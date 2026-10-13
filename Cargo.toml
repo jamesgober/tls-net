@@ -1,0 +1,69 @@
+# =============================================================================
+#  R E P S   ·   tls-net
+# =============================================================================
+[package]
+name    = "tls-net"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "TLS for net-io: a thin adapter that plugs rustls into net-io's TLS seam, with certificate loading and hot reload, SNI, ALPN, client certificates, ClientHello capture, and a policy shaped by shield-sec."
+
+# Keywords (5 max)
+keywords = ["tls", "ssl", "rustls", "https", "network"]
+
+# Categories
+categories = ["network-programming", "cryptography"]
+
+# Links
+homepage      = "https://github.com/jamesgober/tls-net"
+repository    = "https://github.com/jamesgober/tls-net"
+documentation = "https://docs.rs/tls-net"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "tls_net"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# None yet. Planned dependencies and the reason for each are listed in
+# dev/PLAN.md; each is added with the first code that needs it.
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
