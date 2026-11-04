@@ -63,6 +63,8 @@ sans-IO API, and plugs into net-io as its TLS engine.
   this release instead of 0.4 and 0.5 (D-036 to D-038).
 - Exporters and channel binding move to the rustls 0.24 adoption: rustls 0.23's
   unbuffered connections have no exporter (D-052).
+- Application data that arrives in the same flight as the peer's Finished is
+  delivered after `HandshakeComplete`, never before (D-066).
 
 ## [0.2.0] - 2026-11-04
 

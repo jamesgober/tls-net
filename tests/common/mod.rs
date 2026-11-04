@@ -397,3 +397,42 @@ pub fn refuse(server: &tls_net::TlsServer, hello: &[u8]) -> (Vec<u8>, Option<Tls
     }
     (sent, None)
 }
+
+impl TcpClient {
+    /// Completes the handshake and sends `first` in the same write as the
+    /// client's Finished, as curl does.
+    pub fn handshake_with_early_request(&mut self, first: &[u8]) -> Result<(), TlsError> {
+        use std::io::{Read, Write};
+        loop {
+            let p = self
+                .session
+                .step(&mut self.inbuf[..self.filled], &mut self.out)?;
+            let (consumed, mut written) = (p.consumed, p.written);
+            let complete = matches!(p.event, Event::HandshakeComplete);
+            let need = matches!(p.event, Event::NeedInput);
+            if complete {
+                written += self.session.encrypt(first, &mut self.out[written..])?;
+            }
+            if written > 0 {
+                self.sock
+                    .write_all(&self.out[..written])
+                    .map_err(|_| TlsError::UncleanClose)?;
+            }
+            self.inbuf.copy_within(consumed..self.filled, 0);
+            self.filled -= consumed;
+            if complete {
+                return Ok(());
+            }
+            if need && written == 0 && consumed == 0 {
+                let n = self
+                    .sock
+                    .read(&mut self.inbuf[self.filled..])
+                    .map_err(|_| TlsError::UncleanClose)?;
+                if n == 0 {
+                    return Err(TlsError::UncleanClose);
+                }
+                self.filled += n;
+            }
+        }
+    }
+}

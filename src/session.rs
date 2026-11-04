@@ -153,6 +153,12 @@ pub(crate) struct Core<C> {
     handshake_bytes: usize,
     max_handshake_bytes: usize,
     held: usize,
+    /// Plaintext that arrived with the last handshake flight: it sits at the
+    /// front of the next input and is handed out before rustls runs again,
+    /// so `HandshakeComplete` always comes first.
+    held_plain: usize,
+    /// `close_notify` that arrived with the last handshake flight.
+    held_peer_closed: bool,
     peer_closed: bool,
     pub(crate) tag: u64,
     pub(crate) started: Option<Instant>,
@@ -169,6 +175,8 @@ impl<C: Engine> Core<C> {
             handshake_bytes: 0,
             max_handshake_bytes: max_handshake_bytes as usize,
             held: 0,
+            held_plain: 0,
+            held_peer_closed: false,
             peer_closed: false,
             tag: 0,
             started: None,
@@ -236,6 +244,35 @@ impl<C: Engine> Core<C> {
         None
     }
 
+    /// Whether something that arrived with the last handshake flight waits.
+    pub(crate) fn has_held(&self) -> bool {
+        self.held_plain > 0 || self.held_peer_closed
+    }
+
+    /// Hands out what arrived with the last handshake flight, before rustls
+    /// runs again (D-066).
+    pub(crate) fn take_held<'i>(&mut self, input: &'i mut [u8]) -> Result<Progress<'i>, TlsError> {
+        if self.held_plain > 0 {
+            let len = std::mem::take(&mut self.held_plain);
+            if input.len() < len {
+                return Err(self.fail(TlsError::WrongState));
+            }
+            return Ok(Progress {
+                consumed: len,
+                written: 0,
+                event: Event::Data(&input[..len]),
+            });
+        }
+        self.held_peer_closed = false;
+        self.peer_closed = true;
+        self.state = SessionState::HalfClosed;
+        Ok(Progress {
+            consumed: 0,
+            written: 0,
+            event: Event::PeerClosed,
+        })
+    }
+
     /// Writes tls-net's own `unrecognized_name` alert and fails (D-031).
     pub(crate) fn refuse_unknown_name<'i>(
         &mut self,
@@ -254,7 +291,30 @@ impl<C: Engine> Core<C> {
     ) -> Result<Progress<'i>, TlsError> {
         let mut consumed = 0usize;
         let mut written = 0usize;
-        let stop = self.drive(input, output, &mut consumed, &mut written);
+        let mut stop = self.drive(input, output, &mut consumed, &mut written);
+        // rustls hands out application data (or close_notify) that came in the
+        // same flight as the peer's Finished before it reports the handshake
+        // complete. Report completion first; keep the plaintext at the front
+        // of the unconsumed input for the next call.
+        if self.state == SessionState::Handshake
+            && self
+                .conn
+                .as_ref()
+                .is_some_and(|c| !c.common().is_handshaking())
+        {
+            match stop {
+                Stop::Data { len } => {
+                    consumed -= len;
+                    self.held_plain = len;
+                    stop = Stop::Complete;
+                }
+                Stop::PeerClosed => {
+                    self.held_peer_closed = true;
+                    stop = Stop::Complete;
+                }
+                _ => {}
+            }
+        }
         if matches!(self.state, SessionState::Handshake) {
             self.handshake_bytes = self.handshake_bytes.saturating_add(consumed);
             if self.handshake_bytes.saturating_add(self.held) > self.max_handshake_bytes {
@@ -627,6 +687,9 @@ impl ServerSession {
         if let Some(done) = self.core.precheck(output) {
             return done;
         }
+        if self.core.has_held() {
+            return self.core.take_held(input);
+        }
         if self.core.state == SessionState::Hello {
             match HelloParser::parse(input, &self.state.hello_limits) {
                 Ok(HelloParse::Incomplete { .. }) => {
@@ -809,6 +872,9 @@ impl ClientSession {
     ) -> Result<Progress<'i>, TlsError> {
         if let Some(done) = self.core.precheck(output) {
             return done;
+        }
+        if self.core.has_held() {
+            return self.core.take_held(input);
         }
         let p = self.core.run(input, output)?;
         if p.event == Event::HandshakeComplete {

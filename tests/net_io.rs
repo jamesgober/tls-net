@@ -125,3 +125,26 @@ fn test_net_io_server_refuses_plain_http() {
     assert!(matches!(sock.read(&mut buf), Ok(0) | Err(_)));
     let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
 }
+
+#[test]
+fn test_net_io_request_in_the_finished_flight() {
+    // The request travels in the same TCP write as the client's Finished.
+    let (server, addr) = start();
+    let client = tls_client();
+    for _ in 0..20 {
+        let sock = std::net::TcpStream::connect(addr).unwrap();
+        let mut c = TcpClient::new(sock, client.connect("localhost").unwrap());
+        c.handshake_with_early_request(b"ping").unwrap();
+        let got = c.read(1).unwrap();
+        let mut all = got;
+        while !all.ends_with(b"ping") {
+            all.extend(c.read(1).unwrap());
+        }
+        assert!(
+            all.ends_with(b"ping"),
+            "{:?}",
+            String::from_utf8_lossy(&all)
+        );
+    }
+    let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
+}

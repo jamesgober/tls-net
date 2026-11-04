@@ -456,3 +456,52 @@ fn test_resumption_second_connection_resumed() {
     let third = connect(&server, &other, "localhost", usize::MAX);
     assert_eq!(third.server.info().unwrap().kind, HandshakeKind::Full);
 }
+
+#[test]
+fn test_data_in_the_finished_flight_comes_after_handshake_complete() {
+    // curl and other clients send their first request in the same flight as
+    // their Finished. HandshakeComplete must come first (net-io refuses
+    // plaintext before it), then the data, nothing lost.
+    let server = site().build().unwrap();
+    let client = client(Policy::client_default(), &[]);
+    let (mut srv, mut cli) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    let mut to_s = Vec::new();
+    c.run(&mut cli, &mut to_s);
+    s.inbox.extend(to_s);
+    let mut to_c = Vec::new();
+    s.run(&mut srv, &mut to_c);
+    c.inbox.extend(to_c);
+    let mut to_s = Vec::new();
+    c.run(&mut cli, &mut to_s);
+    assert!(c.complete && !s.complete);
+    send(&mut cli, b"GET / HTTP/1.1\r\n\r\n", 100, &mut to_s);
+    let mut input = to_s;
+    let mut out = vec![0u8; 64 * 1024];
+    let mut events = Vec::new();
+    let mut data = Vec::new();
+    for _ in 0..8 {
+        let p = srv.step(&mut input, &mut out).unwrap();
+        let consumed = p.consumed;
+        match p.event {
+            tls_net::Event::HandshakeComplete => events.push("complete"),
+            tls_net::Event::Data(d) => {
+                events.push("data");
+                data.extend_from_slice(d);
+            }
+            tls_net::Event::NeedInput => break,
+            _ => events.push("other"),
+        }
+        input.drain(..consumed);
+    }
+    let first_data = events.iter().position(|e| *e == "data").unwrap();
+    let complete = events.iter().position(|e| *e == "complete").unwrap();
+    assert!(complete < first_data, "{events:?}");
+    assert_eq!(data, b"GET / HTTP/1.1\r\n\r\n");
+    assert_eq!(srv.state(), SessionState::Established);
+    // The server can answer at once.
+    assert!(srv.encrypt(b"HTTP/1.1 200 OK\r\n\r\n", &mut out).is_ok());
+}
