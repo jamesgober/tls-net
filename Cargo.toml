@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "tls-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -45,7 +45,7 @@ path = "src/lib.rs"
 # #################################
 # Each feature and its reason is in dev/PLAN.md (section 7) and docs/API.md.
 [features]
-default = ["aws-lc", "webpki-roots", "key-vault"]
+default = ["aws-lc", "webpki-roots", "key-vault", "net-io"]
 
 # Crypto provider (decision D-004). With both on, aws-lc-rs is used. With
 # neither, every constructor returns `TlsError::NoProvider`.
@@ -105,6 +105,24 @@ net-io = { version = ">=0.4, <0.7", optional = true, default-features = false }
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+# The net-io server integration for the adapter's end-to-end tests.
+net-io = { version = ">=0.4, <0.7", features = ["tls"] }
+# Property tests.
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+
+# EXAMPLES
+# #################################
+[[example]]
+name = "https_get"
+required-features = ["webpki-roots"]
+
+
+# LINTS
+# #################################
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing` (see fuzz/).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 
 # RELEASE PROFILE

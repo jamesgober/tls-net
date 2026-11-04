@@ -18,21 +18,23 @@ Exit: every public item written in `docs/API.md` with signatures, errors, and ve
 
 ## v0.3.0 - Core
 Exit: a tls-net server serves HTTPS to curl and OpenSSL `s_client` over the loopback harness with SNI (several certificates), ALPN, `compatible` and `modern`; the tls-net client completes handshakes to public sites with Mozilla roots and to a private CA; every load-time check of PLAN 6.5 has a test; error mapping complete for the implemented paths; a counting allocator proves zero allocations in tls-net code on the established path; a real net-io server carries HTTPS through the adapter.
-- [ ] Policy, presets, enums, provider selection, `NoProvider` mode.
-- [ ] PEM and DER intake, DER field reader, certificate entries with all checks.
-- [ ] ClientHello parser with budgets (moved from 0.4, D-037).
-- [ ] SNI table, unknown-name refusal, host groups (one group until 0.4).
-- [ ] `ServerSession`, `ClientSession`: the step loop, the D-035 copy, budgets, capacity gate.
-- [ ] Tier 1: `server_from_pem`, `server_from_files`, `client`, `client_with_ca_pem`, `accept`, `connect`, `connect_to`.
-- [ ] `start_after_plaintext` (moved from 0.5, D-038).
-- [ ] net-io adapter behind `net-io` (moved from 0.5, D-036); compile check against net-io 0.4.0 and the newest.
-- [ ] Attack tests for T-1, T-3, T-5, T-6, T-9, T-13, T-14, T-17, T-20, T-25, T-28.
-- [ ] Fuzz targets `hello_parse`, `der_fields`, `pem_intake`, `session_step_server`, `session_step_client` (built in CI).
+- [x] Policy, presets, enums, provider selection, `NoProvider` mode.
+- [x] PEM and DER intake, DER field reader, certificate entries with all checks.
+- [x] ClientHello parser with budgets (moved from 0.4, D-037).
+- [x] SNI table, unknown-name refusal, host groups (one group until 0.4).
+- [x] `ServerSession`, `ClientSession`: the step loop, the D-035 copy, budgets, capacity gate.
+- [x] Tier 1: `server_from_pem`, `server_from_files`, `client`, `client_with_ca_pem`, `accept`, `connect`, `connect_to`.
+- [x] `start_after_plaintext` (moved from 0.5, D-038).
+- [x] net-io adapter behind `net-io` (moved from 0.5, D-036); compile check against net-io 0.4.0 and the newest.
+- [x] Attack tests for T-1, T-2, T-3, T-5, T-6, T-7, T-9, T-13, T-14, T-17, T-20, T-22 (client side), T-25, T-28.
+- [x] Fuzz targets `hello_parse`, `der_fields`, `pem_intake`, `session_step_server`, `session_step_client` (built in CI; two minutes each without findings, D-060).
+- [x] Interop: OpenSSL 3.0 and 3.5 `s_client` (TLS 1.3 with X25519MLKEM768, X25519, P-256, P-384; TLS 1.2), curl; public sites with the Mozilla roots (D-058).
 
 ## v0.4.0 - Extended
 Exit: mutual TLS end to end (pinned CA and pinned SPKI with signature checks; T-6b passes); reload under load with zero failed handshakes (1,000 handshakes per second, a reload every second, 10 minutes); ticket ring in all three modes with resumption across a reload; JA4 and JA3 with known-answer tests; the hook refuses by fingerprint; key-vault custody in both modes; expiry report; OCSP static staple; exporters and channel binding.
 - [ ] Tier 1: `reload_from_pem`, `reload_from_files`, `expiry_report`.
-- [ ] Tier 2: `client_auth`, `ClientAuth::*`, `HostPolicy`, `AlpnPolicy`, `hello_limits`, `tickets`, `TicketMode::*`, `session_cache`, `ocsp_staple`, `Crls`, `RevocationPolicy`, `ServerIdentity::Pinned`, `ReloadHandle`, `ExpiryReport`, `PeerIdentity`, `export_keying_material`, `channel_binding`, `KeySource::Vault`, `KeyCustody::*`, `Policy::internal`, `require_post_quantum`, `max_fragment_size`.
+- [ ] Tier 2: `client_auth`, `ClientAuth::*`, `HostPolicy`, `AlpnPolicy`, `hello_limits`, `tickets`, `TicketMode::*`, `session_cache`, `ocsp_staple`, `Crls`, `RevocationPolicy`, `ServerIdentity::Pinned`, `ReloadHandle`, `ExpiryReport`, `PeerIdentity`, `KeySource::Vault`, `KeyCustody::*`; tests for `Policy::internal`, `require_post_quantum`, `max_fragment_size` (shipped in 0.3).
+- Moved: `export_keying_material` and `channel_binding` to the rustls 0.24 adoption, at the latest 0.9 (D-052: rustls 0.23's unbuffered API has no exporter).
 - [ ] Tier 3: `ServerReader`, `ClientHelloView` accessors, `HelloHook`, `Fingerprint`, `Ja4`, `ja4_raw`, `ja4_original`, `ja3_string`.
 - [ ] loom tests for the snapshot, capacity gate, and ticket ring.
 - [ ] Attack tests T-2, T-4, T-6b, T-7, T-10, T-11, T-12, T-15, T-16, T-18, T-19, T-22.
@@ -49,7 +51,7 @@ Exit: every bench of PLAN section 9 with committed baselines; the end-to-end com
 - [ ] No new API; internal changes only.
 
 ## v0.7.0 - Hardening
-Exit: every fuzz target run for 24 hours without an open finding; attack tests T-1 to T-28 green; tlsfuzzer server scripts and testssl.sh clean for the supported features (weekly CI job); soak of NFR-21 without memory growth; Miri and loom green; `docs/SECURITY.md` written.
+Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hours without an open finding; attack tests T-1 to T-28 green; tlsfuzzer server scripts and testssl.sh clean for the supported features (weekly CI job); soak of NFR-21 without memory growth; Miri and loom green; `docs/SECURITY.md` written.
 - [ ] No new API.
 
 ## v0.8.0 - Alpha
@@ -57,7 +59,7 @@ Exit (D-039): the consumers' shapes run in this repository against real binaries
 - [ ] API changes only from findings, each logged.
 
 ## v0.9.0 - Beta
-Exit: rustls 0.24 (or the next stable line) adopted if released (D-007); adversarial review in a dedicated session with every finding fixed test-first; API review against `docs/API.md`; `docs/OPERATIONS.md` and `docs/PLATFORM-NOTES.md` complete. API frozen at 0.9.0.
+Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with exporters and channel binding (D-052); adversarial review in a dedicated session with every finding fixed test-first; API review against `docs/API.md`; `docs/OPERATIONS.md` and `docs/PLATFORM-NOTES.md` complete. API frozen at 0.9.0.
 
 ## v0.9.x - Pre-1.0 polish
 Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by item, what is met and what still needs James.

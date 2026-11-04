@@ -11,3 +11,6 @@
 /tests            export-ignore
 /.gitignore       export-ignore
 /.editorconfig    export-ignore
+
+# Binary test fixtures.
+*.der             binary

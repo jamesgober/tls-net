@@ -76,6 +76,43 @@ jobs:
       - name: Check with net-io 0.4.0
         run: cargo check --all-targets --features net-io
 
+  interop:
+    # Opt-in tests against other TLS stacks and public sites (decision D-058).
+    name: Interop (OpenSSL, curl, public sites)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tool versions
+        run: |
+          openssl version
+          curl --version | head -n 1
+      - name: Interop and network tests
+        run: cargo test --test interop --test network
+        env:
+          TLS_NET_INTEROP: "1"
+          TLS_NET_NETWORK: "1"
+
+  fuzz-build:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build every fuzz target
+        working-directory: fuzz
+        run: cargo fuzz build
+
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest
