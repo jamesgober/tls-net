@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "tls-net"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -43,15 +43,63 @@ path = "src/lib.rs"
 
 # FEATURE FLAGS
 # #################################
+# Each feature and its reason is in dev/PLAN.md (section 7) and docs/API.md.
 [features]
-default = []
+default = ["aws-lc", "webpki-roots", "key-vault"]
+
+# Crypto provider (decision D-004). With both on, aws-lc-rs is used. With
+# neither, every constructor returns `TlsError::NoProvider`.
+aws-lc = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+ring = ["rustls/ring"]
+# Windows x86-64 machines without NASM (pass-through to aws-lc-rs).
+prebuilt-nasm = ["aws-lc", "dep:aws-lc-rs", "aws-lc-rs/prebuilt-nasm"]
+
+# Client trust (decision D-005).
+webpki-roots = ["dep:webpki-roots"]
+platform-verifier = ["dep:rustls-platform-verifier"]
+
+# Key and ticket-key custody in key-vault (decision D-021).
+key-vault = ["dep:key-vault"]
+
+# The net-io TLS seam (decision D-036).
+net-io = ["dep:net-io"]
+
+# JA3 MD5 digest, a fingerprint label only (decision D-016).
+ja3-md5 = []
+
+# Raw rustls configuration access; outside semver.
+rustls-escape-hatch = []
+
+# NSS key log output for debugging. Never in production (decision D-040).
+dangerous-keylog = []
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None yet. Planned dependencies and the reason for each are listed in
-# dev/PLAN.md; each is added with the first code that needs it.
+# The TLS implementation: the one accepted third-party runtime dependency
+# (decision D-001). Default features off: no `log`, no compression, no
+# process-default provider.
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
+
+# Only so `prebuilt-nasm` can reach aws-lc-rs; rustls already depends on it.
+aws-lc-rs = { version = "1.19", optional = true, default-features = false }
+
+# Mozilla root program bundle for clients (CDLA-Permissive-2.0 data).
+webpki-roots = { version = "1.0.11", optional = true }
+
+# Operating system trust store (non-default).
+rustls-platform-verifier = { version = "0.7.1", optional = true }
+
+# Ticket AEAD, the ticket ratchet, JA4 and SPKI hashing (decision D-012).
+crypt-io = { version = "1.2.2", default-features = false, features = ["std", "zeroize", "aead-chacha20", "hash-sha2", "kdf-hkdf"] }
+
+# Custody of private keys and ticket keys.
+key-vault = { version = "1.1", optional = true, default-features = false }
+
+# The TLS seam traits (TlsAcceptor, TlsSession). The seam is identical in
+# net-io 0.4.0 through 0.6 (decision D-036).
+net-io = { version = ">=0.4, <0.7", optional = true, default-features = false }
 
 
 # DEV DEPENDENCIES
