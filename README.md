@@ -29,18 +29,54 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: scaffold (<code>0.1.0</code>).</strong> No functional code yet. The design is written down in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a> and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>; the public API is locked in <code>0.2.0</code>.
+        <strong>Status: design lock (<code>0.2.0</code>).</strong> The public API is written down in <a href="./docs/API.md"><code>docs/API.md</code></a> and the design and decisions in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>. No TLS code ships in this release; the server, the client, and the net-io adapter arrive in <code>0.3.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
 <hr>
 <br>
 
-## Scope
+## Features
 
-The adapter over the sans-IO API of rustls, server and client configurations, certificate and key loading (PEM), hot reload without dropping connections, SNI with several certificates, ALPN, optional client certificates, ClientHello capture for fingerprinting, and a TLS policy object (minimum version, cipher suites). Automatic certificates (ACME) are planned separately.
+- **Sans-IO sessions** over rustls's unbuffered API: ciphertext in a buffer you own, plaintext out as a slice of that buffer, records written into another buffer you own. No sockets, no async runtime.
+- **net-io adapter** (feature `net-io`): a `TlsServer` is a net-io `TlsAcceptor`.
+- **Policy** that cannot express anything weak: TLS 1.2 and 1.3 only, AEAD suites with ECDHE only, X25519MLKEM768 post-quantum key exchange first; presets `compatible`, `modern`, `internal`.
+- **Certificates checked before use**: key match, validity window, name coverage, key size, signature algorithm, EKU, chain order; files size-gated and, on Unix, permission-checked.
+- **SNI** with several certificates, single-label wildcards, a default or a refusal, and per-host policy.
+- **Hot reload** that validates everything before the swap; handshakes in progress keep their configuration.
+- **Client verification that cannot be turned off**, Mozilla roots by default, private CAs, SPKI pins that still check handshake signatures.
+- **ClientHello capture** with a bounded zero-copy parser, JA4 and JA3 fingerprints, and a hook for the connection gate.
+- **Session tickets** under a rotating key ring (ephemeral, ratchet with a sealed hand-off across restarts, or derived for clusters).
+- **Errors** with stable codes (`TLS-nnnn`), categories, and messages that never carry key material.
 
-See [`dev/PLAN.md`](./dev/PLAN.md) for the full scope, what is deliberately left to other crates, and the decision log.
+## Installation
+
+```toml
+[dependencies]
+tls-net = "0.2"
+```
+
+The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange.
+
+## Quick start
+
+The API below ships in `0.3.0` (see [`docs/API.md`](./docs/API.md)).
+
+```rust
+// Server: certificate files from the operator, default policy, ALPN http/1.1.
+let server = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
+let mut session = server.accept()?;     // one per accepted connection; drive with step()
+
+// Client: Mozilla roots, server verification always on.
+let client = tls_net::client()?;
+let mut session = client.connect("example.com")?;
+```
+
+## Documentation
+
+- [`docs/API.md`](./docs/API.md): every public item with signatures, errors, cost, and examples.
+- [`dev/PLAN.md`](./dev/PLAN.md): requirements, design, threat model, and the decision log.
+- [`dev/ROADMAP.md`](./dev/ROADMAP.md): versions and their exit criteria.
 
 <hr>
 <br>

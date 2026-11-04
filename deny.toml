@@ -2,6 +2,16 @@
 # Schema reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
 
 [graph]
+# The platforms tls-net supports. Android and wasm32 crates that optional
+# dependencies pull for those targets only are not checked.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
 all-features = true
 no-default-features = false
 
@@ -30,7 +40,11 @@ allow = [
     "0BSD",
 ]
 confidence-threshold = 0.93
-exceptions = []
+# webpki-roots is data (the Mozilla root program bundle) under
+# CDLA-Permissive-2.0; allowed for that crate only (decision D-005).
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 
 [bans]
 multiple-versions = "warn"
@@ -39,7 +53,16 @@ highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
-deny = []
+# Never in this tree: other TLS stacks, async runtimes, and the archived
+# rustls-pemfile (RUSTSEC-2025-0134). Decision D-041.
+deny = [
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+    { crate = "tokio" },
+    { crate = "async-std" },
+    { crate = "rustls-pemfile" },
+]
 skip = []
 skip-tree = []
 
