@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "tls-net"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -33,7 +33,8 @@ documentation = "https://docs.rs/tls-net"
 authors = ["James Gober <me@jamesgober.com>"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Every feature except `fips`, which needs CMake and Go (decision D-042).
+features = ["aws-lc", "ring", "webpki-roots", "platform-verifier", "key-vault", "net-io", "ja3-md5", "rustls-escape-hatch", "dangerous-keylog"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
@@ -51,6 +52,10 @@ default = ["aws-lc", "webpki-roots", "key-vault", "net-io"]
 # neither, every constructor returns `TlsError::NoProvider`.
 aws-lc = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 ring = ["rustls/ring"]
+# FIPS 140-3 mode over aws-lc-rs: builds aws-lc-fips-sys, which needs CMake
+# and Go (and on Windows NASM, Ninja, and clang). Kept out of the gate's
+# feature list on Windows and macOS (decision D-042).
+fips = ["aws-lc", "rustls/fips"]
 # Windows x86-64 machines without NASM (pass-through to aws-lc-rs).
 prebuilt-nasm = ["aws-lc", "dep:aws-lc-rs", "aws-lc-rs/prebuilt-nasm"]
 

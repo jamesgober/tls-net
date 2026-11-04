@@ -43,10 +43,15 @@ Exit: mutual TLS end to end (pinned CA and pinned SPKI with signature checks; T-
 
 ## v0.5.0 - Feature complete
 Exit: smtp-net-shaped STARTTLS and implicit TLS flows against a scripted relay and an external relay with verification; outbound HTTPS from a client; hand-off export and import between two processes keeps resumption; observer events and stats; FIPS build passes `is_fips()` in a Linux CI job; platform verifier on all three OSes; every P0, P1, P2 item shipped or moved with a recorded reason.
-- [ ] Tier 2: `observer`, `TlsObserver`, `TlsEvent`, `ServerStats`, `is_fips`, `Policy::fips`, `TrustAnchors::platform`, `Policy::summary`.
-- [ ] Tier 3: `TicketKeyRingHandle::{export_sealed, import_sealed, epoch}`, `ja3_md5`, escape hatch, `dangerous-keylog`.
-- [ ] `docs/PLATFORM-NOTES.md`.
-- [ ] Attack tests T-8, T-21, T-23, T-24, T-27.
+- [x] Tier 2: `observer` (server and client, D-089), `TlsObserver`, `TlsEvent`, `ServerStats`, `is_fips`, `Policy::fips` (D-084), `TrustAnchors::platform`, `Policy::summary`.
+- [x] Tier 3: `TicketKeyRingHandle::{export_sealed, import_sealed, epoch}` (Ratchet only, D-085), `ja3_md5`, escape hatch, `dangerous-keylog`.
+- [x] `TicketKeyRingHandle::rotate_now` (moved from 0.7, D-086).
+- [x] `docs/PLATFORM-NOTES.md`.
+- [x] Attack tests T-8, T-21 (opt-in timing, D-092), T-23, T-24, T-27.
+- [x] Hand-off between two processes and the platform verifier on all three operating systems (D-093); STARTTLS against a scripted relay and a public relay.
+
+## Standing: net-io releases
+When net-io publishes a release outside the seam range (`>= 0.4, < 0.7` today, D-036), read its changelog for seam changes and ship a tls-net patch release that widens the range (or adapts the seam) without waiting for the next milestone, so serve-net and smtp-net can move with net-io. The `net-io-range` CI job keeps checking the lowest release of the range.
 
 ## v0.6.0 - Optimisation
 Exit: every bench of PLAN section 9 with committed baselines; the end-to-end comparison against tokio plus tokio-rustls published; the 20% target met, or the gap explained with a plan, and 0.6 does not close until it is met; per-signature custody cost measured; `docs/PERFORMANCE.md` written.

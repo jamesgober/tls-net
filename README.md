@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: extended (<code>0.4.0</code>).</strong> Server and client sessions, policies, certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets, JA4 fingerprints with a hook, key-vault custody, the STARTTLS helper, and the net-io adapter work and are tested against OpenSSL and curl. Observability, FIPS, and the platform verifier arrive in <code>0.5.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: feature complete (<code>0.5.0</code>).</strong> Every planned feature before 1.0 is in and tested against OpenSSL and curl: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Next: benchmarks and tuning in <code>0.6.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -47,16 +47,18 @@
 - **Client verification that cannot be turned off**, Mozilla roots by default, private CAs, SPKI pins that still check handshake signatures.
 - **ClientHello capture** with a bounded zero-copy parser, JA4 and JA3 fingerprints, and a hook for the connection gate.
 - **Session tickets** under a rotating key ring (ephemeral, ratchet with a sealed hand-off across restarts, or derived for clusters).
+- **Observation**: an observer for handshake, refusal, reload, expiry, and rotation events, and lock-free server counters (`stats()`).
+- **FIPS 140-3** mode over aws-lc-rs (feature `fips`), checked with `is_fips()`.
 - **Errors** with stable codes (`TLS-nnnn`), categories, and messages that never carry key material.
 
 ## Installation
 
 ```toml
 [dependencies]
-tls-net = "0.4"
+tls-net = "0.5"
 ```
 
-The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange.
+The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange. Build needs per platform, FIPS included, are in [`docs/PLATFORM-NOTES.md`](./docs/PLATFORM-NOTES.md).
 
 ## Quick start
 
@@ -75,6 +77,7 @@ let mut session = client.connect("example.com")?;
 ## Documentation
 
 - [`docs/API.md`](./docs/API.md): every public item with signatures, errors, cost, and examples.
+- [`docs/PLATFORM-NOTES.md`](./docs/PLATFORM-NOTES.md): build needs, key file checks, and trust anchors on Linux, macOS, and Windows.
 - [`dev/PLAN.md`](./dev/PLAN.md): requirements, design, threat model, and the decision log.
 - [`dev/ROADMAP.md`](./dev/ROADMAP.md): versions and their exit criteria.
 
@@ -83,7 +86,7 @@ let mut session = client.connect("example.com")?;
 
 ## Contributing
 
-See <a href="./dev/DIRECTIVES.md"><code>dev/DIRECTIVES.md</code></a> for engineering standards and the definition of done. Before a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean.
+See <a href="./dev/DIRECTIVES.md"><code>dev/DIRECTIVES.md</code></a> for engineering standards and the definition of done. Before a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean (`--all-features` includes `fips`, which needs CMake and Go; without them, list every feature but `fips`).
 
 <br>
 

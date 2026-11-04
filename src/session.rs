@@ -13,6 +13,7 @@ use crate::fingerprint::Fingerprint;
 use crate::hello::{HelloParse, HelloParser};
 use crate::hook::{HelloContext, HelloVerdict};
 use crate::identity::{HandshakeInfo, HandshakeKind, PeerIdentity};
+use crate::observe::{HelloRefusal, Observation, TlsEvent};
 use crate::policy::{CipherSuite, Group, Version};
 use crate::server::{CapacitySlot, ServerState};
 use crate::sni::NormalizedName;
@@ -668,6 +669,8 @@ pub struct ServerSession {
     sni: Option<NormalizedName>,
     fingerprint: Option<Fingerprint>,
     peer: Option<PeerIdentity>,
+    refusal: Option<HelloRefusal>,
+    reported: bool,
 }
 
 impl fmt::Debug for ServerSession {
@@ -690,6 +693,8 @@ impl ServerSession {
             sni: None,
             fingerprint: None,
             peer: None,
+            refusal: None,
+            reported: false,
         }
     }
 
@@ -705,6 +710,42 @@ impl ServerSession {
     ///
     /// Any session error, `TLS-0030` to `TLS-0050`.
     pub fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<Progress<'i>, TlsError> {
+        let before = self.core.state;
+        let r = self.step_inner(input, output);
+        let complete = matches!(&r, Ok(p) if p.event == Event::HandshakeComplete);
+        self.observe(before, complete);
+        r
+    }
+
+    /// Counters and events after a step.
+    fn observe(&mut self, before: SessionState, complete: bool) {
+        let obs = &self.state.obs;
+        if complete {
+            if let Some(info) = self.info() {
+                record_completion(obs, &info, &self.core, self.peer.is_some());
+            }
+        }
+        if self.core.state == SessionState::Failed && !self.reported {
+            self.reported = true;
+            if let Some(reason) = self.refusal {
+                obs.refusals
+                    .hello
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                obs.emit(&TlsEvent::HelloRefused {
+                    tag: self.core.tag,
+                    reason,
+                });
+            } else if matches!(before, SessionState::Hello | SessionState::Handshake) {
+                record_failure(obs, &self.core, before);
+            }
+        }
+    }
+
+    fn step_inner<'i>(
         &mut self,
         input: &'i mut [u8],
         output: &mut [u8],
@@ -737,9 +778,17 @@ impl ServerSession {
                         };
                         if let HelloVerdict::Refuse(reason) = hook.on_client_hello(&ctx) {
                             // No alert: a scanner learns nothing (D-014).
+                            self.refusal = Some(HelloRefusal::Hook(reason));
                             self.release();
                             return Err(self.core.fail(TlsError::Refused(reason)));
                         }
+                    }
+                    if self.state.obs.sample() {
+                        self.state.obs.emit(&TlsEvent::HelloCaptured {
+                            tag: self.core.tag,
+                            view: &view,
+                            fingerprint: &fingerprint,
+                        });
                     }
                     if kinds != crate::fingerprint::FingerprintKinds::NONE {
                         self.fingerprint = Some(fingerprint);
@@ -749,6 +798,7 @@ impl ServerSession {
                         .table
                         .lookup(self.sni.as_ref().map(NormalizedName::as_str))
                     else {
+                        self.refusal = Some(HelloRefusal::UnknownName);
                         self.release();
                         return self.core.refuse_unknown_name(output);
                     };
@@ -759,6 +809,7 @@ impl ServerSession {
                         .copied()
                         .ok_or(TlsError::Other)?;
                     if group.alpn_required && !view.has_alpn() {
+                        self.refusal = Some(HelloRefusal::AlpnRequired);
                         self.release();
                         return self.core.refuse_no_alpn(output);
                     }
@@ -778,6 +829,11 @@ impl ServerSession {
                     }
                 }
                 Err(e) if self.state.hello_limits.refuse_malformed || is_not_tls(&e) => {
+                    self.refusal = Some(if e.code() == 32 {
+                        HelloRefusal::OverBudget
+                    } else {
+                        HelloRefusal::Malformed
+                    });
                     self.release();
                     return Err(self.core.fail(e));
                 }
@@ -919,6 +975,8 @@ pub struct ClientSession {
     max_chain_len: usize,
     max_cert_bytes: usize,
     peer: Option<PeerIdentity>,
+    obs: std::sync::Arc<Observation>,
+    reported: bool,
 }
 
 impl fmt::Debug for ClientSession {
@@ -935,6 +993,7 @@ impl ClientSession {
         conn: UnbufferedClientConnection,
         server_name: Box<str>,
         limits: &crate::limits::HandshakeLimits,
+        obs: std::sync::Arc<Observation>,
     ) -> Self {
         ClientSession {
             core: Core::new(
@@ -946,6 +1005,8 @@ impl ClientSession {
             max_chain_len: usize::from(limits.max_peer_chain_len),
             max_cert_bytes: limits.max_peer_cert_bytes as usize,
             peer: None,
+            obs,
+            reported: false,
         }
     }
 
@@ -955,6 +1016,27 @@ impl ClientSession {
     ///
     /// Any session error, `TLS-0032` to `TLS-0050`.
     pub fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<Progress<'i>, TlsError> {
+        let before = self.core.state;
+        let r = self.step_inner(input, output);
+        if matches!(&r, Ok(p) if p.event == Event::HandshakeComplete) {
+            if let Some(info) = self.info() {
+                record_completion(&self.obs, &info, &self.core, self.peer.is_some());
+            }
+        }
+        if self.core.state == SessionState::Failed && !self.reported {
+            self.reported = true;
+            if before == SessionState::Handshake {
+                record_failure(&self.obs, &self.core, before);
+            }
+        }
+        r
+    }
+
+    fn step_inner<'i>(
         &mut self,
         input: &'i mut [u8],
         output: &mut [u8],
@@ -1043,4 +1125,53 @@ impl ClientSession {
     pub fn alert(&self) -> Option<u8> {
         self.core.alert()
     }
+}
+
+/// Counts and reports a completed handshake.
+fn record_completion<C: Engine>(
+    obs: &Observation,
+    info: &HandshakeInfo<'_>,
+    core: &Core<C>,
+    peer: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &obs.handshakes;
+    match info.kind {
+        HandshakeKind::Resumed => c.resumed.fetch_add(1, Relaxed),
+        _ => c.full.fetch_add(1, Relaxed),
+    };
+    if info.version == crate::policy::Version::Tls12 {
+        c.tls12.fetch_add(1, Relaxed);
+    }
+    if info
+        .group
+        .is_some_and(crate::policy::Group::is_post_quantum)
+    {
+        c.post_quantum.fetch_add(1, Relaxed);
+    }
+    obs.emit(&TlsEvent::HandshakeCompleted {
+        tag: core.tag,
+        version: info.version,
+        cipher_suite: info.cipher_suite,
+        group: info.group,
+        alpn: info.alpn,
+        server_name: info.server_name,
+        kind: info.kind,
+        duration: core.started.map(|t| t.elapsed()).unwrap_or_default(),
+        peer_certificate: peer,
+        fingerprint: info.fingerprint,
+    });
+}
+
+/// Counts and reports a failed handshake.
+fn record_failure<C: Engine>(obs: &Observation, core: &Core<C>, stage: SessionState) {
+    obs.handshakes
+        .failed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    obs.emit(&TlsEvent::HandshakeFailed {
+        tag: core.tag,
+        code: core.error_code().unwrap_or(0),
+        alert: core.alert(),
+        stage,
+    });
 }

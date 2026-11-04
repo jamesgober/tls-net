@@ -4,7 +4,6 @@
 //! permutes its extensions, and is kept for existing intelligence feeds.
 
 use std::fmt;
-use std::fmt::Write as _;
 
 use crate::hello::{ClientHelloView, is_grease};
 
@@ -161,18 +160,43 @@ fn raw(view: &ClientHelloView<'_>, out: &mut String, sorted: bool) {
 /// ```
 pub fn ja3_string(view: &ClientHelloView<'_>, out: &mut String) {
     out.clear();
+    write_ja3(view, out);
+}
+
+/// The JA3 MD5 digest as 32 lowercase hex bytes (feature `ja3-md5`). MD5 is
+/// used as a label here, never for security; the JA3 string is streamed into
+/// it, so nothing is allocated.
+///
+/// ```
+/// # let _ = tls_net::ja3_md5;
+/// ```
+#[cfg(feature = "ja3-md5")]
+#[must_use]
+pub fn ja3_md5(view: &ClientHelloView<'_>) -> [u8; 32] {
+    let mut h = crate::md5::Md5::new();
+    write_ja3(view, &mut h);
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    for (i, b) in digest.iter().enumerate() {
+        out[2 * i] = HEX[usize::from(b >> 4)];
+        out[2 * i + 1] = HEX[usize::from(b & 15)];
+    }
+    out
+}
+
+fn write_ja3(view: &ClientHelloView<'_>, out: &mut impl fmt::Write) {
     let _ = write!(out, "{}", view.legacy_version());
-    out.push(',');
+    let _ = out.write_char(',');
     dec_list(out, view.cipher_suites());
-    out.push(',');
+    let _ = out.write_char(',');
     dec_list(out, view.extension_types());
-    out.push(',');
+    let _ = out.write_char(',');
     dec_list(out, view.groups());
-    out.push(',');
+    let _ = out.write_char(',');
     let mut first = true;
     for p in view.point_formats() {
         if !first {
-            out.push('-');
+            let _ = out.write_char('-');
         }
         first = false;
         let _ = write!(out, "{p}");
@@ -194,6 +218,9 @@ impl FingerprintKinds {
     pub const NONE: Self = FingerprintKinds(0);
     /// JA4 (the default).
     pub const JA4: Self = FingerprintKinds(1);
+    /// The JA3 MD5 label (feature `ja3-md5`).
+    #[cfg(feature = "ja3-md5")]
+    pub const JA3_MD5: Self = FingerprintKinds(2);
 
     /// Both sets.
     #[must_use]
@@ -220,14 +247,23 @@ impl Default for FingerprintKinds {
 pub struct Fingerprint {
     /// JA4, when enabled.
     pub ja4: Option<Ja4>,
+    /// The JA3 MD5 label as lowercase hex, when enabled (feature `ja3-md5`).
+    pub ja3_md5: Option<[u8; 32]>,
 }
 
 impl Fingerprint {
     pub(crate) fn compute(view: &ClientHelloView<'_>, kinds: FingerprintKinds) -> Fingerprint {
+        #[cfg(feature = "ja3-md5")]
+        let ja3_md5 = kinds
+            .contains(FingerprintKinds::JA3_MD5)
+            .then(|| ja3_md5(view));
+        #[cfg(not(feature = "ja3-md5"))]
+        let ja3_md5 = None;
         Fingerprint {
             ja4: kinds
                 .contains(FingerprintKinds::JA4)
                 .then(|| Ja4::compute(view)),
+            ja3_md5,
         }
     }
 }
@@ -323,11 +359,11 @@ fn hex_list(out: &mut String, values: &[u16]) {
     }
 }
 
-fn dec_list(out: &mut String, values: impl Iterator<Item = u16>) {
+fn dec_list(out: &mut impl fmt::Write, values: impl Iterator<Item = u16>) {
     let mut first = true;
     for v in values.filter(|v| !is_grease(*v)) {
         if !first {
-            out.push('-');
+            let _ = out.write_char('-');
         }
         first = false;
         let _ = write!(out, "{v}");
@@ -434,6 +470,27 @@ mod tests {
         ja3_string(&view_of(&bytes), &mut s);
         assert!(s.starts_with("771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,5-10-11-13-"), "{s}");
         assert!(s.ends_with(",29,0"), "{s}");
+    }
+
+    #[cfg(feature = "ja3-md5")]
+    #[test]
+    fn test_ja3_md5_is_md5_of_the_string() {
+        let bytes = foxio_example(false);
+        let view = view_of(&bytes);
+        let mut s = String::new();
+        ja3_string(&view, &mut s);
+        let mut h = crate::md5::Md5::new();
+        h.update(s.as_bytes());
+        let digest: String = h.finalize().iter().fold(String::new(), |mut s, x| {
+            let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{x:02x}"));
+            s
+        });
+        assert_eq!(std::str::from_utf8(&ja3_md5(&view)).unwrap(), digest);
+        let fp = Fingerprint::compute(
+            &view,
+            FingerprintKinds::JA4.union(FingerprintKinds::JA3_MD5),
+        );
+        assert!(fp.ja4.is_some() && fp.ja3_md5.is_some());
     }
 
     #[test]

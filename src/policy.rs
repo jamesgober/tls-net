@@ -267,6 +267,62 @@ pub(crate) enum Preset {
     Modern,
     Internal,
     Client,
+    Fips,
+}
+
+/// What a policy allows, for logs and audits.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicySummary {
+    /// Allowed versions.
+    pub versions: Vec<Version>,
+    /// Allowed cipher suites, in order.
+    pub cipher_suites: Vec<CipherSuite>,
+    /// Allowed groups, in order.
+    pub groups: Vec<Group>,
+    /// Extended master secret required for TLS 1.2.
+    pub extended_master_secret: bool,
+    /// The server's suite order wins.
+    pub server_order: bool,
+    /// Only post-quantum groups.
+    pub post_quantum_required: bool,
+    /// Plaintext bytes per record, if lowered.
+    pub max_fragment_size: Option<u16>,
+    /// The FIPS preset.
+    pub fips: bool,
+}
+
+impl std::fmt::Display for PolicySummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v: Vec<&str> = self
+            .versions
+            .iter()
+            .map(|v| {
+                if *v == Version::Tls13 {
+                    "TLS1.3"
+                } else {
+                    "TLS1.2"
+                }
+            })
+            .collect();
+        write!(f, "versions {} suites", v.join(","))?;
+        for s in &self.cipher_suites {
+            write!(f, " {:#06x}", s.wire())?;
+        }
+        f.write_str(" groups")?;
+        for g in &self.groups {
+            write!(f, " {:#06x}", g.wire())?;
+        }
+        write!(
+            f,
+            " ems={} server_order={} pq_required={} fips={}",
+            self.extended_master_secret, self.server_order, self.post_quantum_required, self.fips
+        )?;
+        if let Some(n) = self.max_fragment_size {
+            write!(f, " fragment={n}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Versions, cipher suites, key exchange groups, and the settings around
@@ -293,6 +349,8 @@ pub struct Policy {
     /// Groups named by the caller must exist; preset groups the provider
     /// lacks (ML-KEM with ring) are skipped.
     groups_explicit: bool,
+    /// The same for suites (ChaCha20 in a FIPS build, D-095).
+    suites_explicit: bool,
     ems: bool,
     server_order: bool,
     post_quantum: bool,
@@ -322,6 +380,7 @@ impl Policy {
                 Group::Secp384r1,
             ],
             groups_explicit: false,
+            suites_explicit: false,
             ems: true,
             server_order: true,
             post_quantum: false,
@@ -353,6 +412,66 @@ impl Policy {
         p
     }
 
+    /// FIPS 140-3: TLS 1.3 and TLS 1.2 with AES-GCM suites only and NIST
+    /// curves (with ML-KEM hybrids where the module offers them). Building a
+    /// server or client with it outside a FIPS build fails with
+    /// `FipsUnavailable` (D-084).
+    #[must_use]
+    pub fn fips() -> Policy {
+        let mut p = Policy::base(&[Version::Tls13, Version::Tls12], Preset::Fips);
+        p.suites.retain(|s| {
+            !matches!(
+                s,
+                CipherSuite::Tls13ChaCha20Poly1305Sha256
+                    | CipherSuite::EcdheEcdsaChaCha20Poly1305Sha256
+                    | CipherSuite::EcdheRsaChaCha20Poly1305Sha256
+            )
+        });
+        p.groups = vec![
+            Group::Secp256r1MlKem768,
+            Group::X25519MlKem768,
+            Group::Secp256r1,
+            Group::Secp384r1,
+        ];
+        p
+    }
+
+    /// Whether this is the FIPS preset.
+    pub(crate) fn requires_fips(&self) -> bool {
+        self.preset == Preset::Fips
+    }
+
+    /// A one-line description for logs and audits.
+    ///
+    /// ```
+    /// let s = tls_net::Policy::modern().summary();
+    /// assert_eq!(s.versions, [tls_net::Version::Tls13]);
+    /// assert!(s.to_string().starts_with("versions TLS1.3"));
+    /// ```
+    #[must_use]
+    pub fn summary(&self) -> PolicySummary {
+        PolicySummary {
+            versions: self.versions.clone(),
+            cipher_suites: self
+                .suites
+                .iter()
+                .copied()
+                .filter(|s| self.versions.contains(&s.version()))
+                .collect(),
+            groups: self
+                .groups
+                .iter()
+                .copied()
+                .filter(|g| !self.post_quantum || g.is_post_quantum())
+                .collect(),
+            extended_master_secret: self.ems,
+            server_order: self.server_order,
+            post_quantum_required: self.post_quantum,
+            max_fragment_size: self.max_fragment,
+            fips: self.preset == Preset::Fips,
+        }
+    }
+
     /// The client default: TLS 1.3 and TLS 1.2, the same suites and groups as
     /// `compatible`, extended master secret required.
     #[must_use]
@@ -377,6 +496,7 @@ impl Policy {
     /// `PolicyInvalid` for an empty list or a duplicate.
     pub fn cipher_suites(mut self, suites: &[CipherSuite]) -> Result<Policy, TlsError> {
         self.suites = list(suites, "cipher suite list")?;
+        self.suites_explicit = true;
         Ok(self)
     }
 
@@ -461,17 +581,26 @@ impl Policy {
             if !self.versions.contains(&s.version()) {
                 continue;
             }
-            let found = parts
+            match parts
                 .all_suites
                 .iter()
-                .find(|p| u16::from(p.suite()) == s.wire())
-                .ok_or(TlsError::PolicyInvalid {
-                    reason: "a cipher suite is not available in this provider",
-                })?;
-            cipher_suites.push(*found);
+                .find(|p| u16::from(p.suite()) == s.wire() && approved(p.fips()))
+            {
+                Some(found) => cipher_suites.push(*found),
+                None if !self.suites_explicit => {}
+                None => {
+                    return Err(TlsError::PolicyInvalid {
+                        reason: "a cipher suite is not available in this provider",
+                    });
+                }
+            }
         }
         for v in &self.versions {
-            if !self.suites.iter().any(|s| s.version() == *v) {
+            let wire = match v {
+                Version::Tls12 => rustls::ProtocolVersion::TLSv1_2,
+                Version::Tls13 => rustls::ProtocolVersion::TLSv1_3,
+            };
+            if !cipher_suites.iter().any(|s| s.version().version == wire) {
                 return Err(TlsError::PolicyInvalid {
                     reason: "an allowed version has no cipher suite",
                 });
@@ -485,7 +614,7 @@ impl Policy {
             match parts
                 .all_groups
                 .iter()
-                .find(|p| u16::from(p.name()) == g.wire())
+                .find(|p| u16::from(p.name()) == g.wire() && approved(p.fips()))
             {
                 Some(found) => kx_groups.push(*found),
                 None if !self.groups_explicit && !self.post_quantum => {}
@@ -512,6 +641,12 @@ impl Policy {
             ..parts.base
         }))
     }
+}
+
+/// In a FIPS build only what rustls itself reports as FIPS-approved is used,
+/// so every built configuration passes rustls's `fips()` check (D-095).
+fn approved(fips: bool) -> bool {
+    fips || !cfg!(feature = "fips")
 }
 
 fn list<T: Copy + PartialEq>(items: &[T], what: &'static str) -> Result<Vec<T>, TlsError> {
@@ -592,7 +727,9 @@ mod tests {
         let p = Policy::internal().provider().unwrap();
         assert_eq!(p.kx_groups.len(), 1);
         assert_eq!(u16::from(p.kx_groups[0].name()), 0x11ec);
-        assert_eq!(p.cipher_suites.len(), 3);
+        // AES-256-GCM, AES-128-GCM, and ChaCha20 (not approved in FIPS builds).
+        let expected = if cfg!(feature = "fips") { 2 } else { 3 };
+        assert_eq!(p.cipher_suites.len(), expected);
     }
 
     #[cfg(feature = "aws-lc")]
