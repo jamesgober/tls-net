@@ -110,8 +110,9 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Build every fuzz target
+        # The prebuilt cargo-fuzz targets musl by default; fuzz on glibc.
         working-directory: fuzz
-        run: cargo fuzz build
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
   security:
     name: Security (audit + deny)
