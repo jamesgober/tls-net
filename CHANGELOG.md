@@ -13,6 +13,46 @@
 
 ---
 
+## [0.4.0] - 2026-11-04
+
+Extended: mutual TLS, pinned identities, host policies, hot reload, session
+tickets, fingerprints, key-vault custody, expiry reports, and OCSP staples.
+
+### Added
+
+- Mutual TLS: `ClientAuth::{none, optional, required, pinned}` with
+  `with_crls` and `hide_ca_names`; `ClientBuilder::client_certificate`;
+  `PeerIdentity` in `HandshakeInfo::peer` on both sides.
+- Pins: `ServerIdentity::Pinned { name, spki_sha256, require_chain }` and
+  `ClientAuth::pinned`, on top of real handshake signature checks (T-6b);
+  `spki_sha256`, `certificate_der_from_pem`.
+- CRLs: `Crls::{from_pem, from_der}`, `RevocationPolicy`, `ClientBuilder::crls`.
+- Host policies: `ServerBuilder::host(names, HostPolicy)` with their own ALPN,
+  `AlpnPolicy::Required`, client authentication, and policy.
+- Reload: `TlsServer::{reload_from_pem, reload_from_files, reload_handle,
+  reader, version}`, `ReloadHandle::publish`, `ReloadOutcome`, `ServerReader`.
+  Ticket keys and the session cache survive a reload.
+- Session tickets under a key ring: `TicketMode::{Off, Ephemeral, Ratchet,
+  Derived}`, `TicketSeed`, `ServerBuilder::{tickets, session_cache}`;
+  XChaCha20-Poly1305 tickets with lazy rotation.
+- Fingerprints and the hook: `Ja4`, `ja4_raw`, `ja4_original`, `ja3_string`,
+  `Fingerprint`, `FingerprintKinds`, `HelloHook`, `HelloContext`,
+  `HelloVerdict`; `ServerBuilder::{hello_hook, fingerprints, hello_limits}`;
+  `ServerSession::fingerprint`.
+- Key-vault custody: `KeySource::Vault` with `KeyCustody::{Resident,
+  PerSignature}`.
+- `TlsServer::expiry_report`, `ExpiryReport`, `CertificateInfo`, `ExpiryState`,
+  `KeyType`; `ServerBuilder::ocsp_staple`; `allow_group_readable_key`,
+  `validity_skew`; `TlsServer::sni_disagreements`.
+- loom models (snapshot, capacity gate, ticket ring) and a CI job; fuzz target
+  `ticket_open`; JA4 known-answer test against FoxIO's published example.
+
+### Changed
+
+- `KeySource` is `Clone`, not `Copy` (the vault variant holds an `Arc`).
+- `HelloLimits::max_ciphers` accepts 1 to 1,024 (D-072).
+- key-vault is built with page locking and wiping on (D-069).
+
 ## [0.3.0] - 2026-11-04
 
 Core. tls-net serves and connects over TLS 1.3 and TLS 1.2 through rustls's
@@ -112,7 +152,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/tls-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/tls-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/tls-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/tls-net/releases/tag/v0.1.0

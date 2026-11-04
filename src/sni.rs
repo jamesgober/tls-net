@@ -229,6 +229,32 @@ impl SniTable {
         slot.put(entry, kind)
     }
 
+    /// Puts a host-policy name into `group`: the entries that serve it now
+    /// (exact, or the wildcard that covers it) serve it in that group. A
+    /// `*.` name moves the wildcard itself. `false` if no certificate covers it.
+    pub(crate) fn assign(&mut self, name: &str, group: usize) -> bool {
+        if let Some(suffix) = name.strip_prefix("*.") {
+            return match self.wildcard.get_mut(suffix) {
+                Some(slot) => {
+                    slot.group = group;
+                    true
+                }
+                None => false,
+            };
+        }
+        let found = self.exact.get(name).copied().or_else(|| {
+            let (_, parent) = name.split_once('.')?;
+            self.wildcard.get(parent).copied()
+        });
+        match found {
+            Some(slot) => {
+                self.exact.insert(name.into(), Slot { group, ..slot });
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn set_default(&mut self, entry: usize, group: usize, use_default: bool) {
         let mut slot = Slot {
             group,

@@ -25,7 +25,7 @@ use crate::sni::{self, EntryKey};
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[non_exhaustive]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum KeySource<'a> {
     /// One PEM block: `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY` (PKCS#1), or
     /// `EC PRIVATE KEY` (SEC1).
@@ -34,6 +34,17 @@ pub enum KeySource<'a> {
     Der(&'a [u8]),
     /// A PEM file: size gate and, on Unix, the permission check first.
     File(&'a Path),
+    /// A key held in key-vault (PKCS#8, PKCS#1, or SEC1 DER). The vault must
+    /// be built with `normalize_with_blake3(false)`.
+    #[cfg(feature = "key-vault")]
+    Vault {
+        /// The vault.
+        vault: Arc<key_vault::KeyVault>,
+        /// The key.
+        handle: key_vault::KeyHandle,
+        /// How the key is held.
+        custody: crate::custody::KeyCustody,
+    },
 }
 
 impl fmt::Debug for KeySource<'_> {
@@ -42,6 +53,8 @@ impl fmt::Debug for KeySource<'_> {
             KeySource::Pem(_) => f.write_str("KeySource::Pem"),
             KeySource::Der(_) => f.write_str("KeySource::Der"),
             KeySource::File(p) => write!(f, "KeySource::File({})", p.display()),
+            #[cfg(feature = "key-vault")]
+            KeySource::Vault { custody, .. } => write!(f, "KeySource::Vault({custody:?})"),
         }
     }
 }
@@ -142,7 +155,6 @@ impl LoadLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Purpose {
     Server,
-    #[allow(dead_code, reason = "client certificates arrive in 0.4")]
     Client,
 }
 
@@ -177,7 +189,6 @@ pub(crate) enum Chain<'a> {
 
 /// A validated certificate entry.
 #[derive(Clone)]
-#[allow(dead_code, reason = "validity and SPKI feed the expiry report (0.4)")]
 pub(crate) struct CertificateEntry {
     pub(crate) certified: Arc<CertifiedKey>,
     /// Normalised names this entry serves (configured, or the SANs).
@@ -242,8 +253,10 @@ pub(crate) fn load(
         return Err(TlsError::WeakSignatureAlgorithm);
     }
 
-    let signing = crate::provider::load_key(&key.as_der())?;
-    drop(key);
+    let signing = match key {
+        Key::Der(der) => crate::provider::load_key(&der.as_der())?,
+        Key::Signing(s) => s,
+    };
     let certified = CertifiedKey::new(chain.clone(), signing);
     if certified.keys_match().is_err() {
         // The key of a later certificate: the chain is in the wrong order.
@@ -307,21 +320,35 @@ fn gate(len: usize, limit: u32) -> Result<(), TlsError> {
     Ok(())
 }
 
-fn read_key(key: KeySource<'_>, opts: &LoadOptions) -> Result<KeyDer, TlsError> {
+/// A key read for loading: DER in a wiped buffer, or (key-vault) a signing
+/// key already made inside the vault's callback.
+enum Key {
+    Der(KeyDer),
+    #[cfg_attr(not(feature = "key-vault"), allow(dead_code))]
+    Signing(Arc<dyn rustls::sign::SigningKey>),
+}
+
+fn read_key(key: KeySource<'_>, opts: &LoadOptions) -> Result<Key, TlsError> {
     let limit = opts.limits.max_key_file_bytes;
     match key {
         KeySource::Pem(pem) => {
             gate(pem.len(), limit)?;
-            pem::key_from_pem(pem)
+            pem::key_from_pem(pem).map(Key::Der)
         }
         KeySource::Der(der) => {
             gate(der.len(), limit)?;
-            pem::key_from_der(der)
+            pem::key_from_der(der).map(Key::Der)
         }
         KeySource::File(path) => {
             let bytes = pem::read_file(path, limit, true, opts.allow_group_readable)?;
-            pem::key_from_pem(&bytes)
+            pem::key_from_pem(&bytes).map(Key::Der)
         }
+        #[cfg(feature = "key-vault")]
+        KeySource::Vault {
+            vault,
+            handle,
+            custody,
+        } => crate::custody::load(&vault, handle, custody).map(Key::Signing),
     }
 }
 

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: core (<code>0.3.0</code>).</strong> Server and client sessions, policies, certificate loading with every check, SNI, ALPN, the ClientHello parser, the STARTTLS helper, and the net-io adapter work and are tested against OpenSSL and curl. Mutual TLS, reload, tickets, and fingerprints arrive in <code>0.4.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: extended (<code>0.4.0</code>).</strong> Server and client sessions, policies, certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets, JA4 fingerprints with a hook, key-vault custody, the STARTTLS helper, and the net-io adapter work and are tested against OpenSSL and curl. Observability, FIPS, and the platform verifier arrive in <code>0.5.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -53,7 +53,7 @@
 
 ```toml
 [dependencies]
-tls-net = "0.3"
+tls-net = "0.4"
 ```
 
 The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange.

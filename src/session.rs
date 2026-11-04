@@ -2,7 +2,6 @@
 //! (PLAN 6.3).
 
 use std::fmt;
-use std::sync::Arc;
 use std::time::Instant;
 
 use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
@@ -10,8 +9,10 @@ use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
 
 use crate::error::{self, TlsError};
+use crate::fingerprint::Fingerprint;
 use crate::hello::{HelloParse, HelloParser};
-use crate::identity::{HandshakeInfo, HandshakeKind};
+use crate::hook::{HelloContext, HelloVerdict};
+use crate::identity::{HandshakeInfo, HandshakeKind, PeerIdentity};
 use crate::policy::{CipherSuite, Group, Version};
 use crate::server::{CapacitySlot, ServerState};
 use crate::sni::NormalizedName;
@@ -26,6 +27,8 @@ pub const INCOMING_MIN: usize = 18_437;
 
 /// The fatal `unrecognized_name` alert in a plaintext record (D-031).
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
+/// The fatal `no_application_protocol` alert in a plaintext record.
+const NO_APPLICATION_PROTOCOL: [u8; 7] = [21, 3, 3, 0, 2, 2, 120];
 
 /// What one `step` did.
 ///
@@ -281,6 +284,24 @@ impl<C: Engine> Core<C> {
         output[..UNRECOGNIZED_NAME.len()].copy_from_slice(&UNRECOGNIZED_NAME);
         self.alert = Some(112);
         self.fail_after_transmit(TlsError::UnknownServerName, 0, UNRECOGNIZED_NAME.len())
+    }
+
+    /// Writes `no_application_protocol` and fails: ALPN is required (T-15).
+    pub(crate) fn refuse_no_alpn<'i>(
+        &mut self,
+        output: &mut [u8],
+    ) -> Result<Progress<'i>, TlsError> {
+        output[..NO_APPLICATION_PROTOCOL.len()].copy_from_slice(&NO_APPLICATION_PROTOCOL);
+        self.alert = Some(120);
+        self.fail_after_transmit(
+            TlsError::NoApplicationProtocol,
+            0,
+            NO_APPLICATION_PROTOCOL.len(),
+        )
+    }
+
+    pub(crate) fn set_max_handshake_bytes(&mut self, n: u32) {
+        self.max_handshake_bytes = n as usize;
     }
 
     /// Step 4: runs rustls until it needs the caller.
@@ -642,9 +663,11 @@ impl<C: Engine> Core<C> {
 /// `Send`, not `Sync`: one connection is driven by one thread at a time.
 pub struct ServerSession {
     core: Core<UnbufferedServerConnection>,
-    state: Arc<ServerState>,
+    state: crate::sync::Shared<ServerState>,
     slot: Option<CapacitySlot>,
     sni: Option<NormalizedName>,
+    fingerprint: Option<Fingerprint>,
+    peer: Option<PeerIdentity>,
 }
 
 impl fmt::Debug for ServerSession {
@@ -658,13 +681,15 @@ impl fmt::Debug for ServerSession {
 }
 
 impl ServerSession {
-    pub(crate) fn new(state: Arc<ServerState>, slot: CapacitySlot) -> Self {
+    pub(crate) fn new(state: crate::sync::Shared<ServerState>, slot: CapacitySlot) -> Self {
         let max = state.limits.max_handshake_bytes;
         ServerSession {
             core: Core::new(None, SessionState::Hello, max),
             state,
             slot: Some(slot),
             sni: None,
+            fingerprint: None,
+            peer: None,
         }
     }
 
@@ -701,6 +726,24 @@ impl ServerSession {
                 }
                 Ok(HelloParse::Complete { view, .. }) => {
                     self.sni = view.normalized_server_name();
+                    let kinds = self.state.fingerprints;
+                    let fingerprint = Fingerprint::compute(&view, kinds);
+                    if let Some(hook) = &self.state.hook {
+                        let ctx = HelloContext {
+                            view: &view,
+                            fingerprint: &fingerprint,
+                            server_name: self.sni.as_ref().map(NormalizedName::as_str),
+                            tag: self.core.tag,
+                        };
+                        if let HelloVerdict::Refuse(reason) = hook.on_client_hello(&ctx) {
+                            // No alert: a scanner learns nothing (D-014).
+                            self.release();
+                            return Err(self.core.fail(TlsError::Refused(reason)));
+                        }
+                    }
+                    if kinds != crate::fingerprint::FingerprintKinds::NONE {
+                        self.fingerprint = Some(fingerprint);
+                    }
                     let Some(slot) = self
                         .state
                         .table
@@ -709,6 +752,17 @@ impl ServerSession {
                         self.release();
                         return self.core.refuse_unknown_name(output);
                     };
+                    let group = self
+                        .state
+                        .groups
+                        .get(slot.group)
+                        .copied()
+                        .ok_or(TlsError::Other)?;
+                    if group.alpn_required && !view.has_alpn() {
+                        self.release();
+                        return self.core.refuse_no_alpn(output);
+                    }
+                    self.core.set_max_handshake_bytes(group.max_handshake_bytes);
                     let config = self
                         .state
                         .configs
@@ -738,12 +792,35 @@ impl ServerSession {
         }
         let result = self.core.run(input, output);
         match &result {
-            Ok(p) if p.event == Event::HandshakeComplete => self.release(),
+            Ok(p) if p.event == Event::HandshakeComplete => {
+                self.release();
+                if let Err(e) = self.complete() {
+                    return Err(self.core.fail(e));
+                }
+            }
             Err(_) => self.release(),
             _ if self.core.state == SessionState::Failed => self.release(),
             _ => {}
         }
         result
+    }
+
+    /// At completion: the client certificate's budgets and identity.
+    fn complete(&mut self) -> Result<(), TlsError> {
+        let limits = self.state.limits;
+        if let Some(chain) = self.core.peer_chain() {
+            let too_large = chain.len() > usize::from(limits.max_peer_chain_len)
+                || chain
+                    .iter()
+                    .any(|c| c.len() > limits.max_peer_cert_bytes as usize);
+            if too_large {
+                return Err(TlsError::PeerChainTooLarge);
+            }
+            self.peer = chain
+                .first()
+                .and_then(|c| PeerIdentity::from_der(c.as_ref()));
+        }
+        Ok(())
     }
 
     fn release(&mut self) {
@@ -785,8 +862,18 @@ impl ServerSession {
     /// The handshake's results; `None` before `HandshakeComplete`.
     #[must_use]
     pub fn info(&self) -> Option<HandshakeInfo<'_>> {
-        self.core
-            .info(self.sni.as_ref().map(NormalizedName::as_str))
+        let mut info = self
+            .core
+            .info(self.sni.as_ref().map(NormalizedName::as_str))?;
+        info.peer = self.peer.as_ref();
+        info.fingerprint = self.fingerprint.as_ref();
+        Some(info)
+    }
+
+    /// The ClientHello's fingerprints, once parsed (before the handshake completes).
+    #[must_use]
+    pub fn fingerprint(&self) -> Option<&Fingerprint> {
+        self.fingerprint.as_ref()
     }
 
     /// The smallest input buffer the session needs now (D-029).
@@ -831,6 +918,7 @@ pub struct ClientSession {
     server_name: Box<str>,
     max_chain_len: usize,
     max_cert_bytes: usize,
+    peer: Option<PeerIdentity>,
 }
 
 impl fmt::Debug for ClientSession {
@@ -857,6 +945,7 @@ impl ClientSession {
             server_name,
             max_chain_len: usize::from(limits.max_peer_chain_len),
             max_cert_bytes: limits.max_peer_cert_bytes as usize,
+            peer: None,
         }
     }
 
@@ -885,6 +974,11 @@ impl ClientSession {
             if too_large {
                 return Err(self.core.fail(TlsError::PeerChainTooLarge));
             }
+            self.peer = self
+                .core
+                .peer_chain()
+                .and_then(|chain| chain.first())
+                .and_then(|c| PeerIdentity::from_der(c.as_ref()));
         }
         Ok(p)
     }
@@ -922,7 +1016,9 @@ impl ClientSession {
     /// `server_name` is the name this client connected to.
     #[must_use]
     pub fn info(&self) -> Option<HandshakeInfo<'_>> {
-        self.core.info(Some(&self.server_name))
+        let mut info = self.core.info(Some(&self.server_name))?;
+        info.peer = self.peer.as_ref();
+        Some(info)
     }
 
     /// The smallest input buffer the session needs now (D-029).

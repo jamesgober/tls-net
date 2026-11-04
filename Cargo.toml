@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "tls-net"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -95,7 +95,7 @@ rustls-platform-verifier = { version = "0.7.1", optional = true }
 crypt-io = { version = "1.2.2", default-features = false, features = ["std", "zeroize", "aead-chacha20", "hash-sha2", "kdf-hkdf"] }
 
 # Custody of private keys and ticket keys.
-key-vault = { version = "1.1", optional = true, default-features = false }
+key-vault = { version = "1.1", optional = true, default-features = false, features = ["std", "mlock", "zeroize", "fragment-standard"] }
 
 # The TLS seam traits (TlsAcceptor, TlsSession). The seam is identical in
 # net-io 0.4.0 through 0.6 (decision D-036).
@@ -111,6 +111,12 @@ net-io = { version = ">=0.4, <0.7", features = ["tls"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 
+# Model checking of the snapshot, the capacity gate, and the ticket ring:
+# `RUSTFLAGS="--cfg tls_net_loom" cargo test --release --lib loom`.
+[target.'cfg(tls_net_loom)'.dependencies]
+loom = "0.7"
+
+
 # EXAMPLES
 # #################################
 [[example]]
@@ -122,7 +128,7 @@ required-features = ["webpki-roots"]
 # #################################
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing` (see fuzz/).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(tls_net_loom)"] }
 
 
 # RELEASE PROFILE

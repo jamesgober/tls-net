@@ -95,6 +95,20 @@ jobs:
           TLS_NET_INTEROP: "1"
           TLS_NET_NETWORK: "1"
 
+  loom:
+    # Model checks of the snapshot, the capacity gate, and the ticket ring (D-080).
+    name: loom
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Model checks
+        run: cargo test --release --lib loom
+        env:
+          RUSTFLAGS: "--cfg tls_net_loom"
+
   fuzz-build:
     name: Fuzz targets build
     runs-on: ubuntu-latest

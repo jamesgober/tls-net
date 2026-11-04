@@ -122,7 +122,9 @@ fn test_accept_and_hello_parse_do_not_allocate_in_tls_net() {
         .unwrap()
         .build()
         .unwrap();
-    // accept: one Arc clone per slot, no allocation.
+    // accept: one Arc clone per slot, no allocation. Warm up first: on macOS
+    // the standard library allocates a mutex's pthread object on first lock.
+    drop(server.accept().unwrap());
     let (session, n) = counting(|| server.accept().unwrap());
     assert_eq!(n, 0);
     drop(session);
