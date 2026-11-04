@@ -22,6 +22,7 @@ use crypt_io::{Crypt, Zeroizing};
 use rustls::server::ProducesTickets;
 
 use crate::error::TlsError;
+use crate::observe::{Observation, TlsEvent};
 
 /// Ticket format version.
 const VERSION: u8 = 1;
@@ -183,6 +184,7 @@ pub(crate) struct TicketKeyRing {
     pub(crate) issued: AtomicU64,
     pub(crate) rejected: AtomicU64,
     pub(crate) reseeds: AtomicU64,
+    pub(crate) obs: Option<Arc<Observation>>,
 }
 
 impl fmt::Debug for TicketKeyRing {
@@ -240,6 +242,7 @@ impl TicketKeyRing {
             issued: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             reseeds: AtomicU64::new(0),
+            obs: None,
         }))
     }
 
@@ -265,6 +268,7 @@ impl TicketKeyRing {
             return;
         }
         let steps = now - st.epoch;
+        let reseeded = matches!(self.kind, Kind::Ratchet) && steps > MAX_RATCHET_STEPS;
         let next = match &self.kind {
             Kind::Derived(root) => {
                 let cur = derive(root, now);
@@ -315,6 +319,13 @@ impl TicketKeyRing {
                     current,
                     previous,
                 };
+                drop(st);
+                if let Some(obs) = &self.obs {
+                    obs.emit(&TlsEvent::TicketKeyRotated {
+                        epoch: now,
+                        reseeded,
+                    });
+                }
             }
             None => {
                 // The keys could not be made: stop accepting old tickets rather
@@ -371,6 +382,202 @@ impl TicketKeyRing {
         Crypt::xchacha20_poly1305()
             .decrypt_with_aad(key.as_slice(), &ticket[HEADER..], &ticket[..HEADER])
             .ok()
+    }
+}
+
+/// Export format version for sealed ticket keys.
+const EXPORT_VERSION: u8 = 1;
+const MODE_RATCHET: u8 = 1;
+/// Version, mode, epoch: the associated data of an export.
+const EXPORT_HEADER: usize = 10;
+
+/// Ticket keys sealed for a hand-off to the process that takes over the
+/// listening sockets. Wiped on drop.
+pub struct SealedTicketKeys(Zeroizing<Vec<u8>>);
+
+impl SealedTicketKeys {
+    /// The sealed bytes, to pass with the sockets.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SealedTicketKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SealedTicketKeys({} bytes)", self.0.len())
+    }
+}
+
+/// A server's ticket key ring: hand-off across restarts and urgent rotation.
+///
+/// ```
+/// # #[cfg(any(feature = "aws-lc", feature = "ring"))] {
+/// use std::time::Duration;
+/// use tls_net::{KeySource, TicketMode, TicketSeed, TlsServer};
+/// let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+/// let (chain, key) = (std::fs::read(format!("{dir}site.pem")).unwrap(), std::fs::read(format!("{dir}site.key")).unwrap());
+/// let mode = TicketMode::Ratchet { seed: TicketSeed::Random, period: Duration::from_secs(3600) };
+/// let old = TlsServer::builder().certificate(&chain, KeySource::Pem(&key)).unwrap().tickets(mode.clone(), 2).build().unwrap();
+/// let new = TlsServer::builder().certificate(&chain, KeySource::Pem(&key)).unwrap().tickets(mode, 2).build().unwrap();
+/// let wrap = [9u8; 32];
+/// let sealed = old.ticket_keys().unwrap().export_sealed(&wrap).unwrap();
+/// new.ticket_keys().unwrap().import_sealed(&wrap, sealed.as_bytes()).unwrap();
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct TicketKeyRingHandle {
+    ring: Arc<TicketKeyRing>,
+}
+
+impl fmt::Debug for TicketKeyRingHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.ring, f)
+    }
+}
+
+impl TicketKeyRingHandle {
+    pub(crate) fn new(ring: Arc<TicketKeyRing>) -> Self {
+        TicketKeyRingHandle { ring }
+    }
+
+    /// The current epoch.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.ring.epoch()
+    }
+
+    /// Seals the current and previous keys under `wrap_key` (a key both
+    /// processes already hold). Only `Ratchet` rings export: an ephemeral
+    /// ring has nothing to keep, and derived rings share their root already.
+    ///
+    /// # Errors
+    ///
+    /// `PolicyInvalid` for other modes.
+    pub fn export_sealed(&self, wrap_key: &[u8; 32]) -> Result<SealedTicketKeys, TlsError> {
+        if !matches!(self.ring.kind, Kind::Ratchet) {
+            return Err(TlsError::PolicyInvalid {
+                reason: "only ratchet ticket rings export their keys",
+            });
+        }
+        self.ring.advance();
+        let st = self
+            .ring
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut header = [0u8; EXPORT_HEADER];
+        header[0] = EXPORT_VERSION;
+        header[1] = MODE_RATCHET;
+        header[2..].copy_from_slice(&st.epoch.to_be_bytes());
+        let mut plain = Zeroizing::new(Vec::with_capacity(65));
+        plain.push(u8::from(st.previous.is_some()));
+        plain.extend_from_slice(st.current.as_slice());
+        if let Some(p) = &st.previous {
+            plain.extend_from_slice(p.as_slice());
+        }
+        let sealed = Crypt::xchacha20_poly1305()
+            .encrypt_with_aad(wrap_key, &plain, &header)
+            .map_err(|_| TlsError::Other)?;
+        let mut out = Zeroizing::new(Vec::with_capacity(EXPORT_HEADER + sealed.len()));
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&sealed);
+        Ok(SealedTicketKeys(out))
+    }
+
+    /// Adopts keys sealed by [`export_sealed`](Self::export_sealed) in the
+    /// process that handed off the sockets.
+    ///
+    /// # Errors
+    ///
+    /// `PolicyInvalid` for a mode mismatch, an export older than this ring's
+    /// previous epoch, a wrong wrap key, or any tampering (T-24).
+    pub fn import_sealed(&self, wrap_key: &[u8; 32], sealed: &[u8]) -> Result<(), TlsError> {
+        let refused = TlsError::PolicyInvalid {
+            reason: "the sealed ticket keys were refused",
+        };
+        if !matches!(self.ring.kind, Kind::Ratchet) {
+            return Err(TlsError::PolicyInvalid {
+                reason: "only ratchet ticket rings import keys",
+            });
+        }
+        if sealed.len() < EXPORT_HEADER || sealed[0] != EXPORT_VERSION || sealed[1] != MODE_RATCHET
+        {
+            return Err(refused);
+        }
+        let epoch = u64::from_be_bytes(
+            sealed[2..EXPORT_HEADER]
+                .try_into()
+                .map_err(|_| refused.clone())?,
+        );
+        self.ring.advance();
+        let mine = self.ring.epoch();
+        if epoch.saturating_add(1) < mine {
+            return Err(refused);
+        }
+        let plain = Crypt::xchacha20_poly1305()
+            .decrypt_with_aad(wrap_key, &sealed[EXPORT_HEADER..], &sealed[..EXPORT_HEADER])
+            .map_err(|_| refused.clone())?;
+        let plain = Zeroizing::new(plain);
+        let key = |range: std::ops::Range<usize>| -> Option<Zeroizing<[u8; 32]>> {
+            let bytes: [u8; 32] = plain.get(range)?.try_into().ok()?;
+            Some(Zeroizing::new(bytes))
+        };
+        let (current, previous) = match plain.first() {
+            Some(0) if plain.len() == 33 => (key(1..33), None),
+            Some(1) if plain.len() == 65 => (key(1..33), key(33..65)),
+            _ => return Err(refused),
+        };
+        let current = current.ok_or(refused)?;
+        {
+            let mut st = self
+                .ring
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *st = RingState {
+                epoch,
+                current,
+                previous,
+            };
+        }
+        // Catch up if the export is from the previous epoch.
+        self.ring.advance();
+        Ok(())
+    }
+
+    /// Replaces the current key with a random one now and drops the previous
+    /// one: every outstanding ticket then needs a full handshake (for a
+    /// suspected compromise). Not for derived rings, whose keys come from
+    /// the shared root.
+    ///
+    /// # Errors
+    ///
+    /// `PolicyInvalid` for derived rings.
+    pub fn rotate_now(&self) -> Result<u64, TlsError> {
+        if matches!(self.ring.kind, Kind::Derived(_)) {
+            return Err(TlsError::PolicyInvalid {
+                reason: "rotate the root of a derived ring instead",
+            });
+        }
+        let fresh = random_key()?;
+        let epoch = {
+            let mut st = self
+                .ring
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st.current = fresh;
+            st.previous = None;
+            st.epoch
+        };
+        if let Some(obs) = &self.ring.obs {
+            obs.emit(&TlsEvent::TicketKeyRotated {
+                epoch,
+                reseeded: true,
+            });
+        }
+        Ok(epoch)
     }
 }
 

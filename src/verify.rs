@@ -292,13 +292,17 @@ impl Pins {
         let Some(facts) = crate::der::parse_certificate(cert.as_ref()) else {
             return false;
         };
-        let hash = crypt_io::hash::sha256(facts.spki);
-        let mut hit = false;
-        for pin in &self.0 {
-            hit |= crypt_io::Tag::new(*pin).ct_eq(&hash);
-        }
-        hit
+        any_pin(&self.0, &crypt_io::hash::sha256(facts.spki))
     }
+}
+
+/// Compares `hash` with every pin in constant time, without an early exit.
+fn any_pin(pins: &[[u8; 32]], hash: &[u8; 32]) -> bool {
+    let mut hit = false;
+    for pin in pins {
+        hit |= crypt_io::Tag::new(*pin).ct_eq(hash);
+    }
+    hit
 }
 
 /// The error a pinned verifier reports; mapped back to `TlsError::PinMismatch`.
@@ -483,6 +487,53 @@ pub(crate) fn server_verifier(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-21: a pin that differs in its first byte takes as long to refuse as
+    /// one that differs in its last byte. Opt-in (`TLS_NET_TIMING=1`, run
+    /// with `--release` in CI): timing on shared machines is noisy, so the
+    /// test takes the median of interleaved rounds and allows 25 percent.
+    #[test]
+    fn test_t21_pin_comparison_time_does_not_depend_on_the_data() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        if std::env::var_os("TLS_NET_TIMING").is_none() {
+            return;
+        }
+        let hash = [0x5a; 32];
+        let mut first = [[0x5a; 32]; 4];
+        let mut last = [[0x5a; 32]; 4];
+        for pin in &mut first {
+            pin[0] ^= 1;
+        }
+        for pin in &mut last {
+            pin[31] ^= 1;
+        }
+        let time = |pins: &[[u8; 32]]| {
+            let start = Instant::now();
+            for _ in 0..20_000 {
+                black_box(any_pin(black_box(pins), black_box(&hash)));
+            }
+            start.elapsed().as_nanos()
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for round in 0..101 {
+            if round % 2 == 0 {
+                a.push(time(&first));
+                b.push(time(&last));
+            } else {
+                b.push(time(&last));
+                a.push(time(&first));
+            }
+        }
+        a.sort_unstable();
+        b.sort_unstable();
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = a[50] as f64 / b[50] as f64;
+        assert!(
+            (0.8..1.25).contains(&ratio),
+            "first-byte vs last-byte median ratio {ratio:.3}"
+        );
+    }
 
     #[test]
     fn test_pins_match_only_the_right_key() {

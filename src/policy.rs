@@ -267,6 +267,62 @@ pub(crate) enum Preset {
     Modern,
     Internal,
     Client,
+    Fips,
+}
+
+/// What a policy allows, for logs and audits.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicySummary {
+    /// Allowed versions.
+    pub versions: Vec<Version>,
+    /// Allowed cipher suites, in order.
+    pub cipher_suites: Vec<CipherSuite>,
+    /// Allowed groups, in order.
+    pub groups: Vec<Group>,
+    /// Extended master secret required for TLS 1.2.
+    pub extended_master_secret: bool,
+    /// The server's suite order wins.
+    pub server_order: bool,
+    /// Only post-quantum groups.
+    pub post_quantum_required: bool,
+    /// Plaintext bytes per record, if lowered.
+    pub max_fragment_size: Option<u16>,
+    /// The FIPS preset.
+    pub fips: bool,
+}
+
+impl std::fmt::Display for PolicySummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v: Vec<&str> = self
+            .versions
+            .iter()
+            .map(|v| {
+                if *v == Version::Tls13 {
+                    "TLS1.3"
+                } else {
+                    "TLS1.2"
+                }
+            })
+            .collect();
+        write!(f, "versions {} suites", v.join(","))?;
+        for s in &self.cipher_suites {
+            write!(f, " {:#06x}", s.wire())?;
+        }
+        f.write_str(" groups")?;
+        for g in &self.groups {
+            write!(f, " {:#06x}", g.wire())?;
+        }
+        write!(
+            f,
+            " ems={} server_order={} pq_required={} fips={}",
+            self.extended_master_secret, self.server_order, self.post_quantum_required, self.fips
+        )?;
+        if let Some(n) = self.max_fragment_size {
+            write!(f, " fragment={n}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Versions, cipher suites, key exchange groups, and the settings around
@@ -351,6 +407,66 @@ impl Policy {
         p.groups = vec![Group::X25519MlKem768];
         p.post_quantum = true;
         p
+    }
+
+    /// FIPS 140-3: TLS 1.3 and TLS 1.2 with AES-GCM suites only and NIST
+    /// curves (with ML-KEM hybrids where the module offers them). Building a
+    /// server or client with it outside a FIPS build fails with
+    /// `FipsUnavailable` (D-084).
+    #[must_use]
+    pub fn fips() -> Policy {
+        let mut p = Policy::base(&[Version::Tls13, Version::Tls12], Preset::Fips);
+        p.suites.retain(|s| {
+            !matches!(
+                s,
+                CipherSuite::Tls13ChaCha20Poly1305Sha256
+                    | CipherSuite::EcdheEcdsaChaCha20Poly1305Sha256
+                    | CipherSuite::EcdheRsaChaCha20Poly1305Sha256
+            )
+        });
+        p.groups = vec![
+            Group::Secp256r1MlKem768,
+            Group::X25519MlKem768,
+            Group::Secp256r1,
+            Group::Secp384r1,
+        ];
+        p
+    }
+
+    /// Whether this is the FIPS preset.
+    pub(crate) fn requires_fips(&self) -> bool {
+        self.preset == Preset::Fips
+    }
+
+    /// A one-line description for logs and audits.
+    ///
+    /// ```
+    /// let s = tls_net::Policy::modern().summary();
+    /// assert_eq!(s.versions, [tls_net::Version::Tls13]);
+    /// assert!(s.to_string().starts_with("versions TLS1.3"));
+    /// ```
+    #[must_use]
+    pub fn summary(&self) -> PolicySummary {
+        PolicySummary {
+            versions: self.versions.clone(),
+            cipher_suites: self
+                .suites
+                .iter()
+                .copied()
+                .filter(|s| self.versions.contains(&s.version()))
+                .collect(),
+            groups: self
+                .groups
+                .iter()
+                .copied()
+                .filter(|g| !self.post_quantum || g.is_post_quantum())
+                .collect(),
+            extended_master_secret: self.ems,
+            server_order: self.server_order,
+            post_quantum_required: self.post_quantum,
+            max_fragment_size: self.max_fragment,
+            fips: self.preset == Preset::Fips,
+        }
     }
 
     /// The client default: TLS 1.3 and TLS 1.2, the same suites and groups as

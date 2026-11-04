@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every feature except `fips`, which needs CMake and Go and has its own job
+  # (decision D-042).
+  FULL: aws-lc,ring,prebuilt-nasm,webpki-roots,platform-verifier,key-vault,net-io,ja3-md5,rustls-escape-hatch,dangerous-keylog
   RUSTFLAGS: "-D warnings"
   # Run every JS action on Node.js 24 ahead of GitHub's forced migration,
   # silencing "Node.js 20 actions are deprecated" runner warnings.
@@ -34,26 +37,31 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
-      - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Clippy (all features but fips)
+        run: cargo clippy --all-targets --features ${{ env.FULL }} -- -D warnings
       - name: Clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Clippy (ring provider only)
         run: cargo clippy --all-targets --no-default-features --features ring,webpki-roots -- -D warnings
       - name: Test (default features)
         run: cargo test
-      - name: Test (all features)
-        run: cargo test --all-features
+      - name: Test (all features but fips)
+        run: cargo test --features ${{ env.FULL }}
       - name: Test (no default features)
         run: cargo test --no-default-features
+      - name: Platform verifier against public sites
+        if: matrix.rust == 'stable'
+        run: cargo test --features platform-verifier --test network test_platform_verifier
+        env:
+          TLS_NET_NETWORK: "1"
       - name: Build examples
         run: cargo build --examples
       - name: Doc (default features)
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
-      - name: Doc (all features)
-        run: cargo doc --no-deps --all-features
+      - name: Doc (all features but fips)
+        run: cargo doc --no-deps --features ${{ env.FULL }}
         env:
           RUSTDOCFLAGS: "-D warnings"
 
@@ -94,6 +102,26 @@ jobs:
         env:
           TLS_NET_INTEROP: "1"
           TLS_NET_NETWORK: "1"
+      - name: Pin comparison timing (T-21)
+        run: cargo test --release --lib test_t21
+        env:
+          TLS_NET_TIMING: "1"
+
+  fips:
+    # FIPS 140-3 build over aws-lc-rs: needs CMake and Go (on the runner).
+    name: FIPS (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tool versions
+        run: |
+          cmake --version | head -n 1
+          go version
+      - name: Test with fips
+        run: cargo test --features fips
 
   loom:
     # Model checks of the snapshot, the capacity gate, and the ticket ring (D-080).
@@ -144,5 +172,7 @@ jobs:
         run: cargo generate-lockfile
       - name: Audit
         run: cargo audit
-      - name: Deny
-        run: cargo deny check
+      - name: Deny (all features but fips)
+        run: cargo deny --features ${{ env.FULL }} check
+      - name: Deny (with fips, D-094)
+        run: cargo deny --all-features check

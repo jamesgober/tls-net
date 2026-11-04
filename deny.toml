@@ -44,6 +44,8 @@ confidence-threshold = 0.93
 # CDLA-Permissive-2.0; allowed for that crate only (decision D-005).
 exceptions = [
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    # The FIPS module (feature `fips` only) carries the OpenSSL license (D-094).
+    { allow = ["OpenSSL"], crate = "aws-lc-fips-sys" },
 ]
 
 [bans]

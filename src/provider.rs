@@ -14,7 +14,7 @@ pub(crate) struct ProviderParts {
     pub(crate) name: &'static str,
 }
 
-#[cfg(feature = "aws-lc")]
+#[cfg(all(feature = "aws-lc", not(feature = "fips")))]
 pub(crate) fn parts() -> Option<ProviderParts> {
     use rustls::crypto::aws_lc_rs as p;
     Some(ProviderParts {
@@ -22,6 +22,18 @@ pub(crate) fn parts() -> Option<ProviderParts> {
         all_suites: p::ALL_CIPHER_SUITES,
         all_groups: p::ALL_KX_GROUPS,
         name: "aws-lc-rs",
+    })
+}
+
+/// FIPS builds take only the provider's default (approved) suites and groups.
+#[cfg(feature = "fips")]
+pub(crate) fn parts() -> Option<ProviderParts> {
+    use rustls::crypto::aws_lc_rs as p;
+    Some(ProviderParts {
+        base: rustls::crypto::default_fips_provider(),
+        all_suites: p::DEFAULT_CIPHER_SUITES,
+        all_groups: p::DEFAULT_KX_GROUPS,
+        name: "aws-lc-rs (FIPS)",
     })
 }
 

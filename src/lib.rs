@@ -34,6 +34,7 @@
 //! |---|---|---|
 //! | `aws-lc` | on | aws-lc-rs provider with X25519MLKEM768 |
 //! | `ring` | off | ring provider, without post-quantum groups |
+//! | `fips` | off | FIPS 140-3 mode over aws-lc-rs (needs CMake and Go) |
 //! | `prebuilt-nasm` | off | Windows x86-64 without NASM |
 //! | `webpki-roots` | on | bundled Mozilla roots for clients |
 //! | `platform-verifier` | off | the operating system's trust store |
@@ -60,6 +61,9 @@ mod hello;
 mod hook;
 mod identity;
 mod limits;
+#[cfg(feature = "ja3-md5")]
+mod md5;
+mod observe;
 mod pem;
 mod policy;
 mod provider;
@@ -119,6 +123,8 @@ pub use client::{
 pub use custody::KeyCustody;
 pub use error::{Action, CertificateProblem, ErrorCategory, RefuseReason, TlsError};
 pub use expiry::{CertificateInfo, ExpiryReport, ExpiryState, KeyType};
+#[cfg(feature = "ja3-md5")]
+pub use fingerprint::ja3_md5;
 pub use fingerprint::{Fingerprint, FingerprintKinds, Ja4, ja3_string, ja4_original, ja4_raw};
 pub use hello::{ClientHelloView, HelloLimits, HelloParse, HelloParser, is_grease};
 pub use hook::{HelloContext, HelloHook, HelloVerdict};
@@ -126,8 +132,11 @@ pub use identity::{
     HandshakeInfo, HandshakeKind, PeerIdentity, certificate_der_from_pem, spki_sha256,
 };
 pub use limits::HandshakeLimits;
-pub use policy::{CipherSuite, Group, Policy, SignatureScheme, Version};
+pub use observe::{HelloRefusal, ServerStats, TlsEvent, TlsObserver};
+pub use policy::{CipherSuite, Group, Policy, PolicySummary, SignatureScheme, Version};
 pub use provider::default_provider_name;
+#[cfg(feature = "dangerous-keylog")]
+pub use server::KeyLogSink;
 pub use server::{
     Alpn, AlpnPolicy, HostPolicy, ReloadHandle, ReloadOutcome, ServerBuilder, ServerReader,
     TlsServer, UnknownName, server_from_files, server_from_pem,
@@ -137,7 +146,7 @@ pub use session::{
     ServerSession, SessionState,
 };
 pub use sni::{NormalizedName, normalize_server_name};
-pub use tickets::{TicketMode, TicketSeed};
+pub use tickets::{SealedTicketKeys, TicketKeyRingHandle, TicketMode, TicketSeed};
 pub use verify::{ClientAuth, Crls, RevocationPolicy};
 
 /// Crate version string, populated by Cargo at build time.

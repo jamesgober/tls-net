@@ -13,6 +13,44 @@
 
 ---
 
+## [0.5.0] - 2026-11-04
+
+Feature complete: observation, FIPS, the platform verifier, ticket key
+hand-off across restarts, and the remaining debugging and fingerprint options.
+
+### Added
+
+- Observation: `TlsObserver`, `TlsEvent` (handshake completed and failed,
+  hello captured and refused, reload applied and refused, certificate
+  expiring, ticket key rotated, capacity reached), `HelloRefusal`;
+  `ServerBuilder::{observer, hello_sampling}` and `ClientBuilder::observer`.
+- `TlsServer::stats()` and `ServerStats`: lock-free counters for full,
+  resumed, and failed handshakes, refusals, tickets, TLS 1.2 and post-quantum
+  handshakes, and SNI disagreements.
+- FIPS 140-3: feature `fips`, `Policy::fips()`, `TlsServer::is_fips()`,
+  `TlsClient::is_fips()`; a Linux CI job builds and tests it.
+- `TrustAnchors::platform()` (feature `platform-verifier`), tested against
+  public sites on Linux, macOS, and Windows.
+- Ticket key hand-off: `TlsServer::ticket_keys()`, `TicketKeyRingHandle::{epoch,
+  export_sealed, import_sealed, rotate_now}`, `SealedTicketKeys`; tested
+  between two processes.
+- `Policy::summary()` and `PolicySummary` for logs and audits.
+- `ja3_md5` and `FingerprintKinds::JA3_MD5` (feature `ja3-md5`), with MD5
+  checked against RFC 1321.
+- `TlsServer::as_rustls_configs` and `TlsClient::as_rustls_config` (feature
+  `rustls-escape-hatch`, outside semver).
+- `ServerBuilder::dangerous_key_log`, `ClientBuilder::dangerous_key_log`, and
+  `KeyLogSink` (feature `dangerous-keylog`); refused with FIPS.
+- `docs/PLATFORM-NOTES.md`.
+- Attack tests T-8 (no key bytes in any `Debug` or `Display`), T-21 (opt-in
+  pin comparison timing), T-23 (no banned crate in the tree), T-24 (sealed
+  keys refused when wrong, tampered, or old), T-27 (half-open handshakes).
+- STARTTLS tests against a scripted relay and a public relay.
+
+### Changed
+
+- `Fingerprint` has a `ja3_md5` field (always `None` without the feature).
+
 ## [0.4.0] - 2026-11-04
 
 Extended: mutual TLS, pinned identities, host policies, hot reload, session
@@ -152,7 +190,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/tls-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/tls-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/tls-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/tls-net/compare/v0.1.0...v0.2.0

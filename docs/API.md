@@ -1,7 +1,7 @@
 # tls-net &mdash; API Reference
 
 > Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.4.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.4.0` or earlier are in the current release. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: `0.5.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -669,7 +669,7 @@ impl Policy {
     pub fn compatible() -> Policy;                                                    // P0 0.3
     pub fn modern() -> Policy;                                                        // P0 0.3
     pub fn internal() -> Policy;                                                      // P1 0.4
-    #[cfg(feature = "fips")] pub fn fips() -> Policy;                                 // P2 0.5
+    pub fn fips() -> Policy;                                                          // P2 0.5 (D-084)
     pub fn client_default() -> Policy;                                                // P0 0.3
     pub fn versions(self, versions: &[Version]) -> Result<Policy, TlsError>;          // P1 0.3
     pub fn cipher_suites(self, suites: &[CipherSuite]) -> Result<Policy, TlsError>;   // P1 0.3
@@ -683,7 +683,7 @@ impl Policy {
 impl Default for Policy { /* compatible() */ }
 ```
 
-The presets are in PLAN 6.9. Setters validate their own argument: empty lists, duplicates, and `max_fragment_size` below 32 or above 16,384 are `PolicyInvalid`. Lists keep their order (the server's preference). Cross-checks against the provider happen at `build` (FR-8): no suite for an allowed version, a group the provider lacks, post-quantum required with `ring` (`PostQuantumUnavailable`), a FIPS policy outside FIPS mode (`FipsUnavailable`). Nothing weaker than these enums can be named, so a weak configuration cannot be written.
+The presets are in PLAN 6.9. Setters validate their own argument: empty lists, duplicates, and `max_fragment_size` below 32 or above 16,384 are `PolicyInvalid`. Lists keep their order (the server's preference). Cross-checks against the provider happen at `build` (FR-8): no suite for an allowed version, a group the provider lacks, post-quantum required with `ring` (`PostQuantumUnavailable`), a FIPS policy outside FIPS mode (`FipsUnavailable`). `Policy::fips()` exists in every build so configuration code compiles the same way everywhere; only a build with feature `fips` can use it (D-084). It allows TLS 1.3 and TLS 1.2 with AES-GCM suites, P-256 and P-384, and the ML-KEM hybrids the FIPS module offers. Nothing weaker than these enums can be named, so a weak configuration cannot be written.
 
 ```rust
 // TLS 1.3 only, ChaCha20 first for clients without AES hardware.
@@ -780,6 +780,8 @@ impl ClientBuilder {
     pub fn client_certificate(self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError>;  // P0 0.4
     pub fn crls(self, crls: Crls, policy: RevocationPolicy) -> Self;                                   // P2 0.4
     pub fn observer(self, observer: Arc<dyn TlsObserver>) -> Self;                                     // P1 0.5
+    #[cfg(feature = "dangerous-keylog")]
+    pub fn dangerous_key_log(self, sink: Arc<dyn KeyLogSink>) -> Self;                                 // P3 0.5
     pub fn build(self) -> Result<TlsClient, TlsError>;                                                 // P0 0.3
 }
 ```
@@ -984,14 +986,14 @@ impl TicketKeyRingHandle {
     pub fn export_sealed(&self, wrap_key: &[u8; 32]) -> Result<SealedTicketKeys, TlsError>;
     pub fn import_sealed(&self, wrap_key: &[u8; 32], sealed: &[u8]) -> Result<(), TlsError>;
     pub fn epoch(&self) -> u64;
-    pub fn rotate_now(&self) -> Result<u64, TlsError>;     // P2 0.7 (defence idea 0.7)
+    pub fn rotate_now(&self) -> Result<u64, TlsError>;     // P2 0.5 (D-086)
 }
 
 pub struct SealedTicketKeys { /* wipes on drop */ }
 impl SealedTicketKeys { pub fn as_bytes(&self) -> &[u8]; }
 ```
 
-For restarts that hand the listening sockets to a new process: the old process exports, the new one imports, and resumption survives. Only `Ratchet` and `Derived` rings export; `Ephemeral` returns `PolicyInvalid`. `import_sealed` refuses an export older than the importer's epoch minus one, a mode mismatch, a wrong wrap key, and any tampering (T-24). The export is AEAD-sealed, so it is safe on a local socket; tls-net never writes it to disk. `rotate_now` advances the ring at once (every outstanding ticket then needs a full handshake).
+For restarts that hand the listening sockets to a new process: the old process exports, the new one imports, and resumption survives. Only `Ratchet` rings export and import; `Ephemeral` has nothing worth keeping and `Derived` processes already share their root, so both return `PolicyInvalid` (D-085). `TlsServer::ticket_keys()` returns the handle, `None` when tickets are off. `import_sealed` refuses an export older than the importer's epoch minus one, a mode mismatch, a wrong wrap key, and any tampering (T-24). The export is AEAD-sealed, so it is safe on a local socket; tls-net never writes it to disk. `rotate_now` replaces the current key with a random one and drops the previous key, so every outstanding ticket needs a full handshake (for a suspected key compromise); it returns the epoch and is refused for `Derived` rings, whose keys come from the shared root (D-086). Cost: an export is 10 bytes of header plus 65 bytes sealed plus a 16-byte tag; import and export take the ring's write lock once (about a microsecond, an estimate).
 
 ---
 
@@ -1075,8 +1077,8 @@ pub trait TlsObserver: Send + Sync + 'static {
 pub enum TlsEvent<'a> {
     HandshakeCompleted { tag: u64, version: Version, cipher_suite: CipherSuite, group: Option<Group>,
         alpn: Option<&'a [u8]>, server_name: Option<&'a str>, kind: HandshakeKind,
-        duration: Duration, client_certificate: bool, fingerprint: Option<&'a Fingerprint> },
-    HandshakeFailed { tag: u64, code: u16, alert: Option<u8>, alert_from_peer: bool, stage: SessionState },
+        duration: Duration, peer_certificate: bool, fingerprint: Option<&'a Fingerprint> },
+    HandshakeFailed { tag: u64, code: u16, alert: Option<u8>, stage: SessionState },
     HelloCaptured { tag: u64, view: &'a ClientHelloView<'a>, fingerprint: &'a Fingerprint },
     HelloRefused { tag: u64, reason: HelloRefusal },
     ReloadApplied { version: u64, entries: usize },
@@ -1091,7 +1093,7 @@ pub enum TlsEvent<'a> {
 pub enum HelloRefusal { Hook(RefuseReason), Malformed, OverBudget, UnknownName, AlpnRequired }
 ```
 
-One observer per server or client, set at build. Events are delivered synchronously on the thread that caused them; emitting allocates nothing; borrowed fields are valid during the call only. `server_name` and `alpn` are sanitised before emission (printable ASCII; other bytes as `\xNN`, T-20). `HelloCaptured` is sampled: `ServerBuilder::hello_sampling(one_in: u32)` (default 0 = off). `duration` is from the first `step` call to completion (tls-net reads `Instant::now()` twice per handshake).
+One observer per server or client, set at build. Events are delivered synchronously on the thread that caused them; emitting allocates nothing; borrowed fields are valid during the call only. `server_name` is the normalised SNI (letters, digits, `-`, `.`) and `alpn` is one of the configured names, so both are safe to log as they are (T-20). `HandshakeCapacityReached` is emitted at most once per second however many sessions are refused (D-087); the counter in `ServerStats` still counts each one. Clients emit `HandshakeCompleted` and `HandshakeFailed` only. `HelloCaptured` is sampled: `ServerBuilder::hello_sampling(one_in: u32)` (default 0 = off). `duration` is from the first `step` call to completion (tls-net reads `Instant::now()` twice per handshake).
 
 ```rust
 struct Log;
@@ -1115,11 +1117,11 @@ pub struct ServerStats {
     pub handshakes_full: u64, pub handshakes_resumed: u64, pub handshakes_failed: u64,
     pub in_progress: u32, pub capacity_refusals: u64, pub hello_refusals: u64,
     pub tickets_issued: u64, pub tickets_rejected: u64, pub snapshot_version: u64,
-    pub tls12_handshakes: u64, pub post_quantum_handshakes: u64,
+    pub tls12_handshakes: u64, pub post_quantum_handshakes: u64, pub sni_disagreements: u64,
 }
 ```
 
-Relaxed atomic counters, padded so counter groups sit on separate cache lines; `stats()` reads them without locking. `tls12_handshakes` and `post_quantum_handshakes` tell an operator when TLS 1.2 can be turned off and how many clients use X25519MLKEM768.
+Relaxed atomic counters, padded so counter groups sit on separate cache lines; `stats()` reads them without locking. `tls12_handshakes` and `post_quantum_handshakes` tell an operator when TLS 1.2 can be turned off and how many clients use X25519MLKEM768. A TLS 1.3 resumption still runs a key exchange, so it counts as post-quantum when the group is a hybrid (D-088). `sni_disagreements` counts D-064 refusals. Cost of the counters: one relaxed atomic add per event, no lock; an observer call is one virtual call with nothing allocated.
 
 ### `provider_name` and `is_fips`
 

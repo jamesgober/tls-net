@@ -19,12 +19,13 @@ use crate::fingerprint::FingerprintKinds;
 use crate::hello::HelloLimits;
 use crate::hook::HelloHook;
 use crate::limits::HandshakeLimits;
+use crate::observe::{Observation, ServerStats, TlsEvent, TlsObserver};
 use crate::pem;
 use crate::policy::{Policy, Preset};
 use crate::session::ServerSession;
 use crate::snapshot::{Reader, Snapshot};
 use crate::sni::{self, GroupResolver, SniTable};
-use crate::tickets::{TicketKeyRing, TicketMode};
+use crate::tickets::{TicketKeyRing, TicketKeyRingHandle, TicketMode};
 use crate::verify::ClientAuth;
 
 /// An application protocol name for ALPN (RFC 7301): 1 to 255 bytes.
@@ -228,12 +229,14 @@ pub(crate) struct ServerState {
     pub(crate) entries: Vec<CertificateEntry>,
     pub(crate) hook: Option<Arc<dyn HelloHook>>,
     pub(crate) fingerprints: FingerprintKinds,
+    pub(crate) obs: Arc<Observation>,
 }
 
 /// State that belongs to the server's lifetime, carried across reloads (FR-32).
 struct Shared {
     tickets: Option<Arc<TicketKeyRing>>,
     cache: Arc<dyn StoresServerSessions>,
+    obs: Arc<Observation>,
 }
 
 struct Inner {
@@ -297,8 +300,44 @@ impl TlsServer {
             .inner
             .capacity
             .acquire()
-            .ok_or(TlsError::HandshakeCapacity)?;
+            .ok_or_else(|| self.inner.refuse())?;
         Ok(ServerSession::new(self.inner.snapshot.load(), slot))
+    }
+
+    /// The server's counters, read without locking.
+    #[must_use]
+    pub fn stats(&self) -> ServerStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let obs = &self.inner.shared.obs;
+        let h = &obs.handshakes;
+        let (issued, rejected) = self.inner.shared.tickets.as_ref().map_or((0, 0), |t| {
+            (t.issued.load(Relaxed), t.rejected.load(Relaxed))
+        });
+        ServerStats {
+            handshakes_full: h.full.load(Relaxed),
+            handshakes_resumed: h.resumed.load(Relaxed),
+            handshakes_failed: h.failed.load(Relaxed),
+            in_progress: self.handshakes_in_progress(),
+            capacity_refusals: obs.refusals.capacity.load(Relaxed),
+            hello_refusals: obs.refusals.hello.load(Relaxed),
+            tickets_issued: issued,
+            tickets_rejected: rejected,
+            snapshot_version: self.version(),
+            tls12_handshakes: h.tls12.load(Relaxed),
+            post_quantum_handshakes: h.post_quantum.load(Relaxed),
+            sni_disagreements: self.sni_disagreements(),
+        }
+    }
+
+    /// The ticket key ring, for hand-off across restarts (`Ratchet` mode) or
+    /// an urgent rotation; `None` when tickets are off.
+    #[must_use]
+    pub fn ticket_keys(&self) -> Option<TicketKeyRingHandle> {
+        self.inner
+            .shared
+            .tickets
+            .as_ref()
+            .map(|r| TicketKeyRingHandle::new(Arc::clone(r)))
     }
 
     /// A per-worker handle: one atomic load per `accept`, a lock only after a reload.
@@ -350,36 +389,70 @@ impl TlsServer {
         &self,
         add: impl FnOnce(ServerBuilder) -> Result<ServerBuilder, TlsError>,
     ) -> Result<(), TlsError> {
-        let refused = |e: TlsError| TlsError::ReloadRefused {
-            source: Box::new(e),
-        };
         let template = self
             .inner
             .template
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !template.hosts.is_empty() || self.inner.snapshot.load().entries.len() != 1 {
-            return Err(refused(TlsError::PolicyInvalid {
-                reason: "this server has several certificates or host policies; use ReloadHandle::publish",
-            }));
+        let r = (|| {
+            if !template.hosts.is_empty() || self.inner.snapshot.load().entries.len() != 1 {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "this server has several certificates or host policies; use ReloadHandle::publish",
+                });
+            }
+            add(template.clone())?.state(&self.inner.shared)
+        })();
+        match r {
+            Ok(state) => {
+                let entries = state.entries.len();
+                let version = self.inner.snapshot.publish(state);
+                self.inner
+                    .shared
+                    .obs
+                    .emit(&TlsEvent::ReloadApplied { version, entries });
+                Ok(())
+            }
+            Err(e) => Err(self.inner.reload_refused(e)),
         }
-        let next = add(template.clone()).map_err(refused)?;
-        let state = next.state(&self.inner.shared).map_err(refused)?;
-        self.inner.snapshot.publish(state);
-        Ok(())
     }
 
     /// Every loaded certificate with days remaining and a state. Never fails;
     /// `now` is a parameter so the caller (the health check) controls time.
     #[must_use]
     pub fn expiry_report(&self, now: SystemTime) -> ExpiryReport {
-        expiry::report(&self.inner.snapshot.load().entries, now)
+        let report = expiry::report(&self.inner.snapshot.load().entries, now);
+        for e in report
+            .entries
+            .iter()
+            .filter(|e| e.state >= expiry::ExpiryState::Warn)
+        {
+            self.inner.shared.obs.emit(&TlsEvent::CertificateExpiring {
+                names: &e.names,
+                not_after: e.not_after,
+                state: e.state,
+            });
+        }
+        report
     }
 
     /// The crypto provider: `"aws-lc-rs"` or `"ring"`.
     #[must_use]
     pub fn provider_name(&self) -> &'static str {
         self.inner.provider_name
+    }
+
+    /// Whether every configuration runs in FIPS mode (rustls `ServerConfig::fips`).
+    #[must_use]
+    pub fn is_fips(&self) -> bool {
+        self.inner.snapshot.load().configs.iter().all(|c| c.fips())
+    }
+
+    /// The built rustls configurations, one per host group. Outside semver
+    /// (feature `rustls-escape-hatch`): for debugging and rustls-only wiring.
+    #[cfg(feature = "rustls-escape-hatch")]
+    #[must_use]
+    pub fn as_rustls_configs(&self) -> Vec<Arc<rustls::ServerConfig>> {
+        self.inner.snapshot.load().configs.clone()
     }
 
     /// Handshakes in progress now.
@@ -412,6 +485,27 @@ pub struct ServerReader {
     reader: Reader<ServerState>,
 }
 
+impl Inner {
+    /// A capacity refusal: counted, evented at most once per second.
+    fn refuse(&self) -> TlsError {
+        self.shared.obs.capacity(
+            self.capacity.in_progress.load(Ordering::Relaxed),
+            self.capacity.max,
+        );
+        TlsError::HandshakeCapacity
+    }
+
+    fn reload_refused(&self, cause: TlsError) -> TlsError {
+        self.shared.obs.emit(&TlsEvent::ReloadRefused {
+            version: self.snapshot.version(),
+            code: cause.code(),
+        });
+        TlsError::ReloadRefused {
+            source: Box::new(cause),
+        }
+    }
+}
+
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Inner")
@@ -440,7 +534,7 @@ impl ServerReader {
             .inner
             .capacity
             .acquire()
-            .ok_or(TlsError::HandshakeCapacity)?;
+            .ok_or_else(|| self.inner.refuse())?;
         Ok(ServerSession::new(
             crate::sync::Shared::clone(self.reader.get()),
             slot,
@@ -492,9 +586,7 @@ impl ReloadHandle {
         let settings = next.settings();
         let state = next
             .state(&self.inner.shared)
-            .map_err(|e| TlsError::ReloadRefused {
-                source: Box::new(e),
-            })?;
+            .map_err(|e| self.inner.reload_refused(e))?;
         let entries = state.entries.len();
         let expiring = expiry::report(&state.entries, SystemTime::now())
             .entries
@@ -502,6 +594,10 @@ impl ReloadHandle {
             .filter(|e| e.state >= expiry::ExpiryState::Warn)
             .count();
         let version = self.inner.snapshot.publish(state);
+        self.inner
+            .shared
+            .obs
+            .emit(&TlsEvent::ReloadApplied { version, entries });
         *template = settings;
         Ok(ReloadOutcome {
             version,
@@ -562,6 +658,36 @@ pub struct ServerBuilder {
     fingerprints: FingerprintKinds,
     allow_group_readable: bool,
     skew: Duration,
+    observer: Option<Arc<dyn TlsObserver>>,
+    sampling: u32,
+    #[cfg(feature = "dangerous-keylog")]
+    key_log: Option<Arc<dyn KeyLogSink>>,
+}
+
+/// Receives NSS key log lines (for Wireshark while debugging). Feature
+/// `dangerous-keylog`; never enable it in production, and it is refused
+/// together with FIPS (D-040).
+#[cfg(feature = "dangerous-keylog")]
+pub trait KeyLogSink: Send + Sync + 'static {
+    /// One line: label, client random, secret.
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]);
+}
+
+#[cfg(feature = "dangerous-keylog")]
+pub(crate) struct KeyLogAdapter(pub(crate) Arc<dyn KeyLogSink>);
+
+#[cfg(feature = "dangerous-keylog")]
+impl fmt::Debug for KeyLogAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("KeyLogAdapter")
+    }
+}
+
+#[cfg(feature = "dangerous-keylog")]
+impl rustls::KeyLog for KeyLogAdapter {
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        self.0.log(label, client_random, secret);
+    }
 }
 
 impl fmt::Debug for ServerBuilder {
@@ -604,7 +730,32 @@ impl ServerBuilder {
             fingerprints: FingerprintKinds::JA4,
             allow_group_readable: false,
             skew: Duration::from_secs(300),
+            observer: None,
+            sampling: 0,
+            #[cfg(feature = "dangerous-keylog")]
+            key_log: None,
         }
+    }
+
+    /// Sends NSS key log lines to `sink` (feature `dangerous-keylog`): anyone
+    /// with them can decrypt the traffic. For debugging only.
+    #[cfg(feature = "dangerous-keylog")]
+    pub fn dangerous_key_log(mut self, sink: Arc<dyn KeyLogSink>) -> Self {
+        self.key_log = Some(sink);
+        self
+    }
+
+    /// The observer that receives this server's events. Belongs to the
+    /// server's lifetime: ignored by `ReloadHandle::publish`.
+    pub fn observer(mut self, observer: Arc<dyn TlsObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Emit `HelloCaptured` for one ClientHello in `one_in` (0, the default, never).
+    pub fn hello_sampling(mut self, one_in: u32) -> Self {
+        self.sampling = one_in;
+        self
     }
 
     /// These settings without certificates (the reload template).
@@ -838,13 +989,21 @@ impl ServerBuilder {
             }
         };
         let (mode, _) = self.tickets.clone().unwrap_or_else(default_tickets);
-        let tickets = TicketKeyRing::new(&mode)?.map(Arc::new);
+        let obs = Arc::new(Observation::new(self.observer.clone(), self.sampling));
+        let tickets = TicketKeyRing::new(&mode)?.map(|mut r| {
+            r.obs = Some(Arc::clone(&obs));
+            Arc::new(r)
+        });
         let cache: Arc<dyn StoresServerSessions> = if self.session_cache == 0 {
             Arc::new(NoServerSessionStorage {})
         } else {
             ServerSessionMemoryCache::new(self.session_cache)
         };
-        let shared = Shared { tickets, cache };
+        let shared = Shared {
+            tickets,
+            cache,
+            obs,
+        };
         let settings = self.settings();
         let limits = self.limits;
         let state = self.state(&shared)?;
@@ -985,6 +1144,19 @@ impl ServerBuilder {
             } else {
                 per_handshake
             };
+            #[cfg(feature = "dangerous-keylog")]
+            if let Some(sink) = &self.key_log {
+                config.key_log = Arc::new(KeyLogAdapter(Arc::clone(sink)));
+            }
+            if policy.requires_fips() && !config.fips() {
+                return Err(TlsError::FipsUnavailable);
+            }
+            #[cfg(feature = "dangerous-keylog")]
+            if self.key_log.is_some() && (config.fips() || policy.requires_fips()) {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "key logging is refused together with FIPS",
+                });
+            }
             let client_auth = auth.is_enabled();
             let max_handshake_bytes = if client_auth && !self.limits_set {
                 96 << 10
@@ -1007,6 +1179,7 @@ impl ServerBuilder {
             entries,
             hook: self.hook,
             fingerprints: self.fingerprints,
+            obs: Arc::clone(&shared.obs),
         })
     }
 }

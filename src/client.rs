@@ -13,6 +13,7 @@ use rustls::{RootCertStore, SignatureScheme};
 use crate::certs::{self, CertificateEntry, Chain, KeySource, LoadOptions, Purpose};
 use crate::error::{self, TlsError};
 use crate::limits::HandshakeLimits;
+use crate::observe::{Observation, TlsObserver};
 use crate::policy::Policy;
 use crate::server::Alpn;
 use crate::session::ClientSession;
@@ -29,6 +30,8 @@ use crate::verify::{Crls, PinnedServer, Pins, RevocationPolicy};
 #[derive(Clone)]
 pub struct TrustAnchors {
     roots: Arc<RootCertStore>,
+    /// Verify with the operating system instead (feature `platform-verifier`).
+    platform: bool,
 }
 
 impl fmt::Debug for TrustAnchors {
@@ -51,6 +54,7 @@ impl TrustAnchors {
         };
         TrustAnchors {
             roots: Arc::new(roots),
+            platform: false,
         }
     }
 
@@ -80,7 +84,25 @@ impl TrustAnchors {
         }
         Ok(TrustAnchors {
             roots: Arc::new(roots),
+            platform: false,
         })
+    }
+
+    /// The operating system's verifier (feature `platform-verifier`): Windows
+    /// and macOS use the OS store with revocation; Linux uses the system
+    /// bundle without revocation. `len()` is 0 (the OS holds the roots).
+    #[cfg(feature = "platform-verifier")]
+    #[must_use]
+    pub fn platform() -> TrustAnchors {
+        TrustAnchors {
+            roots: Arc::new(RootCertStore::empty()),
+            platform: true,
+        }
+    }
+
+    #[cfg(feature = "platform-verifier")]
+    pub(crate) fn is_platform(&self) -> bool {
+        self.platform
     }
 
     pub(crate) fn roots(&self) -> Arc<RootCertStore> {
@@ -93,10 +115,10 @@ impl TrustAnchors {
         self.roots.len()
     }
 
-    /// Whether there are none.
+    /// Whether there are none (and the platform verifier is not used).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
+        self.roots.is_empty() && !self.platform
     }
 }
 
@@ -205,6 +227,7 @@ struct Inner {
     provider_name: &'static str,
     trust: Option<TrustAnchors>,
     crls: Option<(Crls, RevocationPolicy)>,
+    obs: Arc<Observation>,
 }
 
 /// One client certificate for mutual TLS.
@@ -354,7 +377,12 @@ impl TlsClient {
         let (name, shown) = identity.server_name()?;
         let conn =
             UnbufferedClientConnection::new(config, name).map_err(|e| error::from_rustls(&e))?;
-        Ok(ClientSession::new(conn, shown, &self.inner.limits))
+        Ok(ClientSession::new(
+            conn,
+            shown,
+            &self.inner.limits,
+            Arc::clone(&self.inner.obs),
+        ))
     }
 
     /// A session that starts TLS after a plaintext phase (STARTTLS).
@@ -391,11 +419,24 @@ impl TlsClient {
     pub fn provider_name(&self) -> &'static str {
         self.inner.provider_name
     }
+
+    /// Whether the configuration runs in FIPS mode (rustls `ClientConfig::fips`).
+    #[must_use]
+    pub fn is_fips(&self) -> bool {
+        self.inner.config.fips()
+    }
+
+    /// The built rustls configuration. Outside semver (feature
+    /// `rustls-escape-hatch`).
+    #[cfg(feature = "rustls-escape-hatch")]
+    #[must_use]
+    pub fn as_rustls_config(&self) -> Arc<rustls::ClientConfig> {
+        Arc::clone(&self.inner.config)
+    }
 }
 
 /// Builds a [`TlsClient`].
 #[must_use]
-#[derive(Debug)]
 pub struct ClientBuilder {
     trust: Option<TrustAnchors>,
     policy: Policy,
@@ -405,6 +446,17 @@ pub struct ClientBuilder {
     limits: HandshakeLimits,
     certificate: Option<CertificateEntry>,
     crls: Option<(Crls, RevocationPolicy)>,
+    observer: Option<Arc<dyn TlsObserver>>,
+    #[cfg(feature = "dangerous-keylog")]
+    key_log: Option<Arc<dyn crate::server::KeyLogSink>>,
+}
+
+impl fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("trust", &self.trust)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ClientBuilder {
@@ -425,7 +477,24 @@ impl ClientBuilder {
             limits: HandshakeLimits::client(),
             certificate: None,
             crls: None,
+            observer: None,
+            #[cfg(feature = "dangerous-keylog")]
+            key_log: None,
         }
+    }
+
+    /// Sends NSS key log lines to `sink` (feature `dangerous-keylog`). For
+    /// debugging only; refused together with FIPS.
+    #[cfg(feature = "dangerous-keylog")]
+    pub fn dangerous_key_log(mut self, sink: Arc<dyn crate::server::KeyLogSink>) -> Self {
+        self.key_log = Some(sink);
+        self
+    }
+
+    /// The observer that receives this client's events.
+    pub fn observer(mut self, observer: Arc<dyn TlsObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// A client certificate for mutual TLS: the same load-time checks as a
@@ -507,6 +576,22 @@ impl ClientBuilder {
             })?;
         let anchors = self.trust.is_some();
         let builder = match &self.trust {
+            #[cfg(feature = "platform-verifier")]
+            Some(anchors) if anchors.is_platform() => {
+                if self.crls.is_some() {
+                    return Err(TlsError::PolicyInvalid {
+                        reason: "CRLs cannot be combined with the platform verifier",
+                    });
+                }
+                let v = rustls_platform_verifier::Verifier::new(Arc::clone(&provider)).map_err(
+                    |_| TlsError::PolicyInvalid {
+                        reason: "the platform verifier is not available",
+                    },
+                )?;
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(v))
+            }
             Some(anchors) => builder.with_webpki_verifier(crate::verify::server_verifier(
                 anchors,
                 self.crls.as_ref(),
@@ -530,6 +615,18 @@ impl ClientBuilder {
         };
         config.require_ems = self.policy.ems();
         config.max_fragment_size = self.policy.fragment().map(|f| f + 5);
+        if self.policy.requires_fips() && !config.fips() {
+            return Err(TlsError::FipsUnavailable);
+        }
+        #[cfg(feature = "dangerous-keylog")]
+        if let Some(sink) = &self.key_log {
+            if config.fips() || self.policy.requires_fips() {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "key logging is refused together with FIPS",
+                });
+            }
+            config.key_log = Arc::new(crate::server::KeyLogAdapter(Arc::clone(sink)));
+        }
         Ok(TlsClient {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -539,6 +636,7 @@ impl ClientBuilder {
                 provider_name,
                 trust: self.trust,
                 crls: self.crls,
+                obs: Arc::new(Observation::new(self.observer, 0)),
             }),
         })
     }
