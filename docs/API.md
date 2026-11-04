@@ -1,7 +1,7 @@
 # tls-net &mdash; API Reference
 
 > Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.2.0` design lock.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Only `VERSION` exists in `0.2.0`. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: `0.3.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.3.0` or earlier are in the current release. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -358,6 +358,7 @@ impl TlsServer {
     pub fn ticket_keys(&self) -> Option<TicketKeyRingHandle>;      // P2 0.5
     pub fn stats(&self) -> ServerStats;                            // P1 0.5
     pub fn provider_name(&self) -> &'static str;                   // P1 0.3
+    pub fn handshakes_in_progress(&self) -> u32;                   // P1 0.3 (D-065)
     pub fn is_fips(&self) -> bool;                                 // P2 0.5
 }
 ```
@@ -1012,7 +1013,7 @@ pub struct HandshakeInfo<'s> {
 pub enum HandshakeKind { Full, FullWithHelloRetry, Resumed }
 ```
 
-`ServerSession::info()` and `ClientSession::info()` return `None` before `HandshakeComplete`. The server checks at completion that rustls's view of the SNI equals its own (defence idea 0.2); a mismatch fails the session with `PeerMisbehaved`.
+`ServerSession::info()` and `ClientSession::info()` return `None` before `HandshakeComplete`. The server's certificate resolver checks rustls's view of the SNI against the session's host group before a certificate is chosen; a disagreement refuses the handshake and is counted (D-064). `peer` and `fingerprint` arrive in `0.4.0`.
 
 ### `PeerIdentity`
 
@@ -1037,7 +1038,7 @@ Built once when the handshake completes, only when the peer sent a certificate (
 
 ### Exporters and channel binding
 
-P2, `0.4.0`.
+P2, with the rustls 0.24 adoption (at the latest `0.9.0`): rustls 0.23's unbuffered connections expose no exporter (D-052).
 
 ```rust
 impl ServerSession {   // and ClientSession
@@ -1156,6 +1157,7 @@ impl ServerSession {   // ClientSession has the same methods
     pub fn input_capacity_required(&self) -> usize;
     pub fn set_tag(&mut self, tag: u64);        // opaque id echoed in events (for example a connection id)
     pub fn error_code(&self) -> Option<u16>;    // the code that failed the session, once Failed
+    pub fn alert(&self) -> Option<u8>;          // the TLS alert sent or received when it failed (D-061)
 }
 ```
 
@@ -1308,12 +1310,17 @@ impl<'a> ClientHelloView<'a> {
     pub fn legacy_version(&self) -> u16;
     pub fn supported_versions(&self) -> impl Iterator<Item = u16> + 'a;
     pub fn cipher_suites(&self) -> impl Iterator<Item = u16> + 'a;          // wire order, GREASE included
-    pub fn extensions(&self) -> impl Iterator<Item = (u16, &'a [u8])> + 'a; // wire order
-    pub fn server_name(&self) -> Option<&'a str>;                           // validated LDH ASCII, as sent
+    pub fn extension_types(&self) -> impl Iterator<Item = u16> + 'a;        // wire order, across records
+    pub fn extension_count(&self) -> usize;
+    pub fn extensions(&self) -> impl Iterator<Item = (u16, &'a [u8])> + 'a; // wire order; data empty if it crosses a record
+    pub fn server_name(&self) -> Option<&'a str>;                           // validated LDH ASCII, as sent, one record
+    pub fn has_server_name(&self) -> bool;
+    pub fn normalized_server_name(&self) -> Option<NormalizedName>;         // FR-17, across records
     pub fn server_name_raw(&self) -> Option<&'a [u8]>;                      // P2: bytes as sent, for forensics
-    pub fn alpn(&self) -> impl Iterator<Item = &'a [u8]> + 'a;
+    pub fn alpn(&self) -> impl Iterator<Item = &'a [u8]> + 'a;              // names inside one record
+    pub fn has_alpn(&self) -> bool;
     pub fn groups(&self) -> impl Iterator<Item = u16> + 'a;
-    pub fn point_formats(&self) -> &'a [u8];
+    pub fn point_formats(&self) -> impl Iterator<Item = u8> + 'a;
     pub fn signature_algorithms(&self) -> impl Iterator<Item = u16> + 'a;
     pub fn key_share_groups(&self) -> impl Iterator<Item = u16> + 'a;
     pub fn has_pre_shared_key(&self) -> bool;
@@ -1475,7 +1482,6 @@ impl TlsError {
     pub fn category(&self) -> ErrorCategory;
     pub fn action(&self) -> Action;
     pub fn public_message(&self) -> &'static str;    // safe to show a remote client or end user
-    pub fn alert(&self) -> Option<u8>;               // TLS alert sent or received, if any
     pub fn required(&self) -> Option<usize>;         // OutputFull only: bytes needed
 }
 impl fmt::Display for TlsError { /* "TLS-0016: private key does not match the certificate" */ }
@@ -1540,7 +1546,7 @@ Carried by `PeerCertificateInvalid`.
 | TLS-0032 | `HelloTooLarge`, `HelloTooFragmented`, `HelloOverBudget { what }`, `HandshakeTooLarge`, `PeerChainTooLarge` | ResourceExhausted | None | Secure connection failed |
 | TLS-0033 | `Refused(RefuseReason)` | PermissionDenied | None | Secure connection failed |
 | TLS-0034 | `UnknownServerName` | NotFound | None | Secure connection failed |
-| TLS-0035 | `NoCommonVersion`, `NoCommonCipherSuite`, `NoCommonGroup`, `NoCommonSignatureScheme` | FailedPrecondition | None | Client and server have no TLS settings in common |
+| TLS-0035 | `NoCommonVersion`, `NoCommonCipherSuite`, `NoCommonGroup`, `NoCommonSignatureScheme`, `ExtendedMasterSecretRequired` | FailedPrecondition | None | Client and server have no TLS settings in common |
 | TLS-0036 | `NoApplicationProtocol` | FailedPrecondition | None | Client and server have no TLS settings in common |
 | TLS-0037 | `PeerCertificateInvalid(CertificateProblem)` | Unauthenticated | None | Certificate was not accepted |
 | TLS-0038 | `PeerCertificateRequired` | Unauthenticated | None | Certificate was not accepted |

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: design lock (<code>0.2.0</code>).</strong> The public API is written down in <a href="./docs/API.md"><code>docs/API.md</code></a> and the design and decisions in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>. No TLS code ships in this release; the server, the client, and the net-io adapter arrive in <code>0.3.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: core (<code>0.3.0</code>).</strong> Server and client sessions, policies, certificate loading with every check, SNI, ALPN, the ClientHello parser, the STARTTLS helper, and the net-io adapter work and are tested against OpenSSL and curl. Mutual TLS, reload, tickets, and fingerprints arrive in <code>0.4.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -53,14 +53,14 @@
 
 ```toml
 [dependencies]
-tls-net = "0.2"
+tls-net = "0.3"
 ```
 
 The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange.
 
 ## Quick start
 
-The API below ships in `0.3.0` (see [`docs/API.md`](./docs/API.md)).
+Tier 1: one call each. The full API, including the session loop a driver runs, is in [`docs/API.md`](./docs/API.md).
 
 ```rust
 // Server: certificate files from the operator, default policy, ALPN http/1.1.

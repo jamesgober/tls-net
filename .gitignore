@@ -6,6 +6,12 @@
 /target/
 **/*.rs.bk
 
+# Fuzzing: the corpus and findings live outside the repository
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
 # Editor & OS junk
 /.vscode
 .DS_Store

@@ -13,6 +13,59 @@
 
 ---
 
+## [0.3.0] - 2026-11-04
+
+Core. tls-net serves and connects over TLS 1.3 and TLS 1.2 through rustls's
+sans-IO API, and plugs into net-io as its TLS engine.
+
+### Added
+
+- Tier 1: `server_from_pem`, `server_from_files`, `client`, `client_with_ca_pem`,
+  `TlsServer::accept`, `TlsClient::connect`, `TlsClient::start_after_plaintext`
+  (STARTTLS with injection refusal).
+- `ServerBuilder` (`certificate`, `certificate_for`, `certificate_der`,
+  `unknown_name`, `alpn`, `policy`, `limits`, `load_limits`) and `ClientBuilder`
+  (`trust`, `policy`, `alpn`, `resumption`, `send_sni`, `limits`).
+- `Policy` with the presets `compatible`, `modern`, `internal`, `client_default`;
+  `Version`, `CipherSuite`, `Group`, `SignatureScheme` with wire codes.
+- `ServerSession` and `ClientSession`: `step`, `encrypt`, `close`, `on_eof`,
+  `info`, `input_capacity_required`, `set_tag`, `error_code`, `alert`; `Progress`,
+  `Event`, `CloseKind`, `SessionState`, `OUTGOING_MIN`, `INCOMING_MIN`,
+  `MAX_RECORD_PAYLOAD`.
+- Certificate loading with every check: size gate, Unix key file permissions,
+  PEM labels (encrypted keys named), one key only, key match, validity with skew,
+  SAN name coverage (RFC 9525 wildcards), key size and type, SHA-1 refusal, EKU,
+  chain order. `KeySource::{Pem, Der, File}`, `LoadLimits`.
+- SNI: exact and single-label wildcard names, ECDSA and RSA certificates for one
+  name, default certificate or a 7-byte `unrecognized_name` refusal that is the
+  same for every name; `normalize_server_name`.
+- ClientHello parser: `HelloParser`, `HelloParse`, `ClientHelloView`,
+  `HelloLimits`, `is_grease`; zero-copy across up to 16 records, every budget
+  checked before work.
+- Handshake budgets (`HandshakeLimits`): capacity gate per server, inbound
+  handshake bytes, peer chain length and size.
+- `TlsError` with codes `TLS-0000` to `TLS-0050`, `ErrorCategory`, `Action`,
+  `public_message`; `CertificateProblem`, `RefuseReason`.
+- `TrustAnchors::{mozilla, from_pem, from_der}`, `ServerIdentity::{Dns, Ip}`,
+  `DnsName`, `HandshakeInfo`, `HandshakeKind`, `default_provider_name`.
+- The net-io adapter (feature `net-io`, now on by default): `TlsServer` is a
+  `net_io::TlsAcceptor`, both sessions are `net_io::TlsSession`, for net-io
+  0.4 to 0.6.
+- Examples `https_server_blocking` and `https_get`; tests for every load-time
+  check, attack tests for T-1, T-2, T-3, T-5, T-6, T-7, T-9, T-13, T-14, T-17,
+  T-20, T-22, T-25, T-28, a counting-allocator test, property tests, an
+  end-to-end net-io test, opt-in interop tests against OpenSSL and curl and
+  public sites, and five fuzz targets.
+
+### Changed
+
+- The ClientHello parser, the net-io adapter, and the STARTTLS helper shipped in
+  this release instead of 0.4 and 0.5 (D-036 to D-038).
+- Exporters and channel binding move to the rustls 0.24 adoption: rustls 0.23's
+  unbuffered connections have no exporter (D-052).
+- Application data that arrives in the same flight as the peer's Finished is
+  delivered after `HandshakeComplete`, never before (D-066).
+
 ## [0.2.0] - 2026-11-04
 
 Design lock. The public API from `0.3.0` to `1.0.0` is written down; no TLS code
@@ -59,6 +112,7 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/tls-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/tls-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/tls-net/releases/tag/v0.1.0
