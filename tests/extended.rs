@@ -550,12 +550,13 @@ fn test_internal_preset_back_channel_t2_t4() {
         let info = p.server.info().unwrap();
         assert_eq!(info.version, Version::Tls13);
         assert_eq!(info.group, Some(tls_net::Group::X25519MlKem768));
-        // An X25519-only peer is refused (post-quantum stripping, T-4).
+        // A peer with only a classical group is refused (post-quantum
+        // stripping, T-4). P-256, so the test also runs in FIPS builds.
         let classical = ClientBuilder::new()
             .trust(ca())
             .policy(
                 Policy::client_default()
-                    .groups(&[tls_net::Group::X25519])
+                    .groups(&[tls_net::Group::Secp256r1])
                     .unwrap(),
             )
             .alpn(&[Alpn::new(b"svc-bc/1").unwrap()])

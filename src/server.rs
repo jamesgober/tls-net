@@ -435,7 +435,7 @@ impl TlsServer {
         report
     }
 
-    /// The crypto provider: `"aws-lc-rs"` or `"ring"`.
+    /// The crypto provider: `"aws-lc-rs"`, `"aws-lc-rs (FIPS)"`, or `"ring"`.
     #[must_use]
     pub fn provider_name(&self) -> &'static str {
         self.inner.provider_name

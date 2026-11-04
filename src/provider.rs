@@ -25,14 +25,15 @@ pub(crate) fn parts() -> Option<ProviderParts> {
     })
 }
 
-/// FIPS builds take only the provider's default (approved) suites and groups.
+/// FIPS builds: the policy keeps only what rustls reports as approved
+/// (`Policy::provider`, D-095).
 #[cfg(feature = "fips")]
 pub(crate) fn parts() -> Option<ProviderParts> {
     use rustls::crypto::aws_lc_rs as p;
     Some(ProviderParts {
         base: rustls::crypto::default_fips_provider(),
-        all_suites: p::DEFAULT_CIPHER_SUITES,
-        all_groups: p::DEFAULT_KX_GROUPS,
+        all_suites: p::ALL_CIPHER_SUITES,
+        all_groups: p::ALL_KX_GROUPS,
         name: "aws-lc-rs (FIPS)",
     })
 }
@@ -53,12 +54,12 @@ pub(crate) fn parts() -> Option<ProviderParts> {
     None
 }
 
-/// The provider this build uses: `"aws-lc-rs"`, `"ring"`, or `None` in a build
+/// The provider this build uses: `"aws-lc-rs"`, `"aws-lc-rs (FIPS)"`, `"ring"`, or `None` in a build
 /// without a provider feature. Installing a process-default rustls provider
 /// elsewhere never changes it.
 ///
 /// ```
-/// # #[cfg(feature = "aws-lc")]
+/// # #[cfg(all(feature = "aws-lc", not(feature = "fips")))]
 /// assert_eq!(tls_net::default_provider_name(), Some("aws-lc-rs"));
 /// ```
 #[must_use]

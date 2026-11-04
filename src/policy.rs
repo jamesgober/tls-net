@@ -349,6 +349,8 @@ pub struct Policy {
     /// Groups named by the caller must exist; preset groups the provider
     /// lacks (ML-KEM with ring) are skipped.
     groups_explicit: bool,
+    /// The same for suites (ChaCha20 in a FIPS build, D-095).
+    suites_explicit: bool,
     ems: bool,
     server_order: bool,
     post_quantum: bool,
@@ -378,6 +380,7 @@ impl Policy {
                 Group::Secp384r1,
             ],
             groups_explicit: false,
+            suites_explicit: false,
             ems: true,
             server_order: true,
             post_quantum: false,
@@ -493,6 +496,7 @@ impl Policy {
     /// `PolicyInvalid` for an empty list or a duplicate.
     pub fn cipher_suites(mut self, suites: &[CipherSuite]) -> Result<Policy, TlsError> {
         self.suites = list(suites, "cipher suite list")?;
+        self.suites_explicit = true;
         Ok(self)
     }
 
@@ -577,17 +581,26 @@ impl Policy {
             if !self.versions.contains(&s.version()) {
                 continue;
             }
-            let found = parts
+            match parts
                 .all_suites
                 .iter()
-                .find(|p| u16::from(p.suite()) == s.wire())
-                .ok_or(TlsError::PolicyInvalid {
-                    reason: "a cipher suite is not available in this provider",
-                })?;
-            cipher_suites.push(*found);
+                .find(|p| u16::from(p.suite()) == s.wire() && approved(p.fips()))
+            {
+                Some(found) => cipher_suites.push(*found),
+                None if !self.suites_explicit => {}
+                None => {
+                    return Err(TlsError::PolicyInvalid {
+                        reason: "a cipher suite is not available in this provider",
+                    });
+                }
+            }
         }
         for v in &self.versions {
-            if !self.suites.iter().any(|s| s.version() == *v) {
+            let wire = match v {
+                Version::Tls12 => rustls::ProtocolVersion::TLSv1_2,
+                Version::Tls13 => rustls::ProtocolVersion::TLSv1_3,
+            };
+            if !cipher_suites.iter().any(|s| s.version().version == wire) {
                 return Err(TlsError::PolicyInvalid {
                     reason: "an allowed version has no cipher suite",
                 });
@@ -601,7 +614,7 @@ impl Policy {
             match parts
                 .all_groups
                 .iter()
-                .find(|p| u16::from(p.name()) == g.wire())
+                .find(|p| u16::from(p.name()) == g.wire() && approved(p.fips()))
             {
                 Some(found) => kx_groups.push(*found),
                 None if !self.groups_explicit && !self.post_quantum => {}
@@ -628,6 +641,12 @@ impl Policy {
             ..parts.base
         }))
     }
+}
+
+/// In a FIPS build only what rustls itself reports as FIPS-approved is used,
+/// so every built configuration passes rustls's `fips()` check (D-095).
+fn approved(fips: bool) -> bool {
+    fips || !cfg!(feature = "fips")
 }
 
 fn list<T: Copy + PartialEq>(items: &[T], what: &'static str) -> Result<Vec<T>, TlsError> {
@@ -708,7 +727,9 @@ mod tests {
         let p = Policy::internal().provider().unwrap();
         assert_eq!(p.kx_groups.len(), 1);
         assert_eq!(u16::from(p.kx_groups[0].name()), 0x11ec);
-        assert_eq!(p.cipher_suites.len(), 3);
+        // AES-256-GCM, AES-128-GCM, and ChaCha20 (not approved in FIPS builds).
+        let expected = if cfg!(feature = "fips") { 2 } else { 3 };
+        assert_eq!(p.cipher_suites.len(), expected);
     }
 
     #[cfg(feature = "aws-lc")]

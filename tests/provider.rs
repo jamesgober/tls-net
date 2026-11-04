@@ -25,7 +25,7 @@ fn test_t28_process_default_provider_is_ignored() {
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();
-    assert_eq!(server.provider_name(), "aws-lc-rs");
+    assert!(server.provider_name().starts_with("aws-lc-rs"));
     let (mut s, mut c) = (
         server.accept().unwrap(),
         client.connect("localhost").unwrap(),
