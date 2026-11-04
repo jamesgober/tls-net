@@ -638,34 +638,41 @@ fn test_server_reader_follows_reloads() {
 
 #[test]
 fn test_reload_under_load_zero_failed_handshakes() {
-    // Handshakes on four threads while a fifth reloads every few milliseconds
-    // (scaled down from PLAN's 10-minute run, which the soak job covers).
+    // Handshakes on four threads while a fifth reloads every 2 ms, until at
+    // least 20 reloads and 200 handshakes have happened (scaled down from
+    // PLAN's 10-minute run, which the soak covers, D-081).
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     let server = site().build().unwrap();
     let client = plain_client();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let reloads = Arc::new(AtomicU64::new(0));
+    let handshakes = Arc::new(AtomicU64::new(0));
     let reloader = {
-        let (server, stop) = (server.clone(), Arc::clone(&stop));
+        let (server, stop, reloads) = (server.clone(), Arc::clone(&stop), Arc::clone(&reloads));
         std::thread::spawn(move || {
-            let mut n = 0u32;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop.load(Relaxed) {
+                let n = reloads.load(Relaxed);
                 let (chain, key) = if n % 2 == 0 {
                     ("site-rsa.pem", "site-rsa.key")
                 } else {
                     ("site.pem", "site.key")
                 };
                 server.reload_from_pem(&data(chain), &data(key)).unwrap();
-                n += 1;
+                reloads.fetch_add(1, Relaxed);
                 std::thread::sleep(Duration::from_millis(2));
             }
-            n
         })
     };
     let workers: Vec<_> = (0..4)
         .map(|_| {
-            let (server, client) = (server.clone(), client.clone());
+            let (server, client, stop, handshakes) = (
+                server.clone(),
+                client.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&handshakes),
+            );
             std::thread::spawn(move || {
-                let mut done = 0;
-                for _ in 0..50 {
+                while !stop.load(Relaxed) {
                     let p = connect(&server, &client, "localhost");
                     assert!(
                         p.s.complete && p.c.complete,
@@ -673,17 +680,32 @@ fn test_reload_under_load_zero_failed_handshakes() {
                         p.s.error,
                         p.c.error
                     );
-                    done += 1;
+                    handshakes.fetch_add(1, Relaxed);
                 }
-                done
             })
         })
         .collect();
-    let total: i32 = workers.into_iter().map(|w| w.join().unwrap()).sum();
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let reloads = reloader.join().unwrap();
-    assert_eq!(total, 200);
-    assert!(reloads > 5, "{reloads} reloads");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while (reloads.load(Relaxed) < 20 || handshakes.load(Relaxed) < 200)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stop.store(true, Relaxed);
+    for w in workers {
+        w.join().unwrap();
+    }
+    reloader.join().unwrap();
+    assert!(
+        reloads.load(Relaxed) >= 20,
+        "{} reloads",
+        reloads.load(Relaxed)
+    );
+    assert!(
+        handshakes.load(Relaxed) >= 200,
+        "{} handshakes",
+        handshakes.load(Relaxed)
+    );
 }
 
 #[test]
