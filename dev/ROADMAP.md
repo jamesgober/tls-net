@@ -32,12 +32,14 @@ Exit: a tls-net server serves HTTPS to curl and OpenSSL `s_client` over the loop
 
 ## v0.4.0 - Extended
 Exit: mutual TLS end to end (pinned CA and pinned SPKI with signature checks; T-6b passes); reload under load with zero failed handshakes (1,000 handshakes per second, a reload every second, 10 minutes); ticket ring in all three modes with resumption across a reload; JA4 and JA3 with known-answer tests; the hook refuses by fingerprint; key-vault custody in both modes; expiry report; OCSP static staple; exporters and channel binding.
-- [ ] Tier 1: `reload_from_pem`, `reload_from_files`, `expiry_report`.
-- [ ] Tier 2: `client_auth`, `ClientAuth::*`, `HostPolicy`, `AlpnPolicy`, `hello_limits`, `tickets`, `TicketMode::*`, `session_cache`, `ocsp_staple`, `Crls`, `RevocationPolicy`, `ServerIdentity::Pinned`, `ReloadHandle`, `ExpiryReport`, `PeerIdentity`, `KeySource::Vault`, `KeyCustody::*`; tests for `Policy::internal`, `require_post_quantum`, `max_fragment_size` (shipped in 0.3).
+- [x] Tier 1: `reload_from_pem`, `reload_from_files`, `expiry_report`.
+- [x] Tier 2: `client_auth`, `ClientAuth` (struct, D-067), `HostPolicy`, `AlpnPolicy`, `hello_limits`, `tickets`, `TicketMode::*`, `session_cache`, `ocsp_staple`, `Crls`, `RevocationPolicy`, `ServerIdentity::Pinned`, `ReloadHandle`, `ExpiryReport`, `PeerIdentity`, `KeySource::Vault`, `KeyCustody::*`, `ClientBuilder::{client_certificate, crls}`; tests for `Policy::internal`, `require_post_quantum`, `max_fragment_size`.
 - Moved: `export_keying_material` and `channel_binding` to the rustls 0.24 adoption, at the latest 0.9 (D-052: rustls 0.23's unbuffered API has no exporter).
-- [ ] Tier 3: `ServerReader`, `ClientHelloView` accessors, `HelloHook`, `Fingerprint`, `Ja4`, `ja4_raw`, `ja4_original`, `ja3_string`.
-- [ ] loom tests for the snapshot, capacity gate, and ticket ring.
-- [ ] Attack tests T-2, T-4, T-6b, T-7, T-10, T-11, T-12, T-15, T-16, T-18, T-19, T-22.
+- [x] Tier 3: `ServerReader`, `ClientHelloView` accessors, `HelloHook`, `Fingerprint`, `Ja4` (FoxIO known answer), `ja4_raw`, `ja4_original`, `ja3_string`.
+- [x] loom tests for the snapshot, capacity gate, and ticket ring (D-080).
+- [x] Attack tests T-4, T-6b, T-10, T-11, T-12, T-15, T-16, T-18, T-19, T-22 (server side); T-2 and T-7 since 0.3.
+- [x] Fuzz target `ticket_open`.
+- Moved: the 10-minute reload-under-load run at 1,000 handshakes per second to the 0.7 soak (D-081); the default suite runs a scaled version.
 
 ## v0.5.0 - Feature complete
 Exit: smtp-net-shaped STARTTLS and implicit TLS flows against a scripted relay and an external relay with verification; outbound HTTPS from a client; hand-off export and import between two processes keeps resumption; observer events and stats; FIPS build passes `is_fips()` in a Linux CI job; platform verifier on all three OSes; every P0, P1, P2 item shipped or moved with a recorded reason.

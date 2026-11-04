@@ -65,3 +65,6 @@ openssl pkcs8 -topk8 -nocrypt -in site.key -outform DER -out site.key.der
 openssl x509 -in site.pem -out site.leaf.crt
 cat inter.pem site.leaf.crt > site.reversed.pem
 rm -f site.leaf.crt ca.csr inter.csr ca.ext ca.srl inter.srl
+
+# OCSP staples for site.pem.
+bash ocsp.sh

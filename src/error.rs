@@ -603,6 +603,8 @@ pub(crate) fn from_rustls(e: &rustls::Error) -> TlsError {
             Ce::UnknownRevocationStatus => {
                 TlsError::PeerCertificateInvalid(CertificateProblem::UnknownRevocationStatus)
             }
+            Ce::Other(other) => crate::verify::pin_error(other)
+                .unwrap_or(TlsError::PeerCertificateInvalid(CertificateProblem::Other)),
             _ => TlsError::PeerCertificateInvalid(CertificateProblem::Other),
         },
         R::NoCertificatesPresented => TlsError::PeerCertificateRequired,

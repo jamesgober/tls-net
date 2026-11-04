@@ -5,15 +5,18 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use rustls::RootCertStore;
-use rustls::client::{Resumption, UnbufferedClientConnection};
+use rustls::client::{ResolvesClientCert, Resumption, UnbufferedClientConnection};
 use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::sign::CertifiedKey;
+use rustls::{RootCertStore, SignatureScheme};
 
+use crate::certs::{self, CertificateEntry, Chain, KeySource, LoadOptions, Purpose};
 use crate::error::{self, TlsError};
 use crate::limits::HandshakeLimits;
 use crate::policy::Policy;
 use crate::server::Alpn;
 use crate::session::ClientSession;
+use crate::verify::{Crls, PinnedServer, Pins, RevocationPolicy};
 
 /// Certificates a client trusts as roots.
 ///
@@ -80,6 +83,10 @@ impl TrustAnchors {
         })
     }
 
+    pub(crate) fn roots(&self) -> Arc<RootCertStore> {
+        Arc::clone(&self.roots)
+    }
+
     /// How many anchors.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -143,6 +150,19 @@ pub enum ServerIdentity {
     Dns(DnsName),
     /// An IP address: no SNI is sent (RFC 6066); the certificate must carry it.
     Ip(IpAddr),
+    /// A DNS name whose server key must match one of the SPKI SHA-256 pins.
+    /// With `require_chain` the chain is verified against the client's
+    /// anchors first; without, a self-issued certificate is accepted when its
+    /// key matches a pin (the name is not checked). The handshake signature
+    /// and the validity window are always verified (T-6b).
+    Pinned {
+        /// Sent as SNI (and checked, with `require_chain`).
+        name: DnsName,
+        /// SHA-256 of acceptable SubjectPublicKeyInfos.
+        spki_sha256: Vec<[u8; 32]>,
+        /// Verify the chain against the anchors as well.
+        require_chain: bool,
+    },
 }
 
 impl ServerIdentity {
@@ -160,7 +180,7 @@ impl ServerIdentity {
 
     fn server_name(&self) -> Result<(ServerName<'static>, Box<str>), TlsError> {
         match self {
-            ServerIdentity::Dns(d) => {
+            ServerIdentity::Dns(d) | ServerIdentity::Pinned { name: d, .. } => {
                 let name =
                     rustls::pki_types::DnsName::try_from(d.as_str().to_owned()).map_err(|_| {
                         TlsError::InvalidName {
@@ -177,9 +197,70 @@ impl ServerIdentity {
 }
 
 struct Inner {
-    config: Option<Arc<rustls::ClientConfig>>,
+    /// Verifies against the anchors; refuses every certificate without them.
+    config: Arc<rustls::ClientConfig>,
+    anchors: bool,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
     limits: HandshakeLimits,
     provider_name: &'static str,
+    trust: Option<TrustAnchors>,
+    crls: Option<(Crls, RevocationPolicy)>,
+}
+
+/// One client certificate for mutual TLS.
+#[derive(Debug)]
+struct OneClientCert(Arc<CertifiedKey>);
+
+impl ResolvesClientCert for OneClientCert {
+    fn resolve(&self, _hints: &[&[u8]], _schemes: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// The verifier of a client without anchors: every certificate is refused
+/// unless a pinned identity replaces it for one connection.
+#[derive(Debug)]
+struct NoAnchors(rustls::crypto::WebPkiSupportedAlgorithms);
+
+impl rustls::client::danger::ServerCertVerifier for NoAnchors {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
 }
 
 /// A TLS client. Keep it and reuse it: it holds the resumption store, which
@@ -202,7 +283,7 @@ pub struct TlsClient {
 impl fmt::Debug for TlsClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsClient")
-            .field("anchors", &self.inner.config.is_some())
+            .field("anchors", &self.inner.anchors)
             .field("provider", &self.inner.provider_name)
             .finish_non_exhaustive()
     }
@@ -230,12 +311,49 @@ impl TlsClient {
     ///
     /// As `connect`.
     pub fn connect_to(&self, identity: &ServerIdentity) -> Result<ClientSession, TlsError> {
-        let config = self.inner.config.as_ref().ok_or(TlsError::PolicyInvalid {
+        let no_anchors = TlsError::PolicyInvalid {
             reason: "no trust anchors",
-        })?;
+        };
+        let config = match identity {
+            ServerIdentity::Pinned {
+                spki_sha256,
+                require_chain,
+                ..
+            } => {
+                if spki_sha256.is_empty() {
+                    return Err(TlsError::PolicyInvalid {
+                        reason: "a pinned identity needs at least one pin",
+                    });
+                }
+                if *require_chain && !self.inner.anchors {
+                    return Err(no_anchors);
+                }
+                // One configuration for this connection; the resumption store
+                // is shared with the client (it sits behind an Arc).
+                let inner = match (&self.inner.trust, *require_chain) {
+                    (Some(anchors), true) => Some(crate::verify::server_verifier(
+                        anchors,
+                        self.inner.crls.as_ref(),
+                        self.inner.config.crypto_provider(),
+                    )?),
+                    _ => None,
+                };
+                let mut config = (*self.inner.config).clone();
+                config
+                    .dangerous()
+                    .set_certificate_verifier(Arc::new(PinnedServer {
+                        inner,
+                        pins: Pins(spki_sha256.clone()),
+                        algs: self.inner.algs,
+                    }));
+                Arc::new(config)
+            }
+            _ if !self.inner.anchors => return Err(no_anchors),
+            _ => Arc::clone(&self.inner.config),
+        };
         let (name, shown) = identity.server_name()?;
-        let conn = UnbufferedClientConnection::new(Arc::clone(config), name)
-            .map_err(|e| error::from_rustls(&e))?;
+        let conn =
+            UnbufferedClientConnection::new(config, name).map_err(|e| error::from_rustls(&e))?;
         Ok(ClientSession::new(conn, shown, &self.inner.limits))
     }
 
@@ -285,6 +403,8 @@ pub struct ClientBuilder {
     resumption: usize,
     send_sni: bool,
     limits: HandshakeLimits,
+    certificate: Option<CertificateEntry>,
+    crls: Option<(Crls, RevocationPolicy)>,
 }
 
 impl Default for ClientBuilder {
@@ -303,7 +423,36 @@ impl ClientBuilder {
             resumption: 256,
             send_sni: true,
             limits: HandshakeLimits::client(),
+            certificate: None,
+            crls: None,
         }
+    }
+
+    /// A client certificate for mutual TLS: the same load-time checks as a
+    /// server certificate, with `clientAuth` in place of `serverAuth`.
+    ///
+    /// # Errors
+    ///
+    /// `TLS-0010` to `TLS-0020` from the load-time checks.
+    pub fn client_certificate(
+        mut self,
+        chain_pem: &[u8],
+        key: KeySource<'_>,
+    ) -> Result<Self, TlsError> {
+        let entry = certs::load(
+            Chain::Pem(chain_pem),
+            key,
+            None,
+            &LoadOptions::new(Purpose::Client),
+        )?;
+        self.certificate = Some(entry);
+        Ok(self)
+    }
+
+    /// Checks server certificates against these CRLs.
+    pub fn crls(mut self, crls: Crls, policy: RevocationPolicy) -> Self {
+        self.crls = Some((crls, policy));
+        self
     }
 
     /// The trust anchors.
@@ -350,33 +499,46 @@ impl ClientBuilder {
     pub fn build(self) -> Result<TlsClient, TlsError> {
         let provider_name = crate::provider::parts().ok_or(TlsError::NoProvider)?.name;
         let provider = self.policy.provider()?;
-        let config = match self.trust {
-            None => None,
-            Some(anchors) => {
-                let mut config = rustls::ClientConfig::builder_with_provider(provider)
-                    .with_protocol_versions(&self.policy.rustls_versions())
-                    .map_err(|_| TlsError::PolicyInvalid {
-                        reason: "the provider cannot do these versions",
-                    })?
-                    .with_root_certificates(Arc::clone(&anchors.roots))
-                    .with_no_client_auth();
-                config.alpn_protocols = self.alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
-                config.enable_sni = self.send_sni;
-                config.resumption = if self.resumption == 0 {
-                    Resumption::disabled()
-                } else {
-                    Resumption::in_memory_sessions(self.resumption)
-                };
-                config.require_ems = self.policy.ems();
-                config.max_fragment_size = self.policy.fragment().map(|f| f + 5);
-                Some(Arc::new(config))
-            }
+        let algs = provider.signature_verification_algorithms;
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(&self.policy.rustls_versions())
+            .map_err(|_| TlsError::PolicyInvalid {
+                reason: "the provider cannot do these versions",
+            })?;
+        let anchors = self.trust.is_some();
+        let builder = match &self.trust {
+            Some(anchors) => builder.with_webpki_verifier(crate::verify::server_verifier(
+                anchors,
+                self.crls.as_ref(),
+                &provider,
+            )?),
+            None => builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoAnchors(algs))),
         };
+        let mut config = match self.certificate {
+            Some(entry) => builder
+                .with_client_cert_resolver(Arc::new(OneClientCert(Arc::clone(&entry.certified)))),
+            None => builder.with_no_client_auth(),
+        };
+        config.alpn_protocols = self.alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
+        config.enable_sni = self.send_sni;
+        config.resumption = if self.resumption == 0 {
+            Resumption::disabled()
+        } else {
+            Resumption::in_memory_sessions(self.resumption)
+        };
+        config.require_ems = self.policy.ems();
+        config.max_fragment_size = self.policy.fragment().map(|f| f + 5);
         Ok(TlsClient {
             inner: Arc::new(Inner {
-                config,
+                config: Arc::new(config),
+                anchors,
+                algs,
                 limits: self.limits,
                 provider_name,
+                trust: self.trust,
+                crls: self.crls,
             }),
         })
     }

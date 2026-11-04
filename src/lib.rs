@@ -50,9 +50,14 @@
 
 mod certs;
 mod client;
+#[cfg(feature = "key-vault")]
+mod custody;
 mod der;
 mod error;
+mod expiry;
+mod fingerprint;
 mod hello;
+mod hook;
 mod identity;
 mod limits;
 mod pem;
@@ -62,7 +67,11 @@ mod provider;
 mod seam;
 mod server;
 mod session;
+mod snapshot;
 mod sni;
+mod sync;
+mod tickets;
+mod verify;
 
 /// Entry points for the fuzz targets only (`cargo fuzz` sets `cfg(fuzzing)`).
 #[cfg(fuzzing)]
@@ -72,6 +81,22 @@ pub mod fuzz {
     pub fn der_fields(data: &[u8]) -> bool {
         let _ = crate::der::key_form(data);
         crate::der::parse_certificate(data).is_some()
+    }
+
+    /// Opens arbitrary bytes as a session ticket: never panics, never succeeds
+    /// on anything this ring did not seal.
+    pub fn ticket_open(data: &[u8]) -> bool {
+        use rustls::server::ProducesTickets;
+        use std::sync::OnceLock;
+        static RING: OnceLock<Option<crate::tickets::TicketKeyRing>> = OnceLock::new();
+        let ring = RING.get_or_init(|| {
+            let mode = crate::tickets::TicketMode::Ratchet {
+                seed: crate::tickets::TicketSeed::from_bytes([5; 32]),
+                period: std::time::Duration::from_secs(3600),
+            };
+            crate::tickets::TicketKeyRing::new(&mode).ok().flatten()
+        });
+        ring.as_ref().is_some_and(|r| r.decrypt(data).is_some())
     }
 
     /// PEM and DER intake on arbitrary bytes.
@@ -90,18 +115,30 @@ pub use certs::{KeySource, LoadLimits};
 pub use client::{
     ClientBuilder, DnsName, ServerIdentity, TlsClient, TrustAnchors, client, client_with_ca_pem,
 };
+#[cfg(feature = "key-vault")]
+pub use custody::KeyCustody;
 pub use error::{Action, CertificateProblem, ErrorCategory, RefuseReason, TlsError};
+pub use expiry::{CertificateInfo, ExpiryReport, ExpiryState, KeyType};
+pub use fingerprint::{Fingerprint, FingerprintKinds, Ja4, ja3_string, ja4_original, ja4_raw};
 pub use hello::{ClientHelloView, HelloLimits, HelloParse, HelloParser, is_grease};
-pub use identity::{HandshakeInfo, HandshakeKind};
+pub use hook::{HelloContext, HelloHook, HelloVerdict};
+pub use identity::{
+    HandshakeInfo, HandshakeKind, PeerIdentity, certificate_der_from_pem, spki_sha256,
+};
 pub use limits::HandshakeLimits;
 pub use policy::{CipherSuite, Group, Policy, SignatureScheme, Version};
 pub use provider::default_provider_name;
-pub use server::{Alpn, ServerBuilder, TlsServer, UnknownName, server_from_files, server_from_pem};
+pub use server::{
+    Alpn, AlpnPolicy, HostPolicy, ReloadHandle, ReloadOutcome, ServerBuilder, ServerReader,
+    TlsServer, UnknownName, server_from_files, server_from_pem,
+};
 pub use session::{
     ClientSession, CloseKind, Event, INCOMING_MIN, MAX_RECORD_PAYLOAD, OUTGOING_MIN, Progress,
     ServerSession, SessionState,
 };
 pub use sni::{NormalizedName, normalize_server_name};
+pub use tickets::{TicketMode, TicketSeed};
+pub use verify::{ClientAuth, Crls, RevocationPolicy};
 
 /// Crate version string, populated by Cargo at build time.
 ///

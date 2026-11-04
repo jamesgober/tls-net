@@ -142,7 +142,6 @@ pub(crate) struct Eku {
 /// Facts read from one certificate.
 #[derive(Clone, Debug)]
 pub(crate) struct CertFacts<'a> {
-    #[allow(dead_code, reason = "read by PeerIdentity (0.4)")]
     pub(crate) serial: &'a [u8],
     pub(crate) issuer: &'a [u8],
     pub(crate) subject: &'a [u8],
@@ -157,6 +156,52 @@ pub(crate) struct CertFacts<'a> {
     pub(crate) uri_names: Vec<&'a str>,
     /// `None` when the certificate has no EKU extension.
     pub(crate) eku: Option<Eku>,
+}
+
+/// What an OCSP response says about its first certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OcspFacts {
+    /// `certStatus` is `good`.
+    pub(crate) good: bool,
+    pub(crate) this_update: SystemTime,
+    pub(crate) next_update: Option<SystemTime>,
+}
+
+/// Reads an OCSPResponse (RFC 6960): `successful`, a BasicOCSPResponse, and
+/// the first SingleResponse's status and update times. `None` if malformed.
+/// The response's signature is checked by the client, not here.
+pub(crate) fn ocsp_facts(der: &[u8]) -> Option<OcspFacts> {
+    let mut outer = Reader::new(der);
+    let mut resp = Reader::new(outer.expect(SEQUENCE)?);
+    if !outer.is_empty() {
+        return None;
+    }
+    // responseStatus ENUMERATED: 0 = successful.
+    if resp.expect(0x0a)? != [0] {
+        return None;
+    }
+    let mut bytes = Reader::new(Reader::new(resp.expect(0xa0)?).expect(SEQUENCE)?);
+    bytes.expect(OID)?;
+    let basic = bytes.expect(OCTET_STRING)?;
+    let mut basic = Reader::new(Reader::new(basic).expect(SEQUENCE)?);
+    let mut data = Reader::new(basic.expect(SEQUENCE)?);
+    data.optional(0xa0); // version
+    data.next()?; // responderID
+    data.expect(GENERALIZED_TIME)?; // producedAt
+    let mut responses = Reader::new(data.expect(SEQUENCE)?);
+    let mut single = Reader::new(responses.expect(SEQUENCE)?);
+    single.expect(SEQUENCE)?; // certID
+    let status = single.next()?;
+    let this_update = time(single.next()?)?;
+    let next_update = match single.optional(0xa0) {
+        Some(inner) => Some(time(Reader::new(inner).next()?)?),
+        None => None,
+    };
+    Some(OcspFacts {
+        good: status.tag == 0x80,
+        this_update,
+        next_update,
+    })
 }
 
 /// The form of a DER private key, from its structure: PKCS#8 is

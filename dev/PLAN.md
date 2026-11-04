@@ -4,7 +4,7 @@
 >
 > **Read order:** [`../REPS.md`](../REPS.md) &rarr; [`DIRECTIVES.md`](./DIRECTIVES.md) &rarr; **this file** &rarr; [`ROADMAP.md`](./ROADMAP.md) &rarr; [`../docs/API.md`](../docs/API.md).
 >
-> **Status:** `0.3.0`, core. Facts about rustls were checked against the rustls 0.23.46 source. Numbers that were not measured are marked [est.]; numbers that are goals are marked [target].
+> **Status:** `0.4.0`, extended. Facts about rustls were checked against the rustls 0.23.46 source. Numbers that were not measured are marked [est.]; numbers that are goals are marked [target].
 
 ---
 
@@ -623,6 +623,7 @@ None blocks a pre-1.0 release. James decides 1.0 (DIRECTIVES section 3, item 10 
 |---|---|---|
 | Q-1 | rustls 0.24 (providers in separate crates, new input buffering, split mode): does it deliver plaintext in place, so the D-035 copy goes away? | checked when 0.24 is released as stable, at the latest in 0.9 (D-007) |
 | Q-2 | Windows key file ACL check (FR-49 counterpart) | P3 after 1.0 through a first-party Windows security crate (D-028) |
+| Q-3 | Ticket ring keys in key-vault (rotated on advance) instead of tls-net's wiped buffers? | measured at 0.6 against the seal and open targets (D-070) |
 
 ## 13. Decision log
 
@@ -694,3 +695,21 @@ None blocks a pre-1.0 release. James decides 1.0 (DIRECTIVES section 3, item 10 
 | D-064 | 2026-11-04 | rustls 0.23.46's unbuffered server connection has no `server_name()` accessor, so defence idea 0.2 runs inside the group resolver: rustls's SNI is normalised and checked against the session's group, and each disagreement is counted | the check runs before the certificate is chosen, earlier than a comparison after the handshake |
 | D-065 | 2026-11-04 | `TlsServer::handshakes_in_progress()` is public | operators and tests need the gate's state without waiting for `ServerStats` (0.5) |
 | D-066 | 2026-11-04 | When application data (or `close_notify`) arrives in the same flight as the peer's Finished, rustls hands it out before it reports the handshake complete. The session reports `HandshakeComplete` first and keeps the plaintext at the front of the unconsumed input (it reports that many bytes fewer as consumed); the next `step` hands it out as `Data` before rustls runs again | net-io refuses plaintext before `HandshakeComplete`, and clients such as curl send their first request with their Finished; found by the CI interop job, now covered by an in-memory test and a net-io test |
+| D-067 | 2026-11-04 | `ClientAuth` is a struct with constructors (`none`, `optional`, `required`, `pinned`) and modifiers (`with_crls`, `hide_ca_names`), not an enum | CRLs and CA-name hiding apply to several modes; an enum would repeat the fields in each variant |
+| D-068 | 2026-11-04 | `ServerBuilder` defaults: stateless tickets in `Ephemeral` mode with 6-hour epochs and 2 tickets per handshake (off for `Policy::internal()`), session cache of 1,024 entries | the same as rustls's own provider ticketer, with tls-net's AEAD; internal peers reconnect rarely and keep no ticket state to steal |
+| D-069 | 2026-11-04 | key-vault is used with `std`, `mlock`, `zeroize`, and `fragment-standard` (its defaults minus the decoy) | turning key-vault's default features off had dropped page locking and wiping, the properties custody relies on |
+| D-070 | 2026-11-04 | Ticket ring keys live in tls-net's wiped buffers; the ratchet seed or the derived root may come from key-vault (`TicketSeed::Vault`) | a vault access per ticket seal and open adds a callback per handshake and the AEAD key schedule copies the key anyway; revisited with measurements at 0.6 (Q-3) |
+| D-071 | 2026-11-04 | OCSP staples are checked when given (`ocsp_staple`): at most 16 KiB, a successful response, status good, `thisUpdate` not in the future, `nextUpdate` not past; a failing staple is an error at that call (and so refuses a reload) rather than being dropped silently | until events exist (0.5) a dropped staple would be invisible; refusing at the call tells the operator at once |
+| D-072 | 2026-11-04 | `HelloLimits::max_ciphers` ranges 1 to 1,024 (default 512) | the fingerprint sorts ciphers in a stack array of that size (2 KiB), so JA4 stays exact and allocation-free |
+| D-073 | 2026-11-04 | A `TlsClient` without anchors builds, with a verifier that refuses every certificate; only `ServerIdentity::Pinned { require_chain: false }` can connect with it, and that mode does not check the name | back-channel peers pinned by key alone have no CA; the name of a self-issued certificate proves nothing the pin does not |
+| D-074 | 2026-11-04 | A pinned connection clones the client's rustls configuration once and replaces its verifier; the resumption store stays shared | rustls keeps the verifier in the configuration; [est. a few µs and a handful of allocations per pinned connect], paid by back-channel dialers that connect rarely |
+| D-075 | 2026-11-04 | A host group with `AlpnPolicy::Required` refuses a ClientHello without ALPN with tls-net's own 7-byte `no_application_protocol` alert, before rustls runs | rustls only refuses an ALPN mismatch, not an absent extension; the same constant-alert approach as D-031 |
+| D-076 | 2026-11-04 | Host policy names must be covered by a certificate; a covered name moves into the host's group (a wildcard-covered name gets an exact entry in that group) | a host policy for a name no certificate serves is a configuration mistake; the move keeps the group check of D-032 exact |
+| D-077 | 2026-11-04 | Public helpers `spki_sha256(der)` and `certificate_der_from_pem(pem)` | operators compute pins from certificate files; without the helpers they would need another X.509 tool |
+| D-078 | 2026-11-04 | `reload_from_pem` and `reload_from_files` work for servers with one certificate and no host policy; others use `ReloadHandle::publish`. The settings of the last publish become the template for later Tier 1 reloads | a Tier 1 reload replaces "the" certificate; with several the intent is ambiguous |
+| D-079 | 2026-11-04 | `TlsServer::version()`, `TlsServer::sni_disagreements()`, and `ServerSession::fingerprint()` are public | the reload version and the parser-differential count (idea 0.2) are operator facts; the fingerprint is useful before the handshake completes |
+| D-080 | 2026-11-04 | loom runs under `cfg(tls_net_loom)` through a `sync` module that swaps in loom's types for the snapshot, the capacity gate, and the ticket ring; a CI job runs the models | the same code is checked that ships; the cfg name avoids clashing with dependencies that read `cfg(loom)` |
+| D-081 | 2026-11-04 | The reload-under-load test in the default suite runs 200 handshakes on four threads with a reload every 2 ms; the 10-minute run at 1,000 handshakes per second moves to the soak job of 0.7 | a 10-minute test does not belong in every CI run; the property (zero failed handshakes) is the same |
+| D-082 | 2026-11-04 | T-10 is tested through what tls-net offers: its tickets carry `max_early_data_size` 0, so a resuming client with early data enabled gets no 0-RTT window at all | refusing to open the window is stronger than rejecting early records after they arrive |
+| D-083 | 2026-11-04 | `days_remaining` is whole days rounded down while valid and rounded up (negative) after expiry | a report never shows 0 days for a certificate with hours left that has already expired |
+

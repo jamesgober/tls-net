@@ -93,8 +93,8 @@ impl HelloLimits {
         max_hello_bytes: u32, 512, 65_535, "max_hello_bytes must be 512 to 65,535");
     setter!(/// Most records, 1 to 16.
         max_records: u8, 1, 16, "max_records must be 1 to 16");
-    setter!(/// Most cipher suites, 1 to 32,767.
-        max_ciphers: u16, 1, 32_767, "max_ciphers must be 1 to 32,767");
+    setter!(/// Most cipher suites, 1 to 1,024 (the fingerprint arrays' size).
+        max_ciphers: u16, 1, 1024, "max_ciphers must be 1 to 1,024");
     setter!(/// Most extensions, 1 to 128.
         max_extensions: u8, 1, 128, "max_extensions must be 1 to 128");
     setter!(/// Most ALPN names, 1 to 64.
@@ -803,7 +803,6 @@ impl<'a> ClientHelloView<'a> {
 
     /// The first and last bytes of the first ALPN name, read across record
     /// boundaries (for JA4).
-    #[allow(dead_code, reason = "JA4 (0.4)")]
     pub(crate) fn first_alpn_ends(&self) -> Option<(u8, u8)> {
         let span = self.alpn?;
         let mut c = self.stream.cursor(span.pos());

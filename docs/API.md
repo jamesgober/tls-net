@@ -1,7 +1,7 @@
 # tls-net &mdash; API Reference
 
 > Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.3.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.3.0` or earlier are in the current release. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: `0.4.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.4.0` or earlier are in the current release. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -355,6 +355,8 @@ impl TlsServer {
     pub fn reload_from_pem(&self, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), TlsError>;                // P0 0.4
     pub fn reload_from_files(&self, chain: impl AsRef<Path>, key: impl AsRef<Path>) -> Result<(), TlsError>; // P0 0.4
     pub fn expiry_report(&self, now: SystemTime) -> ExpiryReport;  // P1 0.4
+    pub fn version(&self) -> u64;                                  // P1 0.4 (D-079)
+    pub fn sni_disagreements(&self) -> u64;                        // P2 0.4 (D-079)
     pub fn ticket_keys(&self) -> Option<TicketKeyRingHandle>;      // P2 0.5
     pub fn stats(&self) -> ServerStats;                            // P1 0.5
     pub fn provider_name(&self) -> &'static str;                   // P1 0.3
@@ -408,7 +410,7 @@ impl ServerBuilder {
 - `UnknownName::UseDefault` needs a default entry; without one, `Refuse` is used (documented, not an error);
 - the policy is consistent with the provider (FR-8);
 - ALPN names unique;
-- `ClientAuth::Required` and `Optional` anchors non-empty;
+- `ClientAuth::required` and `optional` anchors non-empty;
 - with feature `net-io`, `max_fragment_size` at least 512 (D-049);
 - `dangerous_key_log` together with a FIPS configuration is refused (D-040).
 
@@ -442,6 +444,7 @@ let server = TlsServer::builder()
 
 ```rust
 #[non_exhaustive]
+#[derive(Clone)]
 pub enum KeySource<'a> {
     Pem(&'a [u8]),
     Der(&'a [u8]),
@@ -538,7 +541,7 @@ let server = TlsServer::builder()
     .certificate(&wildcard_chain, KeySource::Pem(&wildcard_key))?
     .host(&["admin.example.com"], HostPolicy::new()
         .alpn(&[Alpn::H2])
-        .client_auth(ClientAuth::Required { anchors: admin_ca, crls: None }))?
+        .client_auth(ClientAuth::required(admin_ca)))?
     .build()?;
 # Ok::<(), tls_net::TlsError>(())
 ```
@@ -548,21 +551,24 @@ let server = TlsServer::builder()
 `None` P0 `0.3.0`; `Required` P0, `Optional` and `Pinned` P1, `hide_ca_names` P2, all `0.4.0`.
 
 ```rust
-#[non_exhaustive]
-#[derive(Clone, Default)]
-pub enum ClientAuth {
-    #[default]
-    None,
-    Optional { anchors: TrustAnchors, crls: Option<(Crls, RevocationPolicy)> },
-    Required { anchors: TrustAnchors, crls: Option<(Crls, RevocationPolicy)> },
-    Pinned { anchors: Option<TrustAnchors>, spki_sha256: Vec<[u8; 32]> },
+#[derive(Clone, Debug, Default)]
+pub struct ClientAuth { /* private (D-067) */ }
+impl ClientAuth {
+    pub fn none() -> Self;
+    pub fn optional(anchors: TrustAnchors) -> Self;
+    pub fn required(anchors: TrustAnchors) -> Self;
+    pub fn pinned(anchors: Option<TrustAnchors>, pins: &[[u8; 32]]) -> Self;
+    pub fn with_crls(self, crls: Crls, policy: RevocationPolicy) -> Self;
+    pub fn hide_ca_names(self) -> Self;
+    pub fn is_required(&self) -> bool;
 }
-impl ClientAuth { pub fn hide_ca_names(self) -> ClientAuth; }
+pub fn spki_sha256(certificate_der: &[u8]) -> Result<[u8; 32], TlsError>;          // a pin from a certificate
+pub fn certificate_der_from_pem(pem: &[u8]) -> Result<Vec<Vec<u8>>, TlsError>;
 ```
 
-- `Required` verifies the client chain against `anchors` (rustls-webpki), with optional CRLs; no certificate is `PeerCertificateRequired` (`TLS-0038`).
-- `Optional` also allows a client without a certificate; `HandshakeInfo::peer` is then `None`, and upper layers must treat that as anonymous.
-- `Pinned` requires the end-entity SPKI SHA-256 to equal one of the pins (constant-time compare). With `anchors`, the chain is verified first. Without anchors, a self-issued certificate is accepted only when its SPKI matches a pin, and the handshake signature and validity window are still verified (T-6b).
+- `required` verifies the client chain against `anchors` (rustls-webpki), with optional CRLs; no certificate is `PeerCertificateRequired` (`TLS-0038`).
+- `optional` also allows a client without a certificate; `HandshakeInfo::peer` is then `None`, and upper layers must treat that as anonymous.
+- `pinned` requires the end-entity SPKI SHA-256 to equal one of the pins (constant-time compare). With `anchors`, the chain is verified first. Without anchors, a self-issued certificate is accepted only when its SPKI matches a pin, and the handshake signature and validity window are still verified (T-6b).
 - CA name hints are sent by default; `hide_ca_names()` clears them when the CA names are themselves sensitive.
 
 Peer chain budgets come from `HandshakeLimits` (default 5 certificates of at most 16 KiB).
@@ -615,7 +621,7 @@ impl HelloLimits {
     pub fn new() -> Self;
     pub fn max_hello_bytes(self, n: u32) -> Result<Self, TlsError>;   // 512 ..= 65,535
     pub fn max_records(self, n: u8) -> Result<Self, TlsError>;        // 1 ..= 16
-    pub fn max_ciphers(self, n: u16) -> Result<Self, TlsError>;       // 1 ..= 32,767
+    pub fn max_ciphers(self, n: u16) -> Result<Self, TlsError>;       // 1 ..= 1,024 (D-072)
     pub fn max_extensions(self, n: u8) -> Result<Self, TlsError>;     // 1 ..= 128
     pub fn max_alpn(self, n: u8) -> Result<Self, TlsError>;           // 1 ..= 64
     pub fn max_groups(self, n: u8) -> Result<Self, TlsError>;         // 1 ..= 128
@@ -950,9 +956,11 @@ pub enum TicketMode {
 #[derive(Clone)]
 pub enum TicketSeed {
     Random,
+    Bytes(Arc<Zeroizing<[u8; 32]>>),   // see TicketSeed::from_bytes
     #[cfg(feature = "key-vault")]
     Vault { vault: Arc<key_vault::KeyVault>, handle: key_vault::KeyHandle },
 }
+impl TicketSeed { pub fn from_bytes(bytes: [u8; 32]) -> TicketSeed; }
 ```
 
 `period` from 1 minute to 24 hours, else `PolicyInvalid`. Default for Tier 1: `Ephemeral { period: 6 h }`. Recommended for a single host that restarts with a socket hand-off: `Ratchet` (D-010). `Derived` gives clusters shared tickets, and anyone with the root can derive every past key, so rotate the root. `tickets(mode, per_handshake)`: `per_handshake` 0 to 8 (default 2); 0 stops issuing tickets while still accepting valid ones until the ring advances. Ticket format, ring, and costs: PLAN 6.8.
@@ -1158,6 +1166,9 @@ impl ServerSession {   // ClientSession has the same methods
     pub fn set_tag(&mut self, tag: u64);        // opaque id echoed in events (for example a connection id)
     pub fn error_code(&self) -> Option<u16>;    // the code that failed the session, once Failed
     pub fn alert(&self) -> Option<u8>;          // the TLS alert sent or received when it failed (D-061)
+}
+impl ServerSession {
+    pub fn fingerprint(&self) -> Option<&Fingerprint>;   // P1 0.4, once the ClientHello is parsed (D-079)
 }
 ```
 
@@ -1661,7 +1672,7 @@ let server = TlsServer::builder()
     .policy(Policy::internal())
     .alpn(&[back_channel.clone()])
     .alpn_policy(AlpnPolicy::Required)
-    .client_auth(ClientAuth::Required { anchors: ca.clone(), crls: None })
+    .client_auth(ClientAuth::required(ca.clone()))
     .tickets(TicketMode::Off, 0)
     .build()?;
 

@@ -49,3 +49,10 @@ path = "fuzz_targets/session_step_client.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ticket_open"
+path = "fuzz_targets/ticket_open.rs"
+test = false
+doc = false
+bench = false
