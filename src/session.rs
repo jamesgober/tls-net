@@ -397,17 +397,20 @@ impl<C: Engine> Core<C> {
             return Stop::Failed(TlsError::WrongState);
         };
         let mut failed: Option<TlsError> = None;
-        // A deframing error (a malformed or undecryptable record) queues only
-        // its alert and leaves the bad bytes in place: one more call hands
-        // the alert out, a second would parse them again and queue another
-        // fatal alert (D-111). After other errors rustls keeps the failure.
-        let mut alert_only = false;
         loop {
             if output.len() - *written < OUTGOING_MIN {
                 return match failed.take() {
                     Some(e) => Stop::Failed(e),
                     None => Stop::Room,
                 };
+            }
+            // After a failure rustls is called only while it holds queued
+            // records (the alert): it hands those out before reading input,
+            // whereas a call with nothing queued would parse the next record
+            // and, if that record is malformed too, queue a second fatal
+            // alert (D-111).
+            if failed.is_some() && !conn.common().wants_write() {
+                return Stop::Failed(failed.unwrap_or(TlsError::Other));
             }
             let rest = &mut input[*consumed..];
             let rest_len = rest.len();
@@ -424,10 +427,6 @@ impl<C: Engine> Core<C> {
                     if let TlsError::AlertReceived { alert } = mapped {
                         self.alert = Some(alert);
                     }
-                    alert_only = matches!(
-                        e,
-                        rustls::Error::InvalidMessage(_) | rustls::Error::DecryptError
-                    );
                     failed = Some(mapped);
                     continue;
                 }
@@ -450,9 +449,6 @@ impl<C: Engine> Core<C> {
                         }
                     }
                     *consumed += discard;
-                    if alert_only {
-                        return Stop::Failed(failed.take().unwrap_or(TlsError::Other));
-                    }
                 }
                 ConnectionState::TransmitTlsData(t) => {
                     t.done();

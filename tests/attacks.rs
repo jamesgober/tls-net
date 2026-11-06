@@ -763,3 +763,52 @@ fn test_t25_unknown_name_refusal_time_does_not_depend_on_the_name() {
     let ratio = a[a.len() / 2].as_secs_f64() / b[b.len() / 2].as_secs_f64();
     assert!((0.8..1.25).contains(&ratio), "median ratio {ratio}");
 }
+
+#[test]
+fn test_t14_second_bad_record_after_a_failure_sends_no_second_alert_d111() {
+    // Found by the fuzz targets on the first D-111 fix: a record that fails
+    // in rustls's state machine (a ChangeCipherSpec before the ServerHello),
+    // followed by a malformed one. Server side: a hello, then the same.
+    let client = test_ca_client().build().unwrap();
+    let mut session = client.connect("localhost").unwrap();
+    let mut out = vec![0u8; 64 * 1024];
+    assert!(session.step(&mut [], &mut out).unwrap().written > 0);
+    let mut step = |i: &mut Vec<u8>, o: &mut [u8]| {
+        session
+            .step(i, o)
+            .map(|p| (p.consumed, p.written, matches!(p.event, Event::NeedInput)))
+    };
+    let (sent, failed) = drive_junk(&mut step, &[0x14, 0x03, 0x00, 0x00, 0x01, 0x01, 0xba]);
+    assert!(failed);
+    assert!(fatal_alerts(&sent) <= 1, "{sent:?}");
+
+    let server = server();
+    let crash: [u8; 57] = [
+        0x84, 0x16, 0x03, 0x03, 0x00, 0x32, 0x01, 0x00, 0x00, 0x2e, 0xbf, 0x77, 0x76, 0x16, 0x53,
+        0x12, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x05, 0x61, 0x9d, 0x19, 0x61,
+        0x61, 0x02, 0x2e, 0x00, 0x16, 0x03, 0x03, 0x00, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x34, 0x06, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x01, 0x61,
+    ];
+    // The fuzz target's first byte is its chunk size; replay in its chunks.
+    let chunk = usize::from(crash[0]);
+    let mut s = server.accept().unwrap();
+    let (mut input, mut sent) = (Vec::new(), Vec::new());
+    'feed: for part in crash[1..].chunks(chunk) {
+        input.extend_from_slice(part);
+        for _ in 0..64 {
+            match s.step(&mut input, &mut out) {
+                Ok(p) => {
+                    let (consumed, written) = (p.consumed, p.written);
+                    let need = matches!(p.event, Event::NeedInput);
+                    sent.extend_from_slice(&out[..written]);
+                    input.drain(..consumed);
+                    if need && consumed == 0 && written == 0 {
+                        continue 'feed;
+                    }
+                }
+                Err(_) => break 'feed,
+            }
+        }
+    }
+    assert!(fatal_alerts(&sent) <= 1, "{sent:?}");
+}
