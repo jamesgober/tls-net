@@ -45,7 +45,9 @@ jobs:
         if: always()
         with:
           name: testssl
-          path: ${{ runner.temp }}/testssl.json
+          path: |
+            ${{ runner.temp }}/testssl.json
+            ${{ runner.temp }}/server.log
 
   tlsfuzzer:
     name: tlsfuzzer
@@ -63,8 +65,13 @@ jobs:
           git clone https://github.com/tlsfuzzer/tlsfuzzer "$RUNNER_TEMP/tlsfuzzer"
           git -C "$RUNNER_TEMP/tlsfuzzer" checkout --quiet "$TLSFUZZER_COMMIT"
           bash tests/conformance/tlsfuzzer.sh "$RUNNER_TEMP/tlsfuzzer"
+      - name: Server errors
+        if: always()
+        run: sort "$RUNNER_TEMP/server.log" | uniq -c | sort -rn | head -40
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: tlsfuzzer
-          path: ${{ runner.temp }}/tlsfuzzer-logs
+          path: |
+            ${{ runner.temp }}/tlsfuzzer-logs
+            ${{ runner.temp }}/server.log
