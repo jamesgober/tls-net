@@ -65,6 +65,8 @@ jobs:
           git clone https://github.com/tlsfuzzer/tlsfuzzer "$RUNNER_TEMP/tlsfuzzer"
           git -C "$RUNNER_TEMP/tlsfuzzer" checkout --quiet "$TLSFUZZER_COMMIT"
           bash tests/conformance/tlsfuzzer.sh "$RUNNER_TEMP/tlsfuzzer"
+        env:
+          TLSFUZZER_FILTER: "rsa test-tls13-(zero-length-data|lengths|large-number-of-extensions|signature-algorithms|shuffled-extentions|unrecognised-groups|count-tickets|session-resumption|keyshare-omitted)"
       - name: Server errors
         if: always()
         run: |

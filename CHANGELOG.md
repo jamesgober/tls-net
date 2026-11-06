@@ -11,6 +11,31 @@
 
 ## [Unreleased]
 
+Hardening. No API change.
+
+### Fixed
+
+- A ClientHello in a record with legacy version `0x0300` (or any `0x03XX`
+  outside `0x0301` to `0x0303`) was refused with no alert; RFC 5246
+  appendix E.1 requires a server to accept it, and rustls does (D-110).
+- After a failure, a session could ask rustls to read further input, and a
+  second malformed record then made rustls queue a second fatal alert: a
+  panic in debug builds (rustls's `debug_assert!`), from bytes a peer
+  sends. A failed session now only hands out what rustls queued (D-111).
+
+### Added
+
+- Attack tests for every part of the threat table's planned tests (T-1
+  downgrade sentinel, T-4 groups rewritten in transit, T-6 expired,
+  self-signed and revoked certificates, T-13 slot release at net-io's
+  deadline, T-22 50-certificate and 1 MiB chains, T-25 timing, and more).
+- Fuzz seeds from real clients and servers (`fuzz/seeds/`) and
+  `fuzz/run-24h.sh`; `perf/soak.sh` for the NFR-21 soak.
+- A conformance workflow running testssl.sh and tlsfuzzer weekly; Miri in
+  CI.
+- `docs/SECURITY.md`: threat model, defences, tests, costs, and the
+  hardening record.
+
 ---
 
 ## [0.6.0] - 2026-11-06
