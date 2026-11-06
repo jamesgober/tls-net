@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds and starts examples/https_server_blocking on 127.0.0.1:4433 with the
-# test certificate (ECDSA P-256 under the test CA), default policy.
+# Builds and starts examples/https_server_blocking twice, default policy:
+# 127.0.0.1:4433 with the ECDSA P-256 test certificate and 127.0.0.1:4434
+# with the RSA-2048 one (tlsfuzzer assumes RSA unless told otherwise).
 set -eu
 cd "$(dirname "$0")/../.."
 cargo build --release --example https_server_blocking
