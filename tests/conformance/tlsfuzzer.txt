@@ -1,121 +1,106 @@
-# tlsfuzzer scripts run against the example server (ECDSA P-256, default
-# policy: TLS 1.3 and 1.2, AEAD suites only, extended master secret
-# required, no renegotiation, no compression, no 0-RTT).
-# <expect> <server> <script> [args]: `pass` must pass; `report` runs and is
-# logged, with the reason it is not `pass` on the line above it. <server> is
-# `ecdsa` or `rsa` (the example server with that test certificate).
+# tlsfuzzer scripts run against the example server (default policy: TLS
+# 1.3 and 1.2, AEAD suites only, extended master secret required, no
+# renegotiation, no compression, no 0-RTT), D-109 and D-113.
+# <expect> <server> <script> [args]: `pass` must pass, so a regression fails
+# the job; `report` runs and is logged, with the reason it cannot pass.
+# <server> is `ecdsa` or `rsa` (the example server with that certificate).
 #
-# TLS 1.3
-report ecdsa test-tls13-conversation.py
-report rsa   test-tls13-conversation.py
-report ecdsa test-tls13-version-negotiation.py
+# Reasons a script cannot pass, by category (counts in docs/SECURITY.md):
+#   strict: tls-net refuses a ClientHello it cannot read whole, or one over
+#     a budget (16 KiB, 64 extensions, list budgets), before rustls and with
+#     no alert (D-014); tlsfuzzer expects decode_error or illegal_parameter.
+#   rustls: rustls answers with another alert than the one tlsfuzzer
+#     expects (for example decrypt_error for decode_error), or follows
+#     another rule (tickets only to clients that offer psk_dhe_ke).
+#   absent: the feature does not exist in rustls (TLS 1.1 and below, static
+#     RSA key exchange, CBC, FFDHE, x448, brainpool curves, psk_ke,
+#     renegotiation, heartbeat, compression, SSL 2 and 3).
+#   rsa: the script assumes an RSA certificate (run on the rsa server too).
+
+# Passing in full.
+pass   rsa   test-tls13-conversation.py
+pass   ecdsa test-tls13-conversation.py
+pass   rsa   test-tls13-invalid-ciphers.py
+pass   rsa   test-tls13-nociphers.py
+pass   rsa   test-tls13-hrr.py
+pass   rsa   test-tls13-ccs.py
+pass   rsa   test-sslv2-connection.py
+pass   ecdsa test-sslv2-connection.py
+
+# TLS 1.3, partly passing.
+# rustls: TLS 1.2 fallback probes use RSA key exchange (absent).
 report rsa   test-tls13-version-negotiation.py
-report ecdsa test-tls13-legacy-version.py
+# rustls: nonsense legacy_version beside supported_versions is accepted.
 report rsa   test-tls13-legacy-version.py
-report ecdsa test-tls13-invalid-ciphers.py
-report rsa   test-tls13-invalid-ciphers.py
-report ecdsa test-tls13-nociphers.py
-report rsa   test-tls13-nociphers.py
-report ecdsa test-tls13-keyshare-omitted.py
+# strict: an empty key_share extension; rustls: missing_extension expected.
 report rsa   test-tls13-keyshare-omitted.py
-report ecdsa test-tls13-hrr.py
-report rsa   test-tls13-hrr.py
-report ecdsa test-tls13-unrecognised-groups.py
+# strict: hellos over 16 KiB (thousands of unknown groups).
 report rsa   test-tls13-unrecognised-groups.py
-report ecdsa test-tls13-crfg-curves.py
+# absent: x448; rustls: illegal_parameter expected.
 report rsa   test-tls13-crfg-curves.py
-report ecdsa test-tls13-obsolete-curves.py
+# absent: brainpool and other obsolete curves; rustls: alert choice.
 report rsa   test-tls13-obsolete-curves.py
+# absent: brainpool, secp521r1 and SHA-1 ECDSA schemes; rsa elsewhere.
 report ecdsa test-tls13-ecdsa-support.py
-report rsa   test-tls13-ecdsa-support.py
-report ecdsa test-tls13-signature-algorithms.py
+# strict: fuzzed list lengths and lists over the 64-entry budget.
 report rsa   test-tls13-signature-algorithms.py
-report ecdsa test-tls13-pkcs-signature.py
+# rustls: PKCS#1 schemes alone in TLS 1.3 fail after ServerHello.
 report rsa   test-tls13-pkcs-signature.py
-report ecdsa test-tls13-finished.py
+# rustls: decrypt_error where tlsfuzzer expects decode_error.
 report rsa   test-tls13-finished.py
-report ecdsa test-tls13-finished-plaintext.py
+# rustls: bad_record_mac where tlsfuzzer expects unexpected_message.
 report rsa   test-tls13-finished-plaintext.py
-report ecdsa test-tls13-ccs.py
-report rsa   test-tls13-ccs.py
-report ecdsa test-tls13-empty-alert.py
+# rustls: decode_error where tlsfuzzer expects unexpected_message.
 report rsa   test-tls13-empty-alert.py
-report ecdsa test-tls13-zero-length-data.py
+# strict: a zero-length record inside the ClientHello.
 report rsa   test-tls13-zero-length-data.py
-report ecdsa test-tls13-record-layer-limits.py
+# rustls: bad_record_mac where tlsfuzzer expects record_overflow.
 report rsa   test-tls13-record-layer-limits.py
-report ecdsa test-tls13-lengths.py
+# rustls: no tickets to a client that sends no psk_key_exchange_modes.
 report rsa   test-tls13-lengths.py
-report ecdsa test-tls13-large-number-of-extensions.py
+# strict: hellos over 16 KiB or 64 extensions.
 report rsa   test-tls13-large-number-of-extensions.py
-report ecdsa test-tls13-shuffled-extentions.py
 report rsa   test-tls13-shuffled-extentions.py
-report ecdsa test-tls13-serverhello-random.py
+# absent: FFDHE groups.
 report rsa   test-tls13-serverhello-random.py
-report ecdsa test-tls13-session-resumption.py
+# absent: psk_ke and TLS 1.2 RSA key exchange.
 report rsa   test-tls13-session-resumption.py
-report ecdsa test-tls13-count-tickets.py
+# tls-net sends two tickets per handshake; the script expects one.
 report rsa   test-tls13-count-tickets.py
-report ecdsa test-tls13-psk_ke.py
+# absent: psk_ke (tls-net offers psk_dhe_ke only, T-11).
 report rsa   test-tls13-psk_ke.py
-report ecdsa test-tls13-non-support.py
+# absent: draft and pre-1.3 versions offered alone.
 report rsa   test-tls13-non-support.py
-# TLS 1.2 and version handling
-report ecdsa test-conversation.py -d
-report rsa   test-conversation.py -d
-report ecdsa test-downgrade-protection.py
-report rsa   test-downgrade-protection.py
-report ecdsa test-TLSv1_2-rejected-without-TLSv1_2.py
+
+# TLS 1.2 and version handling. `-d -M -C <AEAD suite>` where a script
+# takes them (ECDHE, extended master secret, a suite rustls has); scripts
+# without -C pick CBC suites under -d (absent).
+report rsa   test-conversation.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+report rsa   test-downgrade-protection.py -d -M
 report rsa   test-TLSv1_2-rejected-without-TLSv1_2.py
-report ecdsa test-fallback-scsv.py
-report rsa   test-fallback-scsv.py
-report ecdsa test-sslv2-connection.py
-report rsa   test-sslv2-connection.py
-report ecdsa test-extended-master-secret-extension.py
-report rsa   test-extended-master-secret-extension.py
-report ecdsa test-renegotiation-disabled.py
-report rsa   test-renegotiation-disabled.py
-report ecdsa test-invalid-compression-methods.py
-report rsa   test-invalid-compression-methods.py
-report ecdsa test-invalid-content-type.py
-report rsa   test-invalid-content-type.py
-report ecdsa test-truncating-of-client-hello.py
-report rsa   test-truncating-of-client-hello.py
-report ecdsa test-large-hello.py
-report rsa   test-large-hello.py
-report ecdsa test-client-hello-max-size.py
-report rsa   test-client-hello-max-size.py
-report ecdsa test-empty-extensions.py
+report rsa   test-fallback-scsv.py -d
+report rsa   test-extended-master-secret-extension.py -d
+# no EMS option in this script, and tls-net requires EMS for TLS 1.2 (T-7)
+report rsa   test-renegotiation-disabled.py -d -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+report rsa   test-invalid-compression-methods.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+report rsa   test-invalid-content-type.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+report rsa   test-truncating-of-client-hello.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+report rsa   test-large-hello.py -d -M
+report rsa   test-client-hello-max-size.py -d -M
 report rsa   test-empty-extensions.py
-report ecdsa test-record-size-limit.py
-report rsa   test-record-size-limit.py
-report ecdsa test-heartbeat.py
-report rsa   test-heartbeat.py
-report ecdsa test-no-heartbeat.py
-report rsa   test-no-heartbeat.py
-report ecdsa test-x25519.py
+report rsa   test-record-size-limit.py -M
+report rsa   test-heartbeat.py -d
+report rsa   test-no-heartbeat.py -d -M
 report rsa   test-x25519.py
-report ecdsa test-ecdsa-sig-flexibility.py
-report rsa   test-ecdsa-sig-flexibility.py
+report ecdsa test-ecdsa-sig-flexibility.py -M -C TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
 report ecdsa test-ecdsa-in-certificate-verify.py
-report rsa   test-ecdsa-in-certificate-verify.py
-report ecdsa test-sig-algs.py
-report rsa   test-sig-algs.py
-report ecdsa test-signature-algorithms.py
-report rsa   test-signature-algorithms.py
-report ecdsa test-ecdhe-padded-shared-secret.py
+report rsa   test-sig-algs.py -M
+report rsa   test-signature-algorithms.py -M
 report rsa   test-ecdhe-padded-shared-secret.py
-report ecdsa test-zero-length-data.py
-report rsa   test-zero-length-data.py
-report ecdsa test-chacha20.py
+report rsa   test-zero-length-data.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 report rsa   test-chacha20.py
-report ecdsa test-aes-gcm-nonces.py
-report rsa   test-aes-gcm-nonces.py
-report ecdsa test-atypical-padding.py
-report rsa   test-atypical-padding.py
-report ecdsa test-sessionID-resumption.py
-report rsa   test-sessionID-resumption.py
-report ecdsa test-unsupported-curve-fallback.py
+report rsa   test-aes-gcm-nonces.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+report rsa   test-atypical-padding.py -d -M
+report rsa   test-sessionID-resumption.py -d -M
 report rsa   test-unsupported-curve-fallback.py
-report ecdsa test-ocsp-stapling.py
-report rsa   test-ocsp-stapling.py
+report rsa   test-ocsp-stapling.py -d -M
