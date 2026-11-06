@@ -581,7 +581,7 @@ rustls 0.23.37 with aws-lc-rs 1.16 on x86_64 (rustls.dev/perf, 2026-03-07), per 
 | ticket seal / open | under 2 µs each [target] | rustls provider ticketer |
 | per-signature custody, ECDSA P-256 | at least 70% of the resident full handshake rate [target] | resident |
 
-Benchmarks (criterion, `benches/`): `hello_parse`, `ja4`, `sni_lookup`, `step_record`, `encrypt_record`, `handshake_full`, `handshake_resumed`, `ticket_seal_open`, `reload`, `accept`, `custody`. The end-to-end comparison runs in a separate, unpublished harness (tokio appears only there, never in tls-net's own manifest). Method and hardware go into `docs/PERFORMANCE.md`; a regression over 5% blocks the change.
+Benchmarks (criterion, `benches/`): `hello_parse`, `ja4`, `sni_lookup`, `step_record`, `encrypt_record`, `handshake_full`, `handshake_resumed`, `ticket_seal_open`, `reload`, `accept`, `custody`. The end-to-end comparison runs in a separate, unpublished harness (tokio appears only there, never in tls-net's own manifest). Method and hardware go into `docs/PERFORMANCE.md`; a regression over 5% blocks the change. Measured values and the status of each target: `docs/PERFORMANCE.md`, "Summary" (0.6, D-105).
 
 ## 10. Testing plan
 
