@@ -100,7 +100,13 @@ Costs are per handshake or per record unless stated; measured values are from `d
 
 - testssl.sh 3.2.4 against the example server: no finding of severity HIGH or CRITICAL beyond the test certificate's own (a private CA, a validity to 2099 so fixtures never expire, no CRL or OCSP URI). Every vulnerability check (Heartbleed, CCS injection, Ticketbleed, ROBOT, renegotiation, CRIME, BREACH, POODLE, SWEET32, FREAK, DROWN, LOGJAM, BEAST, Winshock) reports "not vulnerable".
 
-<!-- tlsfuzzer classification: filled from the dual-server run -->
+- tlsfuzzer (commit `5eebc44`) against the example server with an ECDSA and with an RSA certificate, TLS 1.2 scripts with ECDHE, extended master secret, and an AEAD suite where they take those options. Ten script runs pass in full and fail the job if they regress: the TLS 1.3 conversation (both certificates), invalid cipher suites, no cipher suites, HelloRetryRequest, ChangeCipherSpec handling, SSL 2 hellos refused (both), the TLS 1.2 conversation, and zero-length records. Every other script runs as a report (`tests/conformance/tlsfuzzer.txt` gives the reason per script), and the server's own log of each run accounts for every failing case:
+  - **tls-net's hello strictness (D-014):** a ClientHello tls-net cannot read whole, or one over a budget (16 KiB, 64 extensions, list budgets), is refused before rustls with no alert, where tlsfuzzer expects `decode_error` or `illegal_parameter`. RFC 8446 section 6.2 makes the alert a SHOULD; see the table below.
+  - **rustls's choices:** another alert than the one tlsfuzzer expects (for example `decrypt_error` for `decode_error`, `bad_record_mac` for `record_overflow`), a nonsense `legacy_version` accepted beside `supported_versions`, no tickets to a client that offers no `psk_key_exchange_modes`, two tickets per handshake where a script expects one.
+  - **Features rustls does not have:** TLS 1.1 and below, static RSA key exchange, CBC suites, FFDHE, x448, brainpool curves, `psk_ke`, SHA-1 signatures, renegotiation, heartbeat, compression.
+  - **Scripts that cannot run here:** renegotiation and one ECDSA script send no extended master secret, which tls-net requires for TLS 1.2 (T-7); one needs a server that asks for client certificates.
+
+  One tls-net defect came out of these runs and is fixed (D-110).
 
 **Miri.** The library tests that need no crypto provider (parsers, PEM intake, SNI, fingerprints, tickets, snapshot, expiry, errors: 66 tests) run under Miri in CI with no undefined behaviour reported (D-112). The providers are C and assembly, which Miri cannot execute.
 
