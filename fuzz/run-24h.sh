@@ -6,9 +6,11 @@
 #
 #   bash fuzz/run-24h.sh [hours]
 #
-# A finding stops its target and leaves the input in fuzz/artifacts/<target>/.
-# On WSL a clock step can report a false timeout: replay the input with
-# `cargo fuzz run <target> <file>`, and restart the target if it passes.
+# A crash stops its target and leaves the input in fuzz/artifacts/<target>/.
+# Timeouts are saved there too but do not stop the run (fork mode with
+# -ignore_timeouts): on WSL a clock step reports false ones ("timeout after
+# 18446744073709551615 seconds"). Replay each with
+# `cargo fuzz run <target> <file>` when the runs end.
 set -eu
 cd "$(dirname "$0")"
 HOURS=${1:-24}
@@ -41,7 +43,7 @@ cargo +nightly fuzz build --target x86_64-unknown-linux-gnu --target-dir "$TD"
 SECS=$((HOURS * 3600))
 for t in $TARGETS; do
   setsid nohup nice -n 10 cargo +nightly fuzz run --target x86_64-unknown-linux-gnu --target-dir "$TD" "$t" "$CORPUS/$t" -- \
-    -max_total_time="$SECS" -timeout=20 -rss_limit_mb=2048 -print_final_stats=1 \
+    -max_total_time="$SECS" -timeout=20 -rss_limit_mb=2048 -print_final_stats=1 -fork=1 -ignore_timeouts=1 \
     >"$CORPUS/$t.log" 2>&1 </dev/null &
   echo "$t: pid $!"
 done
