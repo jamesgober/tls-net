@@ -252,9 +252,12 @@ fn check_type(t: u8) -> Result<(), TlsError> {
     }
 }
 
+/// Any `{03,XX}` record version: RFC 5246 appendix E.1 requires a server
+/// to accept them on a ClientHello, RFC 8446 section 5.1 says to ignore the
+/// field, and rustls does the same (D-110). It never selects the protocol.
 fn check_header(typ: u8, version: u16) -> Result<(), TlsError> {
     check_type(typ)?;
-    if !(0x0301..=0x0303).contains(&version) {
+    if version >> 8 != 3 {
         return Err(TlsError::BadRecord);
     }
     Ok(())
@@ -1072,6 +1075,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_any_03xx_record_version_accepted_d110() {
+        let hello = HelloBuilder::new().records(16_384);
+        for minor in [0u8, 1, 2, 3, 4, 0xff] {
+            let mut h = hello.clone();
+            h[2] = minor;
+            match HelloParser::parse(&h, &HelloLimits::new()) {
+                Ok(HelloParse::Complete { view, .. }) => {
+                    assert_eq!(view.record_version(), 0x0300 | u16::from(minor));
+                }
+                other => panic!("record version 0x03{minor:02x}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_refusals() {
         let l = HelloLimits::new();
         assert_eq!(
@@ -1086,10 +1104,14 @@ pub(crate) mod tests {
             HelloParser::parse(b"\x15\x03\x03\x00\x02\x02\x28", &l).unwrap_err(),
             TlsError::BadRecord
         );
-        assert_eq!(
-            HelloParser::parse(b"\x16\x03\x00\x00\x10", &l).unwrap_err(),
-            TlsError::BadRecord
-        );
+        for version in [[2u8, 0], [4, 1], [0, 0], [0xff, 0xff]] {
+            let header = [22, version[0], version[1], 0, 0x10];
+            assert_eq!(
+                HelloParser::parse(&header, &l).unwrap_err(),
+                TlsError::BadRecord,
+                "{version:?}"
+            );
+        }
         assert_eq!(
             HelloParser::parse(b"\x16\x03\x01\x00\x00", &l).unwrap_err(),
             TlsError::BadRecord

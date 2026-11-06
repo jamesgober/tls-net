@@ -25,8 +25,7 @@ bad = [f for f in findings if f.get("severity") in ("HIGH", "CRITICAL") and f.ge
 for f in findings:
     if f.get("severity") in ("MEDIUM", "LOW", "HIGH", "CRITICAL"):
         print(f'{f.get("severity"):8} {f.get("id"):40} {f.get("finding")}')
-print("
-vulnerability checks:")
+print("\nvulnerability checks:")
 for f in findings:
     if f.get("id") in VULNERABILITIES or f.get("id", "").startswith(("BEAST", "LOGJAM", "DROWN")):
         print(f'  {f.get("id"):24} {f.get("severity"):8} {f.get("finding")}')
