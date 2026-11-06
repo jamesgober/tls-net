@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "tls-net"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -114,6 +114,8 @@ net-io = { version = ">=0.4, <0.7", optional = true, default-features = false }
 net-io = { version = ">=0.4, <0.7", features = ["tls"] }
 # Property tests.
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Benchmarks (benches/, PLAN section 9); no rayon, no plots.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 
 
 # Model checking of the snapshot, the capacity gate, and the ticket ring:
@@ -129,11 +131,40 @@ name = "https_get"
 required-features = ["webpki-roots"]
 
 
+# BENCHMARKS
+# #################################
+# `cargo bench`; the SNI table bench needs `RUSTFLAGS="--cfg tls_net_bench"`.
+# Method and results: docs/PERFORMANCE.md.
+[[bench]]
+name = "hello"
+harness = false
+
+[[bench]]
+name = "session"
+harness = false
+required-features = ["rustls-escape-hatch", "key-vault"]
+
+[[bench]]
+name = "config"
+harness = false
+required-features = ["rustls-escape-hatch"]
+
+[[bench]]
+name = "paired"
+harness = false
+required-features = ["rustls-escape-hatch"]
+
+[[bench]]
+name = "memory"
+harness = false
+required-features = ["rustls-escape-hatch"]
+
+
 # LINTS
 # #################################
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing` (see fuzz/).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(tls_net_loom)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(tls_net_loom)", "cfg(tls_net_bench)"] }
 
 
 # RELEASE PROFILE

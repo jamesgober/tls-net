@@ -13,6 +13,33 @@
 
 ---
 
+## [0.6.0] - 2026-11-06
+
+Measurement and tuning. No API change.
+
+### Added
+
+- Benchmarks (criterion) for every target in `dev/PLAN.md` section 9:
+  handshakes, records, `accept`, key custody, ClientHello parsing and
+  fingerprints, reload, tickets, and SNI lookup. A paired bench alternates
+  tls-net with rustls's unbuffered connection built from the same
+  configurations, and a memory bench counts heap use and allocations.
+- `perf/`: an unpublished workspace that compares tls-net on net-io's reactor
+  with tokio plus tokio-rustls and tokio plus tokio-openssl over loopback
+  (interleaved rounds, rate and server CPU per operation, idle-connection
+  memory).
+- `docs/PERFORMANCE.md`: hardware, method, results, and open gaps.
+
+### Changed
+
+- An idle server session holds its SNI and peer identity on the heap: 257
+  bytes over rustls's own state, down from 656.
+- Ticket sealing makes one allocation and takes the key ring's lock once.
+- `accept` no longer clones a reference for the handshake slot (61 ns).
+- The peer identity is built when first read, not at every handshake.
+  `HandshakeCompleted::peer_certificate` reports whether the peer sent a
+  certificate.
+
 ## [0.5.0] - 2026-11-04
 
 Feature complete: observation, FIPS, the platform verifier, ticket key
@@ -190,7 +217,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/tls-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/tls-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/tls-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/tls-net/compare/v0.2.0...v0.3.0

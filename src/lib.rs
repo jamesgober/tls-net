@@ -77,6 +77,74 @@ mod sync;
 mod tickets;
 mod verify;
 
+/// Entry points for the SNI table bench only (`--cfg tls_net_bench`); the
+/// table is crate-private and has no public way to be timed alone.
+#[cfg(tls_net_bench)]
+#[doc(hidden)]
+pub mod bench {
+    use std::sync::Arc;
+
+    /// An SNI table holding `names` (and `*.`-prefixed wildcards) for one key.
+    pub struct Sni(crate::sni::SniTable);
+
+    impl Sni {
+        /// Builds the table; `key_der` is a PKCS#8 key the provider accepts.
+        ///
+        /// # Panics
+        ///
+        /// On a key the provider refuses or a duplicate name.
+        #[must_use]
+        pub fn new(names: &[String], key_der: &[u8]) -> Sni {
+            let der = rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.to_vec().into());
+            let key = crate::provider::load_key(&der).expect("key");
+            let certified = Arc::new(rustls::sign::CertifiedKey::new(Vec::new(), key));
+            let mut table = crate::sni::SniTable::new();
+            let entry = table.add_key(certified, crate::sni::EntryKey::Other);
+            for name in names {
+                assert!(table.add_name(name, entry, 0), "duplicate {name}");
+            }
+            Sni(table)
+        }
+
+        /// Normalises `name` as a ClientHello's SNI is and looks it up.
+        #[must_use]
+        pub fn lookup(&self, name: &str) -> bool {
+            let normalized = crate::sni::normalize_server_name(name);
+            self.0
+                .lookup(normalized.as_ref().map(crate::sni::NormalizedName::as_str))
+                .is_some()
+        }
+    }
+
+    /// The configuration cell a reload swaps (here holding a counter).
+    pub struct Swap(crate::snapshot::Snapshot<u64>);
+
+    impl Swap {
+        /// A cell holding 0.
+        #[must_use]
+        pub fn new() -> Swap {
+            Swap(crate::snapshot::Snapshot::new(0))
+        }
+
+        /// Publishes `value`; returns the new version.
+        pub fn publish(&self, value: u64) -> u64 {
+            self.0.publish(value)
+        }
+
+        /// Reads the current value.
+        #[must_use]
+        pub fn load(&self) -> u64 {
+            *self.0.load()
+        }
+    }
+
+    impl Default for Swap {
+        fn default() -> Self {
+            Swap::new()
+        }
+    }
+}
+
 /// Entry points for the fuzz targets only (`cargo fuzz` sets `cfg(fuzzing)`).
 #[cfg(fuzzing)]
 #[doc(hidden)]

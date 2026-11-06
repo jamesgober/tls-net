@@ -1,0 +1,30 @@
+[package]
+name = "tls-net-perf"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+description = "End-to-end loopback comparison of tls-net on net-io with other TLS stacks (docs/PERFORMANCE.md). Not published; tokio and OpenSSL appear only here."
+
+# Not part of a workspace, and never a dependency of tls-net.
+[workspace]
+members = ["."]
+
+[dependencies]
+tls-net = { path = "..", features = ["net-io", "rustls-escape-hatch"] }
+net-io = { version = ">=0.4, <0.7", features = ["tls", "reactor"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+openssl = "0.10"
+tokio-openssl = "0.6"
+
+# CPU profiles of the server (PERF_PROFILE, Linux): signal-based sampling, no perf events or root.
+[target.'cfg(target_os = "linux")'.dependencies]
+pprof = { version = "0.15", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1

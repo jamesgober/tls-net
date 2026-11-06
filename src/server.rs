@@ -190,24 +190,25 @@ pub(crate) struct Capacity {
     max: u32,
 }
 
-/// One handshake slot; released when dropped.
+/// One handshake slot. It holds no reference: the session that owns it
+/// releases it through its snapshot's `capacity` (D-102).
 #[derive(Debug)]
-pub(crate) struct CapacitySlot(Arc<Capacity>);
-
-impl Drop for CapacitySlot {
-    fn drop(&mut self) {
-        self.0.in_progress.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+pub(crate) struct CapacitySlot(());
 
 impl Capacity {
-    fn acquire(self: &Arc<Self>) -> Option<CapacitySlot> {
+    fn acquire(&self) -> Option<CapacitySlot> {
         let prev = self.in_progress.fetch_add(1, Ordering::AcqRel);
         if prev >= self.max {
             self.in_progress.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        Some(CapacitySlot(Arc::clone(self)))
+        Some(CapacitySlot(()))
+    }
+
+    /// Gives back a slot `acquire` handed out.
+    pub(crate) fn release(&self, slot: CapacitySlot) {
+        let CapacitySlot(()) = slot;
+        self.in_progress.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -230,10 +231,13 @@ pub(crate) struct ServerState {
     pub(crate) hook: Option<Arc<dyn HelloHook>>,
     pub(crate) fingerprints: FingerprintKinds,
     pub(crate) obs: Arc<Observation>,
+    /// The server's handshake gate, the same in every snapshot.
+    pub(crate) capacity: Arc<Capacity>,
 }
 
 /// State that belongs to the server's lifetime, carried across reloads (FR-32).
 struct Shared {
+    capacity: Arc<Capacity>,
     tickets: Option<Arc<TicketKeyRing>>,
     cache: Arc<dyn StoresServerSessions>,
     obs: Arc<Observation>,
@@ -241,7 +245,6 @@ struct Shared {
 
 struct Inner {
     snapshot: Arc<Snapshot<ServerState>>,
-    capacity: Arc<Capacity>,
     provider_name: &'static str,
     shared: Shared,
     /// The settings without certificates, for `reload_from_*`; the lock also
@@ -275,7 +278,12 @@ impl fmt::Debug for TlsServer {
             .field("version", &self.inner.snapshot.version())
             .field(
                 "in_progress",
-                &self.inner.capacity.in_progress.load(Ordering::Relaxed),
+                &self
+                    .inner
+                    .shared
+                    .capacity
+                    .in_progress
+                    .load(Ordering::Relaxed),
             )
             .field("provider", &self.inner.provider_name)
             .finish_non_exhaustive()
@@ -298,6 +306,7 @@ impl TlsServer {
     pub fn accept(&self) -> Result<ServerSession, TlsError> {
         let slot = self
             .inner
+            .shared
             .capacity
             .acquire()
             .ok_or_else(|| self.inner.refuse())?;
@@ -458,7 +467,11 @@ impl TlsServer {
     /// Handshakes in progress now.
     #[must_use]
     pub fn handshakes_in_progress(&self) -> u32 {
-        self.inner.capacity.in_progress.load(Ordering::Relaxed)
+        self.inner
+            .shared
+            .capacity
+            .in_progress
+            .load(Ordering::Relaxed)
     }
 
     /// The current configuration version (1 at build, +1 per reload).
@@ -489,8 +502,8 @@ impl Inner {
     /// A capacity refusal: counted, evented at most once per second.
     fn refuse(&self) -> TlsError {
         self.shared.obs.capacity(
-            self.capacity.in_progress.load(Ordering::Relaxed),
-            self.capacity.max,
+            self.shared.capacity.in_progress.load(Ordering::Relaxed),
+            self.shared.capacity.max,
         );
         TlsError::HandshakeCapacity
     }
@@ -532,6 +545,7 @@ impl ServerReader {
     pub fn accept(&mut self) -> Result<ServerSession, TlsError> {
         let slot = self
             .inner
+            .shared
             .capacity
             .acquire()
             .ok_or_else(|| self.inner.refuse())?;
@@ -1000,21 +1014,19 @@ impl ServerBuilder {
             ServerSessionMemoryCache::new(self.session_cache)
         };
         let shared = Shared {
+            capacity: Arc::new(Capacity {
+                in_progress: AtomicU32::new(0),
+                max: self.limits.max_in_progress,
+            }),
             tickets,
             cache,
             obs,
         };
         let settings = self.settings();
-        let limits = self.limits;
         let state = self.state(&shared)?;
-        let capacity = Arc::new(Capacity {
-            in_progress: AtomicU32::new(0),
-            max: limits.max_in_progress,
-        });
         Ok(TlsServer {
             inner: Arc::new(Inner {
                 snapshot: Arc::new(Snapshot::new(state)),
-                capacity,
                 provider_name,
                 shared,
                 template: Mutex::new(settings),
@@ -1180,6 +1192,7 @@ impl ServerBuilder {
             hook: self.hook,
             fingerprints: self.fingerprints,
             obs: Arc::clone(&shared.obs),
+            capacity: Arc::clone(&shared.capacity),
         })
     }
 }
@@ -1278,14 +1291,23 @@ mod loom_tests {
             });
             let other = {
                 let gate = Arc::clone(&gate);
-                loom::thread::spawn(move || gate.acquire().is_some())
+                loom::thread::spawn(move || {
+                    let slot = gate.acquire();
+                    let held = slot.is_some();
+                    if let Some(slot) = slot {
+                        gate.release(slot);
+                    }
+                    held
+                })
             };
             let mine = gate.acquire();
             let held_here = mine.is_some();
             let held_there = other.join().unwrap();
             assert!(!(held_here && held_there) || gate.in_progress.load(Ordering::Relaxed) <= 1);
             assert!(held_here || held_there || gate.in_progress.load(Ordering::Relaxed) == 0);
-            drop(mine);
+            if let Some(slot) = mine {
+                gate.release(slot);
+            }
             if !held_there {
                 assert_eq!(gate.in_progress.load(Ordering::Relaxed), 0);
             }

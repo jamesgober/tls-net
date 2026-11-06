@@ -260,6 +260,29 @@ impl TicketKeyRing {
         if now <= self.epoch() {
             return;
         }
+        self.advance_to(now);
+    }
+
+    /// The state for use now: one read lock when the ring is current, which
+    /// is every call but the first of an epoch.
+    fn current(&self) -> impl std::ops::Deref<Target = RingState> + '_ {
+        let now = (self.clock)() / self.period;
+        {
+            let st = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if now <= st.epoch {
+                return st;
+            }
+        }
+        self.advance_to(now);
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn advance_to(&self, now: u64) {
         let mut st = self
             .state
             .write()
@@ -336,20 +359,18 @@ impl TicketKeyRing {
     }
 
     fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
-        self.advance();
-        let st = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = self.current();
         let mut header = [0u8; HEADER];
         header[0] = VERSION;
         header[1..].copy_from_slice(&st.epoch.to_be_bytes());
-        let sealed = Crypt::xchacha20_poly1305()
-            .encrypt_with_aad(st.current.as_slice(), plain, &header)
+        // One allocation: the capacity covers the header, so moving the
+        // sealed bytes up to make room for it does not reallocate.
+        let mut out = Vec::with_capacity(OVERHEAD + plain.len());
+        Crypt::xchacha20_poly1305()
+            .encrypt_with_aad_into(st.current.as_slice(), plain, &header, &mut out)
             .ok()?;
-        let mut out = Vec::with_capacity(HEADER + sealed.len());
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&sealed);
+        drop(st);
+        out.splice(0..0, header);
         self.issued.fetch_add(1, Ordering::Relaxed);
         Some(out)
     }
@@ -367,11 +388,7 @@ impl TicketKeyRing {
             return None;
         }
         let epoch = u64::from_be_bytes(ticket[1..HEADER].try_into().ok()?);
-        self.advance();
-        let st = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = self.current();
         let key = if epoch == st.epoch {
             &st.current
         } else if Some(epoch) == st.epoch.checked_sub(1) {
