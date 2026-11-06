@@ -94,7 +94,17 @@ Costs are per handshake or per record unless stated; measured values are from `d
 
 **Soak.** `perf/soak.sh` (NFR-21): tls-net on net-io's reactor, 8 workers, 32 client threads making mixed full and resumed handshakes, a certificate reload every 60 seconds, a 10-minute ticket epoch.
 
-<!-- soak result: filled when the run ends -->
+6 hours on WSL2 at load averages around 400, net-io 0.6.1, rustls 0.23.46:
+
+| Measure | Result |
+|---|---|
+| handshakes | 21,361,611 (10,142,969 full, 11,218,674 resumed), about 990 per second |
+| handshakes failed by the server | 0 |
+| certificate reloads / refused | 359 / 0 |
+| ticket epochs | 36; 42,723,286 tickets issued, 0 rejected |
+| server RSS | 25.9 MB after 10 minutes, 30.0 MB at the end, unchanged for the last 80 minutes |
+
+RSS rose 4.1 MB over the first four and a half hours, more slowly each hour, then stopped: the allocator's arenas settling across 8 workers and the reload thread, not a leak. A leak scales with the work: 359 reloads or 21 million handshakes leave a slope that does not flatten. `tests/leak.rs` checks the same work against live heap bytes, which arenas do not move: after a warm-up, 200 rounds of a reload, a ticket rotation every tenth round, and a resumed and a full handshake leave the live heap exactly where it started (a leak of 8 bytes per handshake fails it at 3,200 bytes). The 24-hour soak belongs to the 1.0 gate (D-108).
 
 **Conformance.** `.github/workflows/conformance.yml`, weekly and on demand (D-109):
 

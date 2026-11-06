@@ -30,7 +30,9 @@ Hardening. No API change.
   self-signed and revoked certificates, T-13 slot release at net-io's
   deadline, T-22 50-certificate and 1 MiB chains, T-25 timing, and more).
 - Fuzz seeds from real clients and servers (`fuzz/seeds/`) and
-  `fuzz/run-24h.sh`; `perf/soak.sh` for the NFR-21 soak.
+  `fuzz/run-24h.sh`; `perf/soak.sh` for the NFR-21 soak, and
+  `tests/leak.rs`, which checks that reloads, ticket rotations, and
+  handshakes leave the live heap where it started.
 - A conformance workflow running testssl.sh and tlsfuzzer weekly; Miri in
   CI.
 - `docs/SECURITY.md`: threat model, defences, tests, costs, and the
