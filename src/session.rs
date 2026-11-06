@@ -1,6 +1,7 @@
 //! Server and client sessions: the step loop over rustls's unbuffered API
 //! (PLAN 6.3).
 
+use std::cell::OnceCell;
 use std::fmt;
 use std::time::Instant;
 
@@ -16,7 +17,6 @@ use crate::identity::{HandshakeInfo, HandshakeKind, PeerIdentity};
 use crate::observe::{HelloRefusal, Observation, TlsEvent};
 use crate::policy::{CipherSuite, Group, Version};
 use crate::server::{CapacitySlot, ServerState};
-use crate::sni::NormalizedName;
 
 /// The largest plaintext in one TLS record.
 pub const MAX_RECORD_PAYLOAD: usize = 16_384;
@@ -649,6 +649,21 @@ impl<C: Engine> Core<C> {
         self.conn.as_ref()?.common().peer_certificates()
     }
 
+    /// The peer's identity, parsed from its end-entity certificate on the
+    /// first call and kept in `cell` (D-104).
+    fn peer_identity<'a>(
+        &self,
+        cell: &'a OnceCell<Option<Box<PeerIdentity>>>,
+    ) -> Option<&'a PeerIdentity> {
+        cell.get_or_init(|| {
+            self.peer_chain()
+                .and_then(|chain| chain.first())
+                .and_then(|c| PeerIdentity::from_der(c.as_ref()))
+                .map(Box::new)
+        })
+        .as_deref()
+    }
+
     pub(crate) fn error_code(&self) -> Option<u16> {
         self.failure
     }
@@ -666,9 +681,11 @@ pub struct ServerSession {
     core: Core<UnbufferedServerConnection>,
     state: crate::sync::Shared<ServerState>,
     slot: Option<CapacitySlot>,
-    sni: Option<NormalizedName>,
+    /// Boxed so an idle session does not carry a 254-byte name buffer (D-096).
+    sni: Option<Box<str>>,
     fingerprint: Option<Fingerprint>,
-    peer: Option<PeerIdentity>,
+    /// Built on first use from the client certificate; boxed (D-096, D-104).
+    peer: OnceCell<Option<Box<PeerIdentity>>>,
     refusal: Option<HelloRefusal>,
     reported: bool,
 }
@@ -683,6 +700,12 @@ impl fmt::Debug for ServerSession {
     }
 }
 
+impl Drop for ServerSession {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl ServerSession {
     pub(crate) fn new(state: crate::sync::Shared<ServerState>, slot: CapacitySlot) -> Self {
         let max = state.limits.max_handshake_bytes;
@@ -692,7 +715,7 @@ impl ServerSession {
             slot: Some(slot),
             sni: None,
             fingerprint: None,
-            peer: None,
+            peer: OnceCell::new(),
             refusal: None,
             reported: false,
         }
@@ -726,7 +749,7 @@ impl ServerSession {
         let obs = &self.state.obs;
         if complete {
             if let Some(info) = self.info() {
-                record_completion(obs, &info, &self.core, self.peer.is_some());
+                record_completion(obs, &info, &self.core);
             }
         }
         if self.core.state == SessionState::Failed && !self.reported {
@@ -766,14 +789,14 @@ impl ServerSession {
                     });
                 }
                 Ok(HelloParse::Complete { view, .. }) => {
-                    self.sni = view.normalized_server_name();
+                    self.sni = view.normalized_server_name().map(|n| n.as_str().into());
                     let kinds = self.state.fingerprints;
                     let fingerprint = Fingerprint::compute(&view, kinds);
                     if let Some(hook) = &self.state.hook {
                         let ctx = HelloContext {
                             view: &view,
                             fingerprint: &fingerprint,
-                            server_name: self.sni.as_ref().map(NormalizedName::as_str),
+                            server_name: self.sni.as_deref(),
                             tag: self.core.tag,
                         };
                         if let HelloVerdict::Refuse(reason) = hook.on_client_hello(&ctx) {
@@ -793,11 +816,7 @@ impl ServerSession {
                     if kinds != crate::fingerprint::FingerprintKinds::NONE {
                         self.fingerprint = Some(fingerprint);
                     }
-                    let Some(slot) = self
-                        .state
-                        .table
-                        .lookup(self.sni.as_ref().map(NormalizedName::as_str))
-                    else {
+                    let Some(slot) = self.state.table.lookup(self.sni.as_deref()) else {
                         self.refusal = Some(HelloRefusal::UnknownName);
                         self.release();
                         return self.core.refuse_unknown_name(output);
@@ -861,7 +880,7 @@ impl ServerSession {
         result
     }
 
-    /// At completion: the client certificate's budgets and identity.
+    /// At completion: the client certificate's budgets.
     fn complete(&mut self) -> Result<(), TlsError> {
         let limits = self.state.limits;
         if let Some(chain) = self.core.peer_chain() {
@@ -872,15 +891,14 @@ impl ServerSession {
             if too_large {
                 return Err(TlsError::PeerChainTooLarge);
             }
-            self.peer = chain
-                .first()
-                .and_then(|c| PeerIdentity::from_der(c.as_ref()));
         }
         Ok(())
     }
 
     fn release(&mut self) {
-        self.slot = None;
+        if let Some(slot) = self.slot.take() {
+            self.state.capacity.release(slot);
+        }
     }
 
     /// Encrypts all of `plaintext` into `output`, or writes nothing.
@@ -918,10 +936,8 @@ impl ServerSession {
     /// The handshake's results; `None` before `HandshakeComplete`.
     #[must_use]
     pub fn info(&self) -> Option<HandshakeInfo<'_>> {
-        let mut info = self
-            .core
-            .info(self.sni.as_ref().map(NormalizedName::as_str))?;
-        info.peer = self.peer.as_ref();
+        let mut info = self.core.info(self.sni.as_deref())?;
+        info.peer = self.core.peer_identity(&self.peer);
         info.fingerprint = self.fingerprint.as_ref();
         Some(info)
     }
@@ -974,7 +990,8 @@ pub struct ClientSession {
     server_name: Box<str>,
     max_chain_len: usize,
     max_cert_bytes: usize,
-    peer: Option<PeerIdentity>,
+    /// Built on first use from the server's certificate (D-104).
+    peer: OnceCell<Option<Box<PeerIdentity>>>,
     obs: std::sync::Arc<Observation>,
     reported: bool,
 }
@@ -1004,7 +1021,7 @@ impl ClientSession {
             server_name,
             max_chain_len: usize::from(limits.max_peer_chain_len),
             max_cert_bytes: limits.max_peer_cert_bytes as usize,
-            peer: None,
+            peer: OnceCell::new(),
             obs,
             reported: false,
         }
@@ -1024,7 +1041,7 @@ impl ClientSession {
         let r = self.step_inner(input, output);
         if matches!(&r, Ok(p) if p.event == Event::HandshakeComplete) {
             if let Some(info) = self.info() {
-                record_completion(&self.obs, &info, &self.core, self.peer.is_some());
+                record_completion(&self.obs, &info, &self.core);
             }
         }
         if self.core.state == SessionState::Failed && !self.reported {
@@ -1056,11 +1073,6 @@ impl ClientSession {
             if too_large {
                 return Err(self.core.fail(TlsError::PeerChainTooLarge));
             }
-            self.peer = self
-                .core
-                .peer_chain()
-                .and_then(|chain| chain.first())
-                .and_then(|c| PeerIdentity::from_der(c.as_ref()));
         }
         Ok(p)
     }
@@ -1099,7 +1111,7 @@ impl ClientSession {
     #[must_use]
     pub fn info(&self) -> Option<HandshakeInfo<'_>> {
         let mut info = self.core.info(Some(&self.server_name))?;
-        info.peer = self.peer.as_ref();
+        info.peer = self.core.peer_identity(&self.peer);
         Some(info)
     }
 
@@ -1128,12 +1140,7 @@ impl ClientSession {
 }
 
 /// Counts and reports a completed handshake.
-fn record_completion<C: Engine>(
-    obs: &Observation,
-    info: &HandshakeInfo<'_>,
-    core: &Core<C>,
-    peer: bool,
-) {
+fn record_completion<C: Engine>(obs: &Observation, info: &HandshakeInfo<'_>, core: &Core<C>) {
     use std::sync::atomic::Ordering::Relaxed;
     let c = &obs.handshakes;
     match info.kind {
@@ -1158,7 +1165,7 @@ fn record_completion<C: Engine>(
         server_name: info.server_name,
         kind: info.kind,
         duration: core.started.map(|t| t.elapsed()).unwrap_or_default(),
-        peer_certificate: peer,
+        peer_certificate: core.peer_chain().is_some_and(|c| !c.is_empty()),
         fingerprint: info.fingerprint,
     });
 }
