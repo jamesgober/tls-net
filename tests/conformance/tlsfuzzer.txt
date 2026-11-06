@@ -26,6 +26,8 @@ pass   rsa   test-tls13-hrr.py
 pass   rsa   test-tls13-ccs.py
 pass   rsa   test-sslv2-connection.py
 pass   ecdsa test-sslv2-connection.py
+pass   rsa   test-conversation.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+pass   rsa   test-zero-length-data.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 
 # TLS 1.3, partly passing.
 # rustls: TLS 1.2 fallback probes use RSA key exchange (absent).
@@ -73,9 +75,12 @@ report rsa   test-tls13-psk_ke.py
 report rsa   test-tls13-non-support.py
 
 # TLS 1.2 and version handling. `-d -M -C <AEAD suite>` where a script
-# takes them (ECDHE, extended master secret, a suite rustls has); scripts
-# without -C pick CBC suites under -d (absent).
-report rsa   test-conversation.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+# takes them (ECDHE, extended master secret, a suite rustls has). What the
+# server reports for the rest: no cipher suite in common (CBC and static RSA,
+# absent), no signature scheme in common (a TLS 1.2 hello without
+# signature_algorithms means SHA-1, which the policy refuses), no TLS version
+# in common (TLS 1.1 probes), malformed or over-budget hellos (strict), and
+# EMS missing (refused, T-7).
 report rsa   test-downgrade-protection.py -d -M
 report rsa   test-TLSv1_2-rejected-without-TLSv1_2.py
 report rsa   test-fallback-scsv.py -d
@@ -88,16 +93,18 @@ report rsa   test-truncating-of-client-hello.py -d -M -C TLS_ECDHE_RSA_WITH_AES_
 report rsa   test-large-hello.py -d -M
 report rsa   test-client-hello-max-size.py -d -M
 report rsa   test-empty-extensions.py
-report rsa   test-record-size-limit.py -M
+report rsa   test-record-size-limit.py -M --reply-AD-size 77
 report rsa   test-heartbeat.py -d
 report rsa   test-no-heartbeat.py -d -M
 report rsa   test-x25519.py
-report ecdsa test-ecdsa-sig-flexibility.py -M -C TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-report ecdsa test-ecdsa-in-certificate-verify.py
+# This commit fails with -M (NameError in the script), and without EMS tls-net
+# refuses TLS 1.2 (T-7).
+report ecdsa test-ecdsa-sig-flexibility.py -C TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+# test-ecdsa-in-certificate-verify.py needs a server that asks for client
+# certificates; tls-net's own mutual TLS tests cover that (T-6b, T-22).
 report rsa   test-sig-algs.py -M
 report rsa   test-signature-algorithms.py -M
 report rsa   test-ecdhe-padded-shared-secret.py
-report rsa   test-zero-length-data.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 report rsa   test-chacha20.py
 report rsa   test-aes-gcm-nonces.py -d -M -C TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 report rsa   test-atypical-padding.py -d -M
