@@ -68,3 +68,5 @@ rm -f site.leaf.crt ca.csr inter.csr ca.ext ca.srl inter.srl
 
 # OCSP staples for site.pem.
 bash ocsp.sh
+# CRLs and a self-signed certificate.
+bash crl.sh

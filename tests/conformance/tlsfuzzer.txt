@@ -1,0 +1,64 @@
+# tlsfuzzer scripts run against the example server (ECDSA P-256, default
+# policy: TLS 1.3 and 1.2, AEAD suites only, extended master secret
+# required, no renegotiation, no compression, no 0-RTT).
+# <expect> <script> [args]: `pass` must pass; `report` runs and is logged,
+# with the reason it is not `pass` on the line above it.
+#
+# TLS 1.3
+report test-tls13-conversation.py
+report test-tls13-version-negotiation.py
+report test-tls13-legacy-version.py
+report test-tls13-invalid-ciphers.py
+report test-tls13-nociphers.py
+report test-tls13-keyshare-omitted.py
+report test-tls13-hrr.py
+report test-tls13-unrecognised-groups.py
+report test-tls13-crfg-curves.py
+report test-tls13-obsolete-curves.py
+report test-tls13-ecdsa-support.py
+report test-tls13-signature-algorithms.py
+report test-tls13-pkcs-signature.py
+report test-tls13-finished.py
+report test-tls13-finished-plaintext.py
+report test-tls13-ccs.py
+report test-tls13-empty-alert.py
+report test-tls13-zero-length-data.py
+report test-tls13-record-layer-limits.py
+report test-tls13-lengths.py
+report test-tls13-large-number-of-extensions.py
+report test-tls13-shuffled-extentions.py
+report test-tls13-serverhello-random.py
+report test-tls13-session-resumption.py
+report test-tls13-count-tickets.py
+report test-tls13-psk_ke.py
+report test-tls13-non-support.py
+# TLS 1.2 and version handling
+report test-conversation.py -d
+report test-downgrade-protection.py
+report test-TLSv1_2-rejected-without-TLSv1_2.py
+report test-fallback-scsv.py
+report test-sslv2-connection.py
+report test-extended-master-secret-extension.py
+report test-renegotiation-disabled.py
+report test-invalid-compression-methods.py
+report test-invalid-content-type.py
+report test-truncating-of-client-hello.py
+report test-large-hello.py
+report test-client-hello-max-size.py
+report test-empty-extensions.py
+report test-record-size-limit.py
+report test-heartbeat.py
+report test-no-heartbeat.py
+report test-x25519.py
+report test-ecdsa-sig-flexibility.py
+report test-ecdsa-in-certificate-verify.py
+report test-sig-algs.py
+report test-signature-algorithms.py
+report test-ecdhe-padded-shared-secret.py
+report test-zero-length-data.py
+report test-chacha20.py
+report test-aes-gcm-nonces.py
+report test-atypical-padding.py
+report test-sessionID-resumption.py
+report test-unsupported-curve-fallback.py
+report test-ocsp-stapling.py

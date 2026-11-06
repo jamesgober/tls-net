@@ -1,0 +1,70 @@
+name: TLS conformance
+
+# testssl.sh and tlsfuzzer against the example server (ROADMAP 0.7, T-26,
+# D-109). Weekly, on demand, and when these files change.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - ".github/workflows/conformance.yml"
+      - "tests/conformance/**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TESTSSL_TAG: v3.2.4
+  TLSFUZZER_COMMIT: 5eebc4464e5197a7f7392fb9acda99cfc32441f7
+  TLSLITE_NG: "0.9.0b2"
+
+jobs:
+  testssl:
+    name: testssl.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start the example server
+        run: bash tests/conformance/server.sh
+      - name: Run testssl.sh
+        run: |
+          git clone --depth 1 --branch "$TESTSSL_TAG" https://github.com/testssl/testssl.sh "$RUNNER_TEMP/testssl"
+          "$RUNNER_TEMP/testssl/testssl.sh" --quiet --color 0 --warnings off --ip 127.0.0.1 \
+            --protocols --server-defaults --server-preference --each-cipher --vulnerabilities --headers \
+            --jsonfile "$RUNNER_TEMP/testssl.json" localhost:4433 || true
+      - name: Check the findings
+        run: python3 tests/conformance/testssl_check.py "$RUNNER_TEMP/testssl.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: testssl
+          path: ${{ runner.temp }}/testssl.json
+
+  tlsfuzzer:
+    name: tlsfuzzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start the example server
+        run: bash tests/conformance/server.sh
+      - name: Run tlsfuzzer
+        run: |
+          python3 -m pip install --user "tlslite-ng==$TLSLITE_NG" ecdsa
+          git clone https://github.com/tlsfuzzer/tlsfuzzer "$RUNNER_TEMP/tlsfuzzer"
+          git -C "$RUNNER_TEMP/tlsfuzzer" checkout --quiet "$TLSFUZZER_COMMIT"
+          bash tests/conformance/tlsfuzzer.sh "$RUNNER_TEMP/tlsfuzzer"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tlsfuzzer
+          path: ${{ runner.temp }}/tlsfuzzer-logs

@@ -60,7 +60,7 @@ Exit: every bench of PLAN section 9 with committed baselines; the end-to-end com
 - [x] tls-net's own overhead within its targets: handshakes within 3% of rustls on Windows and Linux, `encrypt` within 50 ns, `step` within 100 ns plus the D-035 copy, no allocation per record, 257 bytes per idle connection (D-096, D-100, D-102, D-104).
 - [x] End-to-end bulk at least 1.2 times tokio-rustls in rate and in CPU per byte (D-105).
 - [ ] End-to-end handshakes at least 1.2 times tokio-rustls in CPU per handshake (rate already 1.45x). Waits on net-io 0.8: coalesced sends and accept in the worker (net-io D-180). Carried to the 1.0 gate (D-106).
-- [ ] Memory per idle connection at least 30% below tokio-rustls, and no TLS connection ceiling below `max_connections`. Waits on net-io: TLS buffers back to the pool while idle. Carried to the 1.0 gate (D-106).
+- [ ] Memory per idle connection at least 30% below tokio-rustls, and no TLS connection ceiling below `max_connections`. net-io 0.7.0 gives idle TLS buffers back to the pool (net-io D-181); measure on it. Carried to the 1.0 gate (D-106).
 
 ## v0.7.0 - Hardening
 Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hours without an open finding; attack tests T-1 to T-28 green; tlsfuzzer server scripts and testssl.sh clean for the supported features (weekly CI job); soak of NFR-21 without memory growth; Miri and loom green; `docs/SECURITY.md` written.

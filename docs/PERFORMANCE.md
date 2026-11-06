@@ -160,12 +160,12 @@ net-io 0.6.1 keeps two 64 KiB buffers per TLS connection for its whole life, whi
 | Gap | Where | Plan |
 |---|---|---|
 | CPU per handshake 0.96x tokio-rustls (target 1.2x) | net-io reactor | Send the tickets, the first response, and close_notify together when one turn produces them (four sends per connection to two), and accept on the worker when listeners are per worker. Reported to net-io with profiles; re-measured on each net-io release |
-| idle memory 2.3x tokio-rustls (target 0.7x) and the 4,096-connection ceiling | net-io reactor | Return TLS buffers to the pool while a connection is idle; tls-net keeps no state in them once input is consumed and output sent. Reported to net-io |
+| idle memory 2.3x tokio-rustls (target 0.7x) and the 4,096-connection ceiling | net-io reactor | net-io 0.7.0 gives TLS buffers back to the pool while a connection is idle (net-io D-181); tls-net keeps no state in them once input is consumed and output sent. Re-measured on 0.7.0 |
 | `ServerReader::accept` 37 ns (target 20 ns) | tls-net | Four atomic operations are left, the capacity gate's and the snapshot's reference count; going lower would give up the server-wide handshake bound (D-102). Accepted |
 | D-035 copy, one extra copy per received record | rustls 0.23 | rustls 0.24's in-place reads (0.9) |
 | bare-metal Linux numbers | hardware | Re-run `perf/` and the paired bench on bare-metal Linux when one is available |
 
-The first two rows are scheduled in net-io 0.8 (net-io D-180, and the idle buffer release reported with them). They are part of the 1.0 gate (D-106): 1.0 does not ship until both are met.
+The first row is scheduled in net-io 0.8 (net-io D-180); the second is fixed in net-io 0.7.0 (net-io D-181) and is re-measured there. They are part of the 1.0 gate (D-106): 1.0 does not ship until both are met.
 
 ---
 

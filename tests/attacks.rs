@@ -4,8 +4,14 @@
 
 mod common;
 
-use common::{RawHello, data, refuse};
-use tls_net::{ClientBuilder, KeySource, Policy, TlsError, TlsServer, TrustAnchors, UnknownName};
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::{End, RawHello, data, pump, refuse};
+use tls_net::{
+    CertificateProblem, ClientBuilder, Crls, Event, HandshakeKind, KeySource, Policy,
+    RevocationPolicy, TicketMode, TlsClient, TlsError, TlsServer, TrustAnchors, UnknownName,
+};
 
 fn server() -> TlsServer {
     TlsServer::builder()
@@ -204,4 +210,187 @@ fn test_t25_every_unknown_name_gets_identical_alert() {
     // No SNI at all gets the same bytes.
     let (sent, _) = refuse(&server, &RawHello::tls12(&ECDHE_SUITES).record());
     assert_eq!(Some(sent), first);
+}
+
+fn test_ca_client() -> ClientBuilder {
+    ClientBuilder::new().trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
+}
+
+/// The handshake between a tls-net client and a plain rustls server that
+/// serves `chain` (which tls-net's own server would refuse to load);
+/// `None` when it completes, else the client's error.
+fn against_rustls_server(chain: &str, key: &str, client: &TlsClient) -> Option<TlsError> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    #[cfg(feature = "aws-lc")]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    #[cfg(not(feature = "aws-lc"))]
+    let provider = rustls::crypto::ring::default_provider();
+    let certs = CertificateDer::pem_slice_iter(&data(chain))
+        .map(Result::unwrap)
+        .collect();
+    let key = PrivateKeyDer::from_pem_slice(&data(key)).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+    let mut session = client.connect("localhost").unwrap();
+    let (mut to_server, mut to_client) = (Vec::new(), Vec::new());
+    let mut out = vec![0u8; 64 * 1024];
+    for _ in 0..16 {
+        loop {
+            let (consumed, written, complete, idle) = match session.step(&mut to_client, &mut out) {
+                Ok(p) => (
+                    p.consumed,
+                    p.written,
+                    matches!(p.event, Event::HandshakeComplete),
+                    matches!(p.event, Event::NeedInput),
+                ),
+                Err(e) => return Some(e),
+            };
+            to_server.extend_from_slice(&out[..written]);
+            to_client.drain(..consumed);
+            if complete {
+                return None;
+            }
+            if idle && consumed == 0 && written == 0 {
+                break;
+            }
+        }
+        let mut rd = &to_server[..];
+        while !rd.is_empty() {
+            server.read_tls(&mut rd).unwrap();
+        }
+        to_server.clear();
+        let _ = server.process_new_packets();
+        while server.wants_write() {
+            server.write_tls(&mut to_client).unwrap();
+        }
+    }
+    panic!("the handshake neither completed nor failed")
+}
+
+#[test]
+fn test_t6_expired_and_self_signed_server_certificates_refused() {
+    let client = test_ca_client().build().unwrap();
+    assert_eq!(
+        against_rustls_server("site.pem", "site.key", &client),
+        None,
+        "control"
+    );
+    assert_eq!(
+        against_rustls_server("expired.pem", "expired.key", &client),
+        Some(TlsError::PeerCertificateInvalid(
+            CertificateProblem::Expired
+        ))
+    );
+    assert_eq!(
+        against_rustls_server("selfsigned.pem", "selfsigned.key", &client),
+        Some(TlsError::PeerCertificateInvalid(
+            CertificateProblem::UnknownIssuer
+        ))
+    );
+}
+
+#[test]
+fn test_t6_revoked_server_certificate_refused_by_crl() {
+    let server = server();
+    let with = |crl: &str| {
+        let client = test_ca_client()
+            .crls(
+                Crls::from_pem(&data(crl)).unwrap(),
+                RevocationPolicy::END_ENTITY_ONLY,
+            )
+            .build()
+            .unwrap();
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (
+            server.accept().unwrap(),
+            client.connect("localhost").unwrap(),
+        );
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        (c.complete, c.error)
+    };
+    assert_eq!(with("inter-empty.crl.pem"), (true, None), "control");
+    assert_eq!(
+        with("inter-revokes-site.crl.pem"),
+        (false, Some(TlsError::PeerCertificateRevoked))
+    );
+}
+
+#[test]
+fn test_t11_clients_never_resume_with_each_others_tickets() {
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .tickets(
+            TicketMode::Ephemeral {
+                period: Duration::from_secs(3600),
+            },
+            2,
+        )
+        .build()
+        .unwrap();
+    let kind = |client: &TlsClient| {
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (
+            server.accept().unwrap(),
+            client.connect("localhost").unwrap(),
+        );
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        assert!(c.complete, "{:?}", c.error);
+        ss.info().unwrap().kind
+    };
+    let (a, b) = (
+        test_ca_client().resumption(64).build().unwrap(),
+        test_ca_client().resumption(64).build().unwrap(),
+    );
+    assert_eq!(kind(&a), HandshakeKind::Full);
+    assert_eq!(
+        kind(&a),
+        HandshakeKind::Resumed,
+        "a resumes with its own ticket"
+    );
+    assert_eq!(kind(&b), HandshakeKind::Full, "b holds none of a's tickets");
+    assert_eq!(kind(&b), HandshakeKind::Resumed);
+}
+
+#[test]
+fn test_t18_reload_with_expired_certificate_refused_old_one_kept() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+    // Checkouts leave key files group-readable; allow that so the refusal
+    // below is the expiry check's, not the permission check's.
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .allow_group_readable_key(true)
+        .build()
+        .unwrap();
+    let before = server.stats().snapshot_version;
+    let refused =
+        server.reload_from_files(format!("{dir}expired.pem"), format!("{dir}expired.key"));
+    let cause = match &refused {
+        Err(TlsError::ReloadRefused { source }) => source.as_ref(),
+        Err(e) => e,
+        Ok(()) => panic!("an expired certificate was published"),
+    };
+    assert!(
+        matches!(cause, TlsError::CertificateExpired { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(server.stats().snapshot_version, before);
+    let client = test_ca_client().build().unwrap();
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    let (mut ss, mut cs) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    pump(&mut ss, &mut s, &mut cs, &mut c);
+    assert!(
+        c.complete,
+        "the old certificate is still served: {:?}",
+        c.error
+    );
 }
