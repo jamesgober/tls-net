@@ -394,3 +394,95 @@ fn test_t18_reload_with_expired_certificate_refused_old_one_kept() {
         c.error
     );
 }
+
+/// Steps `session` over `input` until it fails or waits; returns the bytes it
+/// wrote and whether it failed.
+/// One `step`: consumed, written, and whether the session waits for input.
+type Step<'a> = dyn FnMut(&mut Vec<u8>, &mut [u8]) -> Result<(usize, usize, bool), TlsError> + 'a;
+
+fn drive_junk(step: &mut Step<'_>, input: &[u8]) -> (Vec<u8>, bool) {
+    let (mut input, mut out, mut sent) = (input.to_vec(), vec![0u8; 64 * 1024], Vec::new());
+    for _ in 0..64 {
+        match step(&mut input, &mut out) {
+            Ok((consumed, written, waiting)) => {
+                sent.extend_from_slice(&out[..written]);
+                input.drain(..consumed);
+                if waiting && consumed == 0 && written == 0 {
+                    return (sent, false);
+                }
+            }
+            Err(_) => return (sent, true),
+        }
+    }
+    panic!("the session neither failed nor waited")
+}
+
+/// Plaintext fatal alerts in `sent` (records of type 21, level 2).
+fn fatal_alerts(sent: &[u8]) -> usize {
+    let (mut i, mut n) = (0, 0);
+    while i + 5 <= sent.len() {
+        let len = usize::from(u16::from_be_bytes([sent[i + 3], sent[i + 4]]));
+        if sent[i] == 21 && sent.get(i + 5) == Some(&2) {
+            n += 1;
+        }
+        i += 5 + len;
+    }
+    n
+}
+
+#[test]
+fn test_t14_junk_from_a_server_fails_the_client_with_one_alert_d111() {
+    // Found by the session_step_client fuzz target: one byte 0xd3 as the
+    // server's first flight made rustls queue a second fatal alert.
+    let client = test_ca_client().build().unwrap();
+    for junk in [
+        &[0xd3][..],
+        &[0x00],
+        &[0x17, 0x03, 0x03, 0x00, 0x01, 0x00],
+        &[0x16, 0x02, 0x00, 0x00, 0x01, 0x00],
+    ] {
+        let mut session = client.connect("localhost").unwrap();
+        let mut out = vec![0u8; 64 * 1024];
+        assert!(
+            session.step(&mut [], &mut out).unwrap().written > 0,
+            "the hello"
+        );
+        let mut step = |i: &mut Vec<u8>, o: &mut [u8]| {
+            session
+                .step(i, o)
+                .map(|p| (p.consumed, p.written, matches!(p.event, Event::NeedInput)))
+        };
+        let (sent, failed) = drive_junk(&mut step, junk);
+        assert!(failed, "{junk:?}");
+        assert!(fatal_alerts(&sent) <= 1, "{junk:?}: {sent:?}");
+    }
+}
+
+#[test]
+fn test_t14_junk_after_a_server_hello_fails_with_one_alert_d111() {
+    // The server side: a valid hello, then junk where the client's next
+    // flight belongs.
+    let server = server();
+    let client = test_ca_client().build().unwrap();
+    let mut out = vec![0u8; 64 * 1024];
+    let mut c = client.connect("localhost").unwrap();
+    let n = c.step(&mut [], &mut out).unwrap().written;
+    let hello = out[..n].to_vec();
+    for junk in [
+        &[0xd3][..],
+        &[0x17, 0x03, 0x03, 0x00, 0x01, 0x00],
+        &[0x15, 0x03, 0x03, 0x00, 0x01, 0x07],
+    ] {
+        let mut session = server.accept().unwrap();
+        let mut input = hello.clone();
+        input.extend_from_slice(junk);
+        let mut step = |i: &mut Vec<u8>, o: &mut [u8]| {
+            session
+                .step(i, o)
+                .map(|p| (p.consumed, p.written, matches!(p.event, Event::NeedInput)))
+        };
+        let (sent, failed) = drive_junk(&mut step, &input);
+        assert!(failed, "{junk:?}");
+        assert!(fatal_alerts(&sent) <= 1, "{junk:?}");
+    }
+}

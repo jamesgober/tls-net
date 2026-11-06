@@ -397,6 +397,11 @@ impl<C: Engine> Core<C> {
             return Stop::Failed(TlsError::WrongState);
         };
         let mut failed: Option<TlsError> = None;
+        // A deframing error (a malformed or undecryptable record) queues only
+        // its alert and leaves the bad bytes in place: one more call hands
+        // the alert out, a second would parse them again and queue another
+        // fatal alert (D-111). After other errors rustls keeps the failure.
+        let mut alert_only = false;
         loop {
             if output.len() - *written < OUTGOING_MIN {
                 return match failed.take() {
@@ -419,10 +424,22 @@ impl<C: Engine> Core<C> {
                     if let TlsError::AlertReceived { alert } = mapped {
                         self.alert = Some(alert);
                     }
+                    alert_only = matches!(
+                        e,
+                        rustls::Error::InvalidMessage(_) | rustls::Error::DecryptError
+                    );
                     failed = Some(mapped);
                     continue;
                 }
             };
+            if failed.is_some()
+                && !matches!(
+                    state,
+                    ConnectionState::EncodeTlsData(_) | ConnectionState::TransmitTlsData(_)
+                )
+            {
+                return Stop::Failed(failed.unwrap_or(TlsError::Other));
+            }
             match state {
                 ConnectionState::EncodeTlsData(mut enc) => {
                     match enc.encode(&mut output[*written..]) {
@@ -433,6 +450,9 @@ impl<C: Engine> Core<C> {
                         }
                     }
                     *consumed += discard;
+                    if alert_only {
+                        return Stop::Failed(failed.take().unwrap_or(TlsError::Other));
+                    }
                 }
                 ConnectionState::TransmitTlsData(t) => {
                     t.done();
