@@ -165,7 +165,7 @@ net-io 0.6.1 keeps two 64 KiB buffers per TLS connection for its whole life, whi
 | D-035 copy, one extra copy per received record | rustls 0.23 | rustls 0.24's in-place reads (0.9) |
 | bare-metal Linux numbers | hardware | Re-run `perf/` and the paired bench on bare-metal Linux when one is available |
 
-0.6 closes when the first two rows are met (D-105).
+The first two rows are scheduled in net-io 0.8 (net-io D-180, and the idle buffer release reported with them). They are part of the 1.0 gate (D-106): 1.0 does not ship until both are met.
 
 ---
 

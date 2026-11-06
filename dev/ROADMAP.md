@@ -59,8 +59,8 @@ Exit: every bench of PLAN section 9 with committed baselines; the end-to-end com
 - [x] Benches of PLAN section 9, the paired comparison with rustls, and the loopback harness (`perf/`) against tokio-rustls and tokio-openssl (D-097 to D-099, D-103).
 - [x] tls-net's own overhead within its targets: handshakes within 3% of rustls on Windows and Linux, `encrypt` within 50 ns, `step` within 100 ns plus the D-035 copy, no allocation per record, 257 bytes per idle connection (D-096, D-100, D-102, D-104).
 - [x] End-to-end bulk at least 1.2 times tokio-rustls in rate and in CPU per byte (D-105).
-- [ ] End-to-end handshakes at least 1.2 times tokio-rustls in CPU per handshake (rate already 1.45x). Waits on net-io: coalesced sends and accept in the worker (D-105).
-- [ ] Memory per idle connection at least 30% below tokio-rustls, and no TLS connection ceiling below `max_connections`. Waits on net-io: TLS buffers back to the pool while idle (D-105).
+- [ ] End-to-end handshakes at least 1.2 times tokio-rustls in CPU per handshake (rate already 1.45x). Waits on net-io 0.8: coalesced sends and accept in the worker (net-io D-180). Carried to the 1.0 gate (D-106).
+- [ ] Memory per idle connection at least 30% below tokio-rustls, and no TLS connection ceiling below `max_connections`. Waits on net-io: TLS buffers back to the pool while idle. Carried to the 1.0 gate (D-106).
 
 ## v0.7.0 - Hardening
 Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hours without an open finding; attack tests T-1 to T-28 green; tlsfuzzer server scripts and testssl.sh clean for the supported features (weekly CI job); soak of NFR-21 without memory growth; Miri and loom green; `docs/SECURITY.md` written.
@@ -77,11 +77,13 @@ Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with ex
 Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by item, what is met and what still needs James.
 - [ ] Revisit every gap and every deferred item in this file and in `PLAN.md`; close each or record why it waits for after 1.0.
 - [ ] Re-tune handshake and throughput performance against the 0.6 baselines; no regression over 5%.
+- [ ] The two end-to-end items carried from 0.6 (D-106): CPU per handshake and idle memory against tokio-rustls, measured with `perf/` on the net-io release that ships coalesced sends, accept in the worker, and idle TLS buffer release.
 - [ ] Re-run the security review (threat table, attack tests, dependency footprint, `cargo audit`, `cargo deny`).
 - [ ] Check webpki-roots, rustls, and the provider for newer releases.
 
 ## v1.0.0 - Stable (James's explicit go)
 - [ ] Full audit recorded in `docs/STABILITY-1.0.md` (API, docs, tests, benchmarks, security).
+- [ ] Every end-to-end target of PLAN section 9 met, including the two carried from 0.6 (D-106).
 - [ ] DIRECTIVES section 3 item 10: direct mode of the first site and smtp-net have used the API end to end in production (two weeks on staging for direct mode; RC builds in production).
 - [ ] API frozen until 2.0.
 
