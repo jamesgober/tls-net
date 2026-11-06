@@ -575,7 +575,10 @@ fn test_t8_no_ticket_key_bytes_in_debug() {
         format!("{handle:?}"),
         format!("{sealed:?}"),
     ];
-    let hexed: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    let hexed = secret.iter().fold(String::new(), |mut s, b| {
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+        s
+    });
     for out in &outputs {
         assert!(!out.contains(&hexed[..16]), "hex key bytes in {out}");
         assert!(
