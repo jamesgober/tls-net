@@ -1193,6 +1193,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_parse_budgets_at_n_minus_one_n_n_plus_one_t14() {
+        let parse = |b: &HelloBuilder, l: &HelloLimits| {
+            HelloParser::parse(&b.records(16_384), l).map(|_| ())
+        };
+        // Cipher suites, limit 4.
+        let l = HelloLimits::new().max_ciphers(4).unwrap();
+        for (n, ok) in [(3u16, true), (4, true), (5, false)] {
+            let mut b = HelloBuilder::new();
+            b.ciphers = (1..=n).collect();
+            assert_eq!(parse(&b, &l).is_ok(), ok, "{n} cipher suites");
+        }
+        // ALPN names, default limit 32.
+        for (n, ok) in [(31, true), (32, true), (33, false)] {
+            let names: Vec<&[u8]> = vec![b"x"; n];
+            let b = HelloBuilder::new().alpn(&names);
+            assert_eq!(parse(&b, &HelloLimits::new()).is_ok(), ok, "{n} ALPN names");
+        }
+        // Extensions, default limit 64.
+        for (n, ok) in [(63u16, true), (64, true), (65, false)] {
+            let mut b = HelloBuilder::new();
+            for t in 0..n {
+                b = b.ext(0x7000 + t, vec![]);
+            }
+            assert_eq!(parse(&b, &HelloLimits::new()).is_ok(), ok, "{n} extensions");
+        }
+        // The hello's length, default limit 16 KiB, padded with extension 21.
+        let max = HelloLimits::new().max_hello_bytes as usize;
+        let bare = HelloBuilder::new().ext(21, vec![]).body().len() - 4;
+        for (len, ok) in [(max - 1, true), (max, true), (max + 1, false)] {
+            let b = HelloBuilder::new().ext(21, vec![0; len - bare]);
+            assert_eq!(b.body().len() - 4, len);
+            let r = parse(&b, &HelloLimits::new());
+            assert_eq!(r.is_ok(), ok, "a {len}-byte hello: {r:?}");
+            if !ok {
+                assert_eq!(r.unwrap_err(), TlsError::HelloTooLarge);
+            }
+        }
+        // Records, default limit 4: a 400-byte hello in 3, 4, and 5 records.
+        let bare = HelloBuilder::new().ext(21, vec![]).body().len();
+        let b = HelloBuilder::new().ext(21, vec![0; 400 - bare]);
+        assert_eq!(b.body().len(), 400);
+        for (chunk, records, ok) in [(134, 3, true), (100, 4, true), (80, 5, false)] {
+            let wire = b.records(chunk);
+            assert_eq!(wire.len(), 400 + 5 * records);
+            let r = HelloParser::parse(&wire, &HelloLimits::new());
+            assert_eq!(r.is_ok(), ok, "{records} records: {r:?}");
+            if !ok {
+                assert_eq!(r.unwrap_err(), TlsError::HelloTooFragmented);
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_bad_sni_shapes() {
         let l = HelloLimits::new();
         for bad in [vec![0, 0], vec![0, 3, 0, 0, 0], vec![0, 4, 1, 0, 1, b'a']] {

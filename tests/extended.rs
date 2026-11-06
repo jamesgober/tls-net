@@ -357,12 +357,29 @@ fn test_reload_keeps_handshakes_in_progress_t19() {
         after.server.info().unwrap().cipher_suite,
         CipherSuite::EcdheRsaAes256GcmSha384
     );
-    // A half-written pair (new chain, old key) is refused; the old one stays.
+    // A half-written pair (new chain, old key) is refused; the old one
+    // stays, and a handshake in flight across the refusal completes.
+    let mut during = Pair {
+        server: server.accept().unwrap(),
+        client: client.connect("localhost").unwrap(),
+        s: End::new(usize::MAX),
+        c: End::new(usize::MAX),
+    };
+    let mut to_s = Vec::new();
+    during.c.run(&mut during.client, &mut to_s);
+    during.s.inbox.extend(to_s);
     let e = server
         .reload_from_pem(&data("site.pem"), &data("site-rsa.key"))
         .unwrap_err();
     assert!(matches!(e, TlsError::ReloadRefused { .. }), "{e}");
     assert_eq!(server.version(), 2);
+    pump(
+        &mut during.server,
+        &mut during.s,
+        &mut during.client,
+        &mut during.c,
+    );
+    assert!(during.c.complete, "{:?}", during.c.error);
     let still = connect(&server, &client, "localhost");
     assert_eq!(
         still.server.info().unwrap().cipher_suite,
@@ -882,6 +899,13 @@ fn test_t10_early_data_never_reaches_the_application() {
         }
         if round == 1 {
             assert!(!client.is_early_data_accepted());
+            // The resumption happened, so the client held a ticket and the
+            // missing 0-RTT window above is the server's doing.
+            assert_eq!(
+                client.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed)
+            );
+            assert_eq!(s.info().unwrap().kind, HandshakeKind::Resumed);
         }
     }
     assert!(
@@ -889,4 +913,50 @@ fn test_t10_early_data_never_reaches_the_application() {
         "early data reached the application"
     );
     assert_eq!(received, b"LATELATE");
+}
+
+#[cfg(feature = "aws-lc")]
+#[test]
+fn test_t2_t4_internal_listener_refuses_tls12_and_x25519_only_peers() {
+    let server = site()
+        .policy(Policy::internal())
+        .alpn(&[Alpn::new(b"svc-bc/1").unwrap()])
+        .alpn_policy(AlpnPolicy::Required)
+        .client_auth(ClientAuth::required(ca()))
+        .build()
+        .unwrap();
+    let peer = |policy: Policy| {
+        ClientBuilder::new()
+            .trust(ca())
+            .policy(policy)
+            .alpn(&[Alpn::new(b"svc-bc/1").unwrap()])
+            .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
+            .unwrap()
+            .build()
+            .unwrap()
+    };
+    // T-2: a TLS 1.2-only peer.
+    let tls12 = peer(
+        Policy::client_default()
+            .versions(&[Version::Tls12])
+            .unwrap(),
+    );
+    let p = connect(&server, &tls12, "localhost");
+    assert!(!p.s.complete);
+    assert_eq!(p.s.error, Some(TlsError::NoCommonVersion));
+    // T-4: a TLS 1.3 peer offering X25519 alone (no post-quantum group).
+    // X25519 is not approved in a FIPS build, where P-256 covers this case.
+    #[cfg(not(feature = "fips"))]
+    {
+        let classical = peer(
+            Policy::client_default()
+                .versions(&[Version::Tls13])
+                .unwrap()
+                .groups(&[tls_net::Group::X25519])
+                .unwrap(),
+        );
+        let p = connect(&server, &classical, "localhost");
+        assert!(!p.s.complete);
+        assert_eq!(p.s.error, Some(TlsError::NoCommonGroup));
+    }
 }

@@ -486,3 +486,280 @@ fn test_t14_junk_after_a_server_hello_fails_with_one_alert_d111() {
         assert!(fatal_alerts(&sent) <= 1, "{junk:?}");
     }
 }
+
+/// `record` (one record holding a ClientHello) with each extension passed
+/// through `edit`: `None` drops it, `Some(body)` keeps or replaces it. Every
+/// length is recomputed, as an attacker in the path would.
+/// An extension edit: type and body in, the new body or `None` to drop it.
+type Edit = dyn Fn(u16, &[u8]) -> Option<Vec<u8>>;
+
+fn rewrite_hello(record: &[u8], edit: &Edit) -> Vec<u8> {
+    let hs = &record[5 + 4..];
+    let at = |i: usize| usize::from(u16::from_be_bytes([hs[i], hs[i + 1]]));
+    let mut i = 2 + 32;
+    i += 1 + usize::from(hs[i]);
+    i += 2 + at(i);
+    i += 1 + usize::from(hs[i]);
+    let head = &hs[..i];
+    let end = i + 2 + at(i);
+    i += 2;
+    let mut exts = Vec::new();
+    while i < end {
+        let typ = u16::from_be_bytes([hs[i], hs[i + 1]]);
+        let len = at(i + 2);
+        if let Some(body) = edit(typ, &hs[i + 4..i + 4 + len]) {
+            exts.extend_from_slice(&typ.to_be_bytes());
+            exts.extend_from_slice(&u16::try_from(body.len()).unwrap().to_be_bytes());
+            exts.extend_from_slice(&body);
+        }
+        i += 4 + len;
+    }
+    let mut hello = head.to_vec();
+    hello.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
+    hello.extend_from_slice(&exts);
+    let mut msg = vec![1];
+    msg.extend_from_slice(&u32::try_from(hello.len()).unwrap().to_be_bytes()[1..]);
+    msg.extend_from_slice(&hello);
+    let mut rec = record[..3].to_vec();
+    rec.extend_from_slice(&u16::try_from(msg.len()).unwrap().to_be_bytes());
+    rec.extend_from_slice(&msg);
+    rec
+}
+
+/// A tls-net handshake whose first ClientHello is rewritten in transit.
+fn with_rewritten_hello(server: &TlsServer, client: &TlsClient, edit: &Edit) -> (End, End) {
+    let (mut ss, mut cs) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    let mut out = vec![0u8; 64 * 1024];
+    let n = cs.step(&mut [], &mut out).unwrap().written;
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    s.inbox = rewrite_hello(&out[..n], edit);
+    pump(&mut ss, &mut s, &mut cs, &mut c);
+    (s, c)
+}
+
+#[test]
+fn test_rewrite_hello_unchanged_completes() {
+    // The helper itself: a pass-through rewrite still completes.
+    let (s, c) = with_rewritten_hello(&server(), &test_ca_client().build().unwrap(), &|_, b| {
+        Some(b.to_vec())
+    });
+    assert!(s.complete && c.complete, "{:?} {:?}", s.error, c.error);
+}
+
+#[test]
+fn test_t1_downgrade_to_tls12_refused_by_the_client() {
+    // supported_versions stripped in transit: the server, able to do TLS
+    // 1.3, answers TLS 1.2 with RFC 8446's downgrade sentinel in its
+    // random, and the client, which offered 1.3, refuses.
+    let (_, c) = with_rewritten_hello(&server(), &test_ca_client().build().unwrap(), &|t, b| {
+        (t != 43).then(|| b.to_vec())
+    });
+    assert!(!c.complete);
+    assert_eq!(c.error, Some(TlsError::PeerMisbehaved), "{:?}", c.error);
+}
+
+#[test]
+fn test_t4_groups_rewritten_in_transit_fail_the_handshake() {
+    // The supported_groups list reordered in transit (the attacker's way to
+    // steer the group choice): the transcripts differ and neither side
+    // completes.
+    let (s, c) = with_rewritten_hello(&server(), &test_ca_client().build().unwrap(), &|t, b| {
+        if t != 10 {
+            return Some(b.to_vec());
+        }
+        let mut groups: Vec<[u8; 2]> = b[2..].chunks(2).map(|g| [g[0], g[1]]).collect();
+        assert!(groups.len() >= 2);
+        groups.reverse();
+        let mut body = b[..2].to_vec();
+        body.extend(groups.concat());
+        Some(body)
+    });
+    assert!(!c.complete && !s.complete);
+    assert!(c.error.is_some(), "the client must fail");
+}
+
+#[test]
+fn test_t20_events_never_carry_raw_control_bytes() {
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct Log(Mutex<Vec<String>>);
+    impl tls_net::TlsObserver for Log {
+        fn on_event(&self, event: &tls_net::TlsEvent<'_>) {
+            self.0.lock().unwrap().push(format!("{event:?}"));
+        }
+    }
+    let log = Arc::new(Log::default());
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .observer(Arc::clone(&log) as Arc<dyn tls_net::TlsObserver>)
+        .hello_sampling(1)
+        .build()
+        .unwrap();
+    let hello = RawHello::tls12(&ECDHE_SUITES).sni(b"evil\r\n\x1b[31mred\x00.test");
+    let _ = refuse(&server, &hello.record());
+    let events = log.0.lock().unwrap();
+    assert!(!events.is_empty(), "the hello is sampled");
+    for e in events.iter() {
+        assert!(!e.chars().any(char::is_control), "raw control byte in {e}");
+    }
+}
+
+/// The handshake between a plain rustls client (any configuration, any
+/// client chain) and a tls-net server: whether it completed, and the
+/// server's error.
+fn against_rustls_client(
+    server: &TlsServer,
+    config: rustls::ClientConfig,
+) -> (bool, Option<TlsError>) {
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut client = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut session = server.accept().unwrap();
+    let (mut inbox, mut out) = (Vec::new(), vec![0u8; 64 * 1024]);
+    for _ in 0..64 {
+        while client.wants_write() {
+            client.write_tls(&mut inbox).unwrap();
+        }
+        loop {
+            let (consumed, written, complete, idle) = match session.step(&mut inbox, &mut out) {
+                Ok(p) => (
+                    p.consumed,
+                    p.written,
+                    matches!(p.event, Event::HandshakeComplete),
+                    matches!(p.event, Event::NeedInput),
+                ),
+                Err(e) => return (false, Some(e)),
+            };
+            let mut back = &out[..written];
+            while !back.is_empty() {
+                client.read_tls(&mut back).unwrap();
+            }
+            let _ = client.process_new_packets();
+            inbox.drain(..consumed);
+            if complete {
+                return (true, None);
+            }
+            if idle && consumed == 0 && written == 0 {
+                break;
+            }
+        }
+        if !client.wants_write() && !client.is_handshaking() {
+            return (false, None);
+        }
+    }
+    panic!("the handshake neither completed nor failed")
+}
+
+fn rustls_client_with_chain(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> rustls::ClientConfig {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    #[cfg(feature = "aws-lc")]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    #[cfg(not(feature = "aws-lc"))]
+    let provider = rustls::crypto::ring::default_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_slice_iter(&data("ca.pem")) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            chain,
+            PrivateKeyDer::from_pem_slice(&data("client.key")).unwrap(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn test_t22_huge_client_chains_refused() {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .client_auth(tls_net::ClientAuth::required(
+            TrustAnchors::from_pem(&data("ca.pem")).unwrap(),
+        ))
+        .build()
+        .unwrap();
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&data("client.pem"))
+        .map(Result::unwrap)
+        .collect();
+    let (done, err) = against_rustls_client(&server, rustls_client_with_chain(chain.clone()));
+    assert!(done, "control: {err:?}");
+    // 50 certificates: the client's own chain padded with its intermediate.
+    let mut fifty = chain.clone();
+    while fifty.len() < 50 {
+        fifty.push(chain[1].clone());
+    }
+    let (done, err) = against_rustls_client(&server, rustls_client_with_chain(fifty));
+    assert!(!done);
+    assert!(
+        matches!(
+            err,
+            Some(TlsError::PeerChainTooLarge | TlsError::HandshakeTooLarge)
+        ),
+        "{err:?}"
+    );
+    // A 1 MiB "certificate" after the real ones: refused by tls-net's
+    // budgets or, first, by rustls's 64 KiB limit on one handshake message
+    // (reported as PeerMisbehaved).
+    let mut big = chain;
+    big.push(CertificateDer::from(vec![0x30; 1 << 20]));
+    let (done, err) = against_rustls_client(&server, rustls_client_with_chain(big));
+    assert!(!done);
+    assert!(
+        matches!(
+            err,
+            Some(
+                TlsError::HandshakeTooLarge
+                    | TlsError::PeerChainTooLarge
+                    | TlsError::PeerMisbehaved
+            )
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn test_t25_unknown_name_refusal_time_does_not_depend_on_the_name() {
+    // Opt-in (release build, TLS_NET_TIMING=1, as T-21): refusing names that
+    // share a suffix with a hosted wildcard takes as long as refusing names
+    // that share nothing, so timing does not reveal what is hosted.
+    if std::env::var_os("TLS_NET_TIMING").is_none() {
+        return;
+    }
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .unknown_name(UnknownName::Refuse)
+        .build()
+        .unwrap();
+    let hello = |name: &str| RawHello::tls12(&ECDHE_SUITES).sni(name.as_bytes()).record();
+    let near: Vec<Vec<u8>> = (0..64)
+        .map(|i| hello(&format!("a{i}.b.example.test")))
+        .collect();
+    let far: Vec<Vec<u8>> = (0..64)
+        .map(|i| hello(&format!("a{i}.b.unrelated.test")))
+        .collect();
+    let time = |h: &[u8]| {
+        let t = std::time::Instant::now();
+        std::hint::black_box(refuse(&server, h));
+        t.elapsed()
+    };
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for round in 0..2001 {
+        let i = round % 64;
+        a.push(time(&near[i]));
+        b.push(time(&far[i]));
+    }
+    a.sort_unstable();
+    b.sort_unstable();
+    let ratio = a[a.len() / 2].as_secs_f64() / b[b.len() / 2].as_secs_f64();
+    assert!((0.8..1.25).contains(&ratio), "median ratio {ratio}");
+}

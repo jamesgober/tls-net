@@ -772,6 +772,44 @@ mod tests {
     }
 
     #[test]
+    fn test_random_tickets_all_fail_t12() {
+        // Arbitrary bytes of every length up to well past a real ticket,
+        // from a fixed-seed generator (reproducible): none opens.
+        let t = Arc::new(Time::new(1_000 * HOUR));
+        let r = ring(hours(1), &t);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..4_000 {
+            let len = usize::try_from(next() % 400).unwrap_or(0);
+            let bytes: Vec<u8> = (0..len).map(|_| next().to_le_bytes()[0]).collect();
+            assert!(r.decrypt(&bytes).is_none(), "random ticket {i} opened");
+        }
+        assert_eq!(r.rejected.load(Ordering::Relaxed), 4_000);
+    }
+
+    #[test]
+    fn test_export_older_than_one_epoch_refused_t24() {
+        let t = Arc::new(Time::new(1_000 * HOUR));
+        let old = Arc::new(ring(hours(1), &t));
+        let sealed = TicketKeyRingHandle::new(Arc::clone(&old))
+            .export_sealed(&[1; 32])
+            .unwrap();
+        // The importing process, one epoch later: taken.
+        t.store(1_001 * HOUR, Ordering::Relaxed);
+        let next = TicketKeyRingHandle::new(Arc::new(ring(hours(1), &t)));
+        assert!(next.import_sealed(&[1; 32], sealed.as_bytes()).is_ok());
+        // Two epochs later: refused.
+        t.store(1_002 * HOUR, Ordering::Relaxed);
+        let late = TicketKeyRingHandle::new(Arc::new(ring(hours(1), &t)));
+        assert!(late.import_sealed(&[1; 32], sealed.as_bytes()).is_err());
+    }
+
+    #[test]
     fn test_period_out_of_range_refused() {
         for secs in [59, 86_401] {
             let mode = TicketMode::Ephemeral {
