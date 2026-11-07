@@ -204,34 +204,13 @@ fn test_t13_stalled_handshake_releases_its_slot_at_the_deadline() {
         "the deadline released the slot"
     );
     assert!(start.elapsed() < Duration::from_secs(6));
-    // net-io 0.6 sometimes closes the first connection after a handshake
-    // timeout at once, as a second `HandshakeTimeout`, before tls-net sees a
-    // byte (reported to net-io, D-116). tls-net's part is the slot: it is
-    // free, nothing is refused, and a client completes within three tries.
-    let mut done = None;
-    for attempt in 1..=3 {
-        let sock = std::net::TcpStream::connect(addr).unwrap();
-        let mut c = TcpClient::new(sock, tls_client().connect("localhost").unwrap());
-        match c.handshake() {
-            Ok(()) => {
-                done = Some((attempt, c));
-                break;
-            }
-            Err(e) => {
-                let st = server.handle().stats();
-                let closed: Vec<_> = st.closes().collect();
-                assert_eq!(st.refusals().count(), 0, "attempt {attempt}: {e:?}");
-                assert!(
-                    closed
-                        .iter()
-                        .any(|(r, _)| matches!(r, net_io::CloseReason::HandshakeTimeout)),
-                    "attempt {attempt}: {e:?}, closed {closed:?}"
-                );
-                eprintln!("T-13 attempt {attempt}: {e:?}, closed {closed:?}");
-            }
-        }
-    }
-    let (_, c) = done.expect("a client completes after the slot is released");
+    // The client session is built before the socket connects: net-io's
+    // deadline counts from the accept, so building it after spent the
+    // handshake's time on a loaded machine (D-116).
+    let session = tls_client().connect("localhost").unwrap();
+    let sock = std::net::TcpStream::connect(addr).unwrap();
+    let mut c = TcpClient::new(sock, session);
+    c.handshake().unwrap();
     drop((c, stalled));
     let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
 }
