@@ -90,7 +90,14 @@ Costs are per handshake or per record unless stated; measured values are from `d
 
 **Fuzz campaign.** Six targets, seeded with 18 real ClientHellos (Chromium, Windows Schannel, OpenSSL, curl, wget, Python, rustls) and 7 real server flights (`fuzz/seeds/`, D-108), each run for 24 hours at low priority on WSL2 with AddressSanitizer and debug assertions (`fuzz/run-24h.sh`).
 
-<!-- campaign table: filled when the runs end -->
+| Target | Input | Hours | Executions | Coverage (edges) | Corpus | Findings |
+|---|---|---|---|---|---|---|
+| `hello_parse` | the ClientHello parser | 24.1 | 231,376,252 | 1,287 | 521 | none |
+| `session_step_server` | ciphertext into a server session, in chunks | 24.0 | 64,755,461 | 7,322 | 3,338 | D-111 |
+| `pem_intake` | PEM and DER key and certificate intake | 24.1 | 95,356,950 | 1,094 | 3,787 | none |
+<!-- second-run rows: der_fields, ticket_open, session_step_client -->
+
+The first runs started on 2026-11-06. The session targets found D-111 within hours; from `2b7c1c8`, which has the fix, `hello_parse`, both session targets, and `pem_intake` started again from their corpora and ran the 24 hours above. libFuzzer measures each input on the wall clock, which WSL steps, so the first campaign also wrote 61 timeout artifacts: every one replays cleanly in at most 17 ms of CPU. The same steps stopped `der_fields` after 5.4 hours and `ticket_open` after 3.3, and left one `session_step_client` job blocked inside libFuzzer's own alarm handler after 11.75 hours. Those three ran their 24 hours again from their corpora with libFuzzer's timeout off and a progress watchdog that turns a real hang into a crash artifact (D-115).
 
 **Soak.** `perf/soak.sh` (NFR-21): tls-net on net-io's reactor, 8 workers, 32 client threads making mixed full and resumed handshakes, a certificate reload every 60 seconds, a 10-minute ticket epoch.
 

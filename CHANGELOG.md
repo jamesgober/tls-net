@@ -11,6 +11,10 @@
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2026-11-08
+
 Hardening. No API change.
 
 ### Fixed
@@ -35,6 +39,8 @@ Hardening. No API change.
   handshakes leave the live heap where it started.
 - A conformance workflow running testssl.sh and tlsfuzzer weekly; Miri in
   CI.
+- `fuzz/watchdog.sh`: long fuzz runs detect hangs by progress, not by
+  libFuzzer's wall-clock timeout (D-115).
 - `docs/SECURITY.md`: threat model, defences, tests, costs, and the
   hardening record.
 
@@ -244,7 +250,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/tls-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/tls-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/tls-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/tls-net/compare/v0.3.0...v0.4.0

@@ -64,7 +64,7 @@ Exit: every bench of PLAN section 9 with committed baselines; the end-to-end com
 
 ## v0.7.0 - Hardening
 Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hours without an open finding; attack tests T-1 to T-28 green; tlsfuzzer server scripts and testssl.sh clean for the supported features (weekly CI job); soak of NFR-21 without memory growth; Miri and loom green; `docs/SECURITY.md` written.
-- [ ] No new API.
+- [x] No new API.
 - [x] Fuzz seeds from real clients and servers (D-108); 24-hour runs of all six targets. Findings fixed: D-111.
 - [x] Threat audit: every attack test checked against its planned test; gaps closed; T-1 to T-28 each have a test (docs/SECURITY.md).
 - [x] testssl.sh and tlsfuzzer in a weekly conformance workflow (D-109). Finding fixed: D-110.
