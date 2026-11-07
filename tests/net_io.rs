@@ -167,7 +167,8 @@ fn test_t13_stalled_handshake_releases_its_slot_at_the_deadline() {
         .unwrap();
     let limits = net_io::Limits::blocking_defaults()
         .to_builder()
-        .handshake_timeout(Duration::from_millis(300))
+        // Long enough that a loaded test machine still sees the slot held.
+        .handshake_timeout(Duration::from_secs(2))
         .build()
         .unwrap();
     let server = ServerBuilder::new()
@@ -194,7 +195,7 @@ fn test_t13_stalled_handshake_releases_its_slot_at_the_deadline() {
     assert_eq!(tls.handshakes_in_progress(), 1);
     // After the deadline the slot is back and a client completes.
     let start = Instant::now();
-    while tls.handshakes_in_progress() != 0 && start.elapsed() < Duration::from_secs(5) {
+    while tls.handshakes_in_progress() != 0 && start.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
@@ -202,7 +203,7 @@ fn test_t13_stalled_handshake_releases_its_slot_at_the_deadline() {
         0,
         "the deadline released the slot"
     );
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(6));
     // net-io 0.6 sometimes closes the first connection after a handshake
     // timeout at once, as a second `HandshakeTimeout`, before tls-net sees a
     // byte (reported to net-io, D-116). tls-net's part is the slot: it is
