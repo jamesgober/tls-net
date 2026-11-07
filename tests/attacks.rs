@@ -4,8 +4,14 @@
 
 mod common;
 
-use common::{RawHello, data, refuse};
-use tls_net::{ClientBuilder, KeySource, Policy, TlsError, TlsServer, TrustAnchors, UnknownName};
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::{End, RawHello, data, pump, refuse};
+use tls_net::{
+    CertificateProblem, ClientBuilder, Crls, Event, HandshakeKind, KeySource, Policy,
+    RevocationPolicy, TicketMode, TlsClient, TlsError, TlsServer, TrustAnchors, UnknownName,
+};
 
 fn server() -> TlsServer {
     TlsServer::builder()
@@ -204,4 +210,605 @@ fn test_t25_every_unknown_name_gets_identical_alert() {
     // No SNI at all gets the same bytes.
     let (sent, _) = refuse(&server, &RawHello::tls12(&ECDHE_SUITES).record());
     assert_eq!(Some(sent), first);
+}
+
+fn test_ca_client() -> ClientBuilder {
+    ClientBuilder::new().trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
+}
+
+/// The handshake between a tls-net client and a plain rustls server that
+/// serves `chain` (which tls-net's own server would refuse to load);
+/// `None` when it completes, else the client's error.
+fn against_rustls_server(chain: &str, key: &str, client: &TlsClient) -> Option<TlsError> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    #[cfg(feature = "aws-lc")]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    #[cfg(not(feature = "aws-lc"))]
+    let provider = rustls::crypto::ring::default_provider();
+    let certs = CertificateDer::pem_slice_iter(&data(chain))
+        .map(Result::unwrap)
+        .collect();
+    let key = PrivateKeyDer::from_pem_slice(&data(key)).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+    let mut session = client.connect("localhost").unwrap();
+    let (mut to_server, mut to_client) = (Vec::new(), Vec::new());
+    let mut out = vec![0u8; 64 * 1024];
+    for _ in 0..16 {
+        loop {
+            let (consumed, written, complete, idle) = match session.step(&mut to_client, &mut out) {
+                Ok(p) => (
+                    p.consumed,
+                    p.written,
+                    matches!(p.event, Event::HandshakeComplete),
+                    matches!(p.event, Event::NeedInput),
+                ),
+                Err(e) => return Some(e),
+            };
+            to_server.extend_from_slice(&out[..written]);
+            to_client.drain(..consumed);
+            if complete {
+                return None;
+            }
+            if idle && consumed == 0 && written == 0 {
+                break;
+            }
+        }
+        let mut rd = &to_server[..];
+        while !rd.is_empty() {
+            server.read_tls(&mut rd).unwrap();
+        }
+        to_server.clear();
+        let _ = server.process_new_packets();
+        while server.wants_write() {
+            server.write_tls(&mut to_client).unwrap();
+        }
+    }
+    panic!("the handshake neither completed nor failed")
+}
+
+#[test]
+fn test_t6_expired_and_self_signed_server_certificates_refused() {
+    let client = test_ca_client().build().unwrap();
+    assert_eq!(
+        against_rustls_server("site.pem", "site.key", &client),
+        None,
+        "control"
+    );
+    assert_eq!(
+        against_rustls_server("expired.pem", "expired.key", &client),
+        Some(TlsError::PeerCertificateInvalid(
+            CertificateProblem::Expired
+        ))
+    );
+    assert_eq!(
+        against_rustls_server("selfsigned.pem", "selfsigned.key", &client),
+        Some(TlsError::PeerCertificateInvalid(
+            CertificateProblem::UnknownIssuer
+        ))
+    );
+}
+
+#[test]
+fn test_t6_revoked_server_certificate_refused_by_crl() {
+    let server = server();
+    let with = |crl: &str| {
+        let client = test_ca_client()
+            .crls(
+                Crls::from_pem(&data(crl)).unwrap(),
+                RevocationPolicy::END_ENTITY_ONLY,
+            )
+            .build()
+            .unwrap();
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (
+            server.accept().unwrap(),
+            client.connect("localhost").unwrap(),
+        );
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        (c.complete, c.error)
+    };
+    assert_eq!(with("inter-empty.crl.pem"), (true, None), "control");
+    assert_eq!(
+        with("inter-revokes-site.crl.pem"),
+        (false, Some(TlsError::PeerCertificateRevoked))
+    );
+}
+
+#[test]
+fn test_t11_clients_never_resume_with_each_others_tickets() {
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .tickets(
+            TicketMode::Ephemeral {
+                period: Duration::from_secs(3600),
+            },
+            2,
+        )
+        .build()
+        .unwrap();
+    let kind = |client: &TlsClient| {
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (
+            server.accept().unwrap(),
+            client.connect("localhost").unwrap(),
+        );
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        assert!(c.complete, "{:?}", c.error);
+        ss.info().unwrap().kind
+    };
+    let (a, b) = (
+        test_ca_client().resumption(64).build().unwrap(),
+        test_ca_client().resumption(64).build().unwrap(),
+    );
+    assert_eq!(kind(&a), HandshakeKind::Full);
+    assert_eq!(
+        kind(&a),
+        HandshakeKind::Resumed,
+        "a resumes with its own ticket"
+    );
+    assert_eq!(kind(&b), HandshakeKind::Full, "b holds none of a's tickets");
+    assert_eq!(kind(&b), HandshakeKind::Resumed);
+}
+
+#[test]
+fn test_t18_reload_with_expired_certificate_refused_old_one_kept() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+    // Checkouts leave key files group-readable; allow that so the refusal
+    // below is the expiry check's, not the permission check's.
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .allow_group_readable_key(true)
+        .build()
+        .unwrap();
+    let before = server.stats().snapshot_version;
+    let refused =
+        server.reload_from_files(format!("{dir}expired.pem"), format!("{dir}expired.key"));
+    let cause = match &refused {
+        Err(TlsError::ReloadRefused { source }) => source.as_ref(),
+        Err(e) => e,
+        Ok(()) => panic!("an expired certificate was published"),
+    };
+    assert!(
+        matches!(cause, TlsError::CertificateExpired { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(server.stats().snapshot_version, before);
+    let client = test_ca_client().build().unwrap();
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    let (mut ss, mut cs) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    pump(&mut ss, &mut s, &mut cs, &mut c);
+    assert!(
+        c.complete,
+        "the old certificate is still served: {:?}",
+        c.error
+    );
+}
+
+/// Steps `session` over `input` until it fails or waits; returns the bytes it
+/// wrote and whether it failed.
+/// One `step`: consumed, written, and whether the session waits for input.
+type Step<'a> = dyn FnMut(&mut Vec<u8>, &mut [u8]) -> Result<(usize, usize, bool), TlsError> + 'a;
+
+fn drive_junk(step: &mut Step<'_>, input: &[u8]) -> (Vec<u8>, bool) {
+    let (mut input, mut out, mut sent) = (input.to_vec(), vec![0u8; 64 * 1024], Vec::new());
+    for _ in 0..64 {
+        match step(&mut input, &mut out) {
+            Ok((consumed, written, waiting)) => {
+                sent.extend_from_slice(&out[..written]);
+                input.drain(..consumed);
+                if waiting && consumed == 0 && written == 0 {
+                    return (sent, false);
+                }
+            }
+            Err(_) => return (sent, true),
+        }
+    }
+    panic!("the session neither failed nor waited")
+}
+
+/// Plaintext fatal alerts in `sent` (records of type 21, level 2).
+fn fatal_alerts(sent: &[u8]) -> usize {
+    let (mut i, mut n) = (0, 0);
+    while i + 5 <= sent.len() {
+        let len = usize::from(u16::from_be_bytes([sent[i + 3], sent[i + 4]]));
+        if sent[i] == 21 && sent.get(i + 5) == Some(&2) {
+            n += 1;
+        }
+        i += 5 + len;
+    }
+    n
+}
+
+#[test]
+fn test_t14_junk_from_a_server_fails_the_client_with_one_alert_d111() {
+    // Found by the session_step_client fuzz target: one byte 0xd3 as the
+    // server's first flight made rustls queue a second fatal alert.
+    let client = test_ca_client().build().unwrap();
+    for junk in [
+        &[0xd3][..],
+        &[0x00],
+        &[0x17, 0x03, 0x03, 0x00, 0x01, 0x00],
+        &[0x16, 0x02, 0x00, 0x00, 0x01, 0x00],
+    ] {
+        let mut session = client.connect("localhost").unwrap();
+        let mut out = vec![0u8; 64 * 1024];
+        assert!(
+            session.step(&mut [], &mut out).unwrap().written > 0,
+            "the hello"
+        );
+        let mut step = |i: &mut Vec<u8>, o: &mut [u8]| {
+            session
+                .step(i, o)
+                .map(|p| (p.consumed, p.written, matches!(p.event, Event::NeedInput)))
+        };
+        let (sent, failed) = drive_junk(&mut step, junk);
+        assert!(failed, "{junk:?}");
+        assert!(fatal_alerts(&sent) <= 1, "{junk:?}: {sent:?}");
+    }
+}
+
+#[test]
+fn test_t14_junk_after_a_server_hello_fails_with_one_alert_d111() {
+    // The server side: a valid hello, then junk where the client's next
+    // flight belongs.
+    let server = server();
+    let client = test_ca_client().build().unwrap();
+    let mut out = vec![0u8; 64 * 1024];
+    let mut c = client.connect("localhost").unwrap();
+    let n = c.step(&mut [], &mut out).unwrap().written;
+    let hello = out[..n].to_vec();
+    for junk in [
+        &[0xd3][..],
+        &[0x17, 0x03, 0x03, 0x00, 0x01, 0x00],
+        &[0x15, 0x03, 0x03, 0x00, 0x01, 0x07],
+    ] {
+        let mut session = server.accept().unwrap();
+        let mut input = hello.clone();
+        input.extend_from_slice(junk);
+        let mut step = |i: &mut Vec<u8>, o: &mut [u8]| {
+            session
+                .step(i, o)
+                .map(|p| (p.consumed, p.written, matches!(p.event, Event::NeedInput)))
+        };
+        let (sent, failed) = drive_junk(&mut step, &input);
+        assert!(failed, "{junk:?}");
+        assert!(fatal_alerts(&sent) <= 1, "{junk:?}");
+    }
+}
+
+/// `record` (one record holding a ClientHello) with each extension passed
+/// through `edit`: `None` drops it, `Some(body)` keeps or replaces it. Every
+/// length is recomputed, as an attacker in the path would.
+/// An extension edit: type and body in, the new body or `None` to drop it.
+type Edit = dyn Fn(u16, &[u8]) -> Option<Vec<u8>>;
+
+fn rewrite_hello(record: &[u8], edit: &Edit) -> Vec<u8> {
+    let hs = &record[5 + 4..];
+    let at = |i: usize| usize::from(u16::from_be_bytes([hs[i], hs[i + 1]]));
+    let mut i = 2 + 32;
+    i += 1 + usize::from(hs[i]);
+    i += 2 + at(i);
+    i += 1 + usize::from(hs[i]);
+    let head = &hs[..i];
+    let end = i + 2 + at(i);
+    i += 2;
+    let mut exts = Vec::new();
+    while i < end {
+        let typ = u16::from_be_bytes([hs[i], hs[i + 1]]);
+        let len = at(i + 2);
+        if let Some(body) = edit(typ, &hs[i + 4..i + 4 + len]) {
+            exts.extend_from_slice(&typ.to_be_bytes());
+            exts.extend_from_slice(&u16::try_from(body.len()).unwrap().to_be_bytes());
+            exts.extend_from_slice(&body);
+        }
+        i += 4 + len;
+    }
+    let mut hello = head.to_vec();
+    hello.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
+    hello.extend_from_slice(&exts);
+    let mut msg = vec![1];
+    msg.extend_from_slice(&u32::try_from(hello.len()).unwrap().to_be_bytes()[1..]);
+    msg.extend_from_slice(&hello);
+    let mut rec = record[..3].to_vec();
+    rec.extend_from_slice(&u16::try_from(msg.len()).unwrap().to_be_bytes());
+    rec.extend_from_slice(&msg);
+    rec
+}
+
+/// A tls-net handshake whose first ClientHello is rewritten in transit.
+fn with_rewritten_hello(server: &TlsServer, client: &TlsClient, edit: &Edit) -> (End, End) {
+    let (mut ss, mut cs) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    let mut out = vec![0u8; 64 * 1024];
+    let n = cs.step(&mut [], &mut out).unwrap().written;
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    s.inbox = rewrite_hello(&out[..n], edit);
+    pump(&mut ss, &mut s, &mut cs, &mut c);
+    (s, c)
+}
+
+#[test]
+fn test_rewrite_hello_unchanged_completes() {
+    // The helper itself: a pass-through rewrite still completes.
+    let (s, c) = with_rewritten_hello(&server(), &test_ca_client().build().unwrap(), &|_, b| {
+        Some(b.to_vec())
+    });
+    assert!(s.complete && c.complete, "{:?} {:?}", s.error, c.error);
+}
+
+#[test]
+fn test_t1_downgrade_to_tls12_refused_by_the_client() {
+    // supported_versions stripped in transit: the server, able to do TLS
+    // 1.3, answers TLS 1.2 with RFC 8446's downgrade sentinel in its
+    // random, and the client, which offered 1.3, refuses.
+    let (_, c) = with_rewritten_hello(&server(), &test_ca_client().build().unwrap(), &|t, b| {
+        (t != 43).then(|| b.to_vec())
+    });
+    assert!(!c.complete);
+    assert_eq!(c.error, Some(TlsError::PeerMisbehaved), "{:?}", c.error);
+}
+
+#[test]
+fn test_t4_groups_rewritten_in_transit_fail_the_handshake() {
+    // The supported_groups list reordered in transit (the attacker's way to
+    // steer the group choice): the transcripts differ and neither side
+    // completes.
+    let (s, c) = with_rewritten_hello(&server(), &test_ca_client().build().unwrap(), &|t, b| {
+        if t != 10 {
+            return Some(b.to_vec());
+        }
+        let mut groups: Vec<[u8; 2]> = b[2..].chunks(2).map(|g| [g[0], g[1]]).collect();
+        assert!(groups.len() >= 2);
+        groups.reverse();
+        let mut body = b[..2].to_vec();
+        body.extend(groups.concat());
+        Some(body)
+    });
+    assert!(!c.complete && !s.complete);
+    assert!(c.error.is_some(), "the client must fail");
+}
+
+#[test]
+fn test_t20_events_never_carry_raw_control_bytes() {
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct Log(Mutex<Vec<String>>);
+    impl tls_net::TlsObserver for Log {
+        fn on_event(&self, event: &tls_net::TlsEvent<'_>) {
+            self.0.lock().unwrap().push(format!("{event:?}"));
+        }
+    }
+    let log = Arc::new(Log::default());
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .observer(Arc::clone(&log) as Arc<dyn tls_net::TlsObserver>)
+        .hello_sampling(1)
+        .build()
+        .unwrap();
+    let hello = RawHello::tls12(&ECDHE_SUITES).sni(b"evil\r\n\x1b[31mred\x00.test");
+    let _ = refuse(&server, &hello.record());
+    let events = log.0.lock().unwrap();
+    assert!(!events.is_empty(), "the hello is sampled");
+    for e in events.iter() {
+        assert!(!e.chars().any(char::is_control), "raw control byte in {e}");
+    }
+}
+
+/// The handshake between a plain rustls client (any configuration, any
+/// client chain) and a tls-net server: whether it completed, and the
+/// server's error.
+fn against_rustls_client(
+    server: &TlsServer,
+    config: rustls::ClientConfig,
+) -> (bool, Option<TlsError>) {
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut client = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut session = server.accept().unwrap();
+    let (mut inbox, mut out) = (Vec::new(), vec![0u8; 64 * 1024]);
+    for _ in 0..64 {
+        while client.wants_write() {
+            client.write_tls(&mut inbox).unwrap();
+        }
+        loop {
+            let (consumed, written, complete, idle) = match session.step(&mut inbox, &mut out) {
+                Ok(p) => (
+                    p.consumed,
+                    p.written,
+                    matches!(p.event, Event::HandshakeComplete),
+                    matches!(p.event, Event::NeedInput),
+                ),
+                Err(e) => return (false, Some(e)),
+            };
+            let mut back = &out[..written];
+            while !back.is_empty() {
+                client.read_tls(&mut back).unwrap();
+            }
+            let _ = client.process_new_packets();
+            inbox.drain(..consumed);
+            if complete {
+                return (true, None);
+            }
+            if idle && consumed == 0 && written == 0 {
+                break;
+            }
+        }
+        if !client.wants_write() && !client.is_handshaking() {
+            return (false, None);
+        }
+    }
+    panic!("the handshake neither completed nor failed")
+}
+
+fn rustls_client_with_chain(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> rustls::ClientConfig {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    #[cfg(feature = "aws-lc")]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    #[cfg(not(feature = "aws-lc"))]
+    let provider = rustls::crypto::ring::default_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_slice_iter(&data("ca.pem")) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            chain,
+            PrivateKeyDer::from_pem_slice(&data("client.key")).unwrap(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn test_t22_huge_client_chains_refused() {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .client_auth(tls_net::ClientAuth::required(
+            TrustAnchors::from_pem(&data("ca.pem")).unwrap(),
+        ))
+        .build()
+        .unwrap();
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&data("client.pem"))
+        .map(Result::unwrap)
+        .collect();
+    let (done, err) = against_rustls_client(&server, rustls_client_with_chain(chain.clone()));
+    assert!(done, "control: {err:?}");
+    // 50 certificates: the client's own chain padded with its intermediate.
+    let mut fifty = chain.clone();
+    while fifty.len() < 50 {
+        fifty.push(chain[1].clone());
+    }
+    let (done, err) = against_rustls_client(&server, rustls_client_with_chain(fifty));
+    assert!(!done);
+    assert!(
+        matches!(
+            err,
+            Some(TlsError::PeerChainTooLarge | TlsError::HandshakeTooLarge)
+        ),
+        "{err:?}"
+    );
+    // A 1 MiB "certificate" after the real ones: refused by tls-net's
+    // budgets or, first, by rustls's 64 KiB limit on one handshake message
+    // (reported as PeerMisbehaved).
+    let mut big = chain;
+    big.push(CertificateDer::from(vec![0x30; 1 << 20]));
+    let (done, err) = against_rustls_client(&server, rustls_client_with_chain(big));
+    assert!(!done);
+    assert!(
+        matches!(
+            err,
+            Some(
+                TlsError::HandshakeTooLarge
+                    | TlsError::PeerChainTooLarge
+                    | TlsError::PeerMisbehaved
+            )
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn test_t25_unknown_name_refusal_time_does_not_depend_on_the_name() {
+    // Opt-in (release build, TLS_NET_TIMING=1, as T-21): refusing names that
+    // share a suffix with a hosted wildcard takes as long as refusing names
+    // that share nothing, so timing does not reveal what is hosted.
+    if std::env::var_os("TLS_NET_TIMING").is_none() {
+        return;
+    }
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .unknown_name(UnknownName::Refuse)
+        .build()
+        .unwrap();
+    let hello = |name: &str| RawHello::tls12(&ECDHE_SUITES).sni(name.as_bytes()).record();
+    let near: Vec<Vec<u8>> = (0..64)
+        .map(|i| hello(&format!("a{i}.b.example.test")))
+        .collect();
+    let far: Vec<Vec<u8>> = (0..64)
+        .map(|i| hello(&format!("a{i}.b.unrelated.test")))
+        .collect();
+    let time = |h: &[u8]| {
+        let t = std::time::Instant::now();
+        std::hint::black_box(refuse(&server, h));
+        t.elapsed()
+    };
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for round in 0..2001 {
+        let i = round % 64;
+        a.push(time(&near[i]));
+        b.push(time(&far[i]));
+    }
+    a.sort_unstable();
+    b.sort_unstable();
+    let ratio = a[a.len() / 2].as_secs_f64() / b[b.len() / 2].as_secs_f64();
+    assert!((0.8..1.25).contains(&ratio), "median ratio {ratio}");
+}
+
+#[test]
+fn test_t14_second_bad_record_after_a_failure_sends_no_second_alert_d111() {
+    // Found by the fuzz targets on the first D-111 fix: a record that fails
+    // in rustls's state machine (a ChangeCipherSpec before the ServerHello),
+    // followed by a malformed one. Server side: a hello, then the same.
+    let client = test_ca_client().build().unwrap();
+    let mut session = client.connect("localhost").unwrap();
+    let mut out = vec![0u8; 64 * 1024];
+    assert!(session.step(&mut [], &mut out).unwrap().written > 0);
+    let mut step = |i: &mut Vec<u8>, o: &mut [u8]| {
+        session
+            .step(i, o)
+            .map(|p| (p.consumed, p.written, matches!(p.event, Event::NeedInput)))
+    };
+    let (sent, failed) = drive_junk(&mut step, &[0x14, 0x03, 0x00, 0x00, 0x01, 0x01, 0xba]);
+    assert!(failed);
+    assert!(fatal_alerts(&sent) <= 1, "{sent:?}");
+
+    let server = server();
+    let crash: [u8; 57] = [
+        0x84, 0x16, 0x03, 0x03, 0x00, 0x32, 0x01, 0x00, 0x00, 0x2e, 0xbf, 0x77, 0x76, 0x16, 0x53,
+        0x12, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x05, 0x61, 0x9d, 0x19, 0x61,
+        0x61, 0x02, 0x2e, 0x00, 0x16, 0x03, 0x03, 0x00, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x34, 0x06, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x01, 0x61,
+    ];
+    // The fuzz target's first byte is its chunk size; replay in its chunks.
+    let chunk = usize::from(crash[0]);
+    let mut s = server.accept().unwrap();
+    let (mut input, mut sent) = (Vec::new(), Vec::new());
+    'feed: for part in crash[1..].chunks(chunk) {
+        input.extend_from_slice(part);
+        for _ in 0..64 {
+            match s.step(&mut input, &mut out) {
+                Ok(p) => {
+                    let (consumed, written) = (p.consumed, p.written);
+                    let need = matches!(p.event, Event::NeedInput);
+                    sent.extend_from_slice(&out[..written]);
+                    input.drain(..consumed);
+                    if need && consumed == 0 && written == 0 {
+                        continue 'feed;
+                    }
+                }
+                Err(_) => break 'feed,
+            }
+        }
+    }
+    assert!(fatal_alerts(&sent) <= 1, "{sent:?}");
 }

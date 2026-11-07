@@ -1,7 +1,7 @@
 //! Loopback comparison of TLS server stacks (docs/PERFORMANCE.md).
 //!
 //! ```text
-//! perf server <tls-net|tokio-rustls|tokio-openssl> <addr> <workers>
+//! perf server <tls-net|tls-net-shared|tokio-rustls|tokio-openssl> <addr> <workers>
 //! perf load <handshakes|bulk> <addr> <threads> <seconds> [x25519]
 //! perf inmem <tls-net|rustls|server|client> <full|resumed> <seconds>
 //! perf inmem hello x <rounds>
@@ -44,7 +44,8 @@ fn main() {
             let workers: usize = args[3].parse().unwrap();
             profile();
             match args[1].as_str() {
-                "tls-net" => tls_net_server(&args[2], workers),
+                "tls-net" => tls_net_server(&args[2], workers, false),
+                "tls-net-shared" => tls_net_server(&args[2], workers, true),
                 "tokio-rustls" => tokio_server(&args[2], workers, Stack::Rustls),
                 "tokio-openssl" => tokio_server(&args[2], workers, Stack::OpenSsl),
                 other => panic!("unknown stack {other}"),
@@ -55,7 +56,7 @@ fn main() {
             inmem::run(&args[1], &args[2], args[3].parse().unwrap());
         }
         Some("once") => match one_request(&args[1], &client_config(false)) {
-            Ok(()) => println!("ok"),
+            Ok(_) => println!("ok"),
             Err(e) => println!("error: {e:?}"),
         },
         Some("idle") => idle(
@@ -265,34 +266,44 @@ mod tls_net_app {
     }
 }
 
-fn tls_net_server(addr: &str, workers: usize) {
+/// `shared` (`tls-net-shared`): one listener shared by the workers and
+/// net-io's default linger, the setup net-io 0.6.2 tunes for (D-174, D-177).
+fn tls_net_server(addr: &str, workers: usize, shared: bool) {
     use net_io::{
         AllowAll, ConnectionInfo, DriverKind, Limits, ListenOptions, ListenerSpec, PrefixPolicy,
         ServerBuilder,
     };
     // All load comes from 127.0.0.1: lift the per-source cap (256 by
     // default) and the connection cap, which the tokio servers do not have.
-    let limits = Limits::reactor_defaults()
+    let mut limits = Limits::reactor_defaults()
         .to_builder()
         .max_connections(9_000)
         .max_per_listener(9_000)
-        .max_per_source(9_000, PrefixPolicy::DEFAULT)
+        .max_per_source(9_000, PrefixPolicy::DEFAULT);
+    if !shared {
         // The tokio servers close without a linger; match them unless asked.
-        .graceful_linger(
-            if std::env::var_os("PERF_LINGER").is_some() { Duration::from_secs(2) } else { Duration::ZERO },
-            if std::env::var_os("PERF_LINGER").is_some() { 64 * 1024 } else { 0 },
-        )
-        .build()
-        .unwrap();
-    let tls = tls_net::TlsServer::builder()
+        let linger = std::env::var_os("PERF_LINGER").is_some();
+        limits = limits.graceful_linger(
+            if linger { Duration::from_secs(2) } else { Duration::ZERO },
+            if linger { 64 * 1024 } else { 0 },
+        );
+    }
+    let limits = limits.build().unwrap();
+    let mut builder = tls_net::TlsServer::builder()
         .certificate(&data("site.pem"), tls_net::KeySource::Pem(&data("site.key")))
         .unwrap()
-        .build()
-        .unwrap();
+        // The fixtures sit on shared mounts with open permissions.
+        .allow_group_readable_key(true);
+    if let Some(m) = env_secs("PERF_TICKET_MINUTES") {
+        let period = Duration::from_secs(m * 60);
+        builder = builder.tickets(tls_net::TicketMode::Ephemeral { period }, 2);
+    }
+    let tls = builder.build().unwrap();
+    soak_threads(&tls);
     let server = ServerBuilder::new()
         // One reuse-port socket per worker (Linux): with one shared listener
         // net-io 0.6.0 hands most short connections to a single worker.
-        .listener(if std::env::var_os("PERF_SINGLE_LISTENER").is_none() {
+        .listener(if !shared && std::env::var_os("PERF_SINGLE_LISTENER").is_none() {
             ListenerSpec::tcp_with(addr, ListenOptions::new().per_worker(true)).tls(true)
         } else {
             ListenerSpec::tcp(addr).tls(true)
@@ -322,6 +333,43 @@ fn tls_net_server(addr: &str, workers: usize) {
         });
     }
     let _ = server.wait_for_stop();
+}
+
+fn env_secs(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+/// Soak options (perf/soak.sh, NFR-21): `PERF_RELOAD_SECS` reloads the
+/// certificate from its files that often; `PERF_RSS_SECS` prints the
+/// process's resident memory and tls-net's counters that often.
+fn soak_threads(tls: &tls_net::TlsServer) {
+    if let Some(secs) = env_secs("PERF_RELOAD_SECS") {
+        let tls = tls.clone();
+        std::thread::spawn(move || {
+            let dir = format!("{}/../tests/data", env!("CARGO_MANIFEST_DIR"));
+            loop {
+                std::thread::sleep(Duration::from_secs(secs));
+                if let Err(e) = tls.reload_from_files(format!("{dir}/site.pem"), format!("{dir}/site.key")) {
+                    eprintln!("reload failed: {e}");
+                }
+            }
+        });
+    }
+    if let Some(secs) = env_secs("PERF_RSS_SECS") {
+        let tls = tls.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(secs));
+            let rss = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS")).map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_owned()))
+                .unwrap_or_default();
+            let st = tls.stats();
+            eprintln!(
+                "rss_kib {rss} full {} resumed {} failed {} tickets {} rejected {} version {}",
+                st.handshakes_full, st.handshakes_resumed, st.handshakes_failed, st.tickets_issued, st.tickets_rejected, st.snapshot_version
+            );
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +507,8 @@ fn client_config(x25519: bool) -> Arc<rustls::ClientConfig> {
     Arc::new(config)
 }
 
-fn one_request(addr: &str, config: &Arc<rustls::ClientConfig>) -> Result<(), std::io::Error> {
+/// One request on a new connection; `Ok(true)` when the handshake resumed.
+fn one_request(addr: &str, config: &Arc<rustls::ClientConfig>) -> Result<bool, std::io::Error> {
     let tcp = TcpStream::connect(addr)?;
     tcp.set_nodelay(true)?;
     let conn = rustls::ClientConnection::new(Arc::clone(config), "localhost".try_into().unwrap())
@@ -481,7 +530,7 @@ fn one_request(addr: &str, config: &Arc<rustls::ClientConfig>) -> Result<(), std
     if got != RESPONSE {
         return Err(std::io::Error::other("short response"));
     }
-    Ok(())
+    Ok(s.conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed))
 }
 
 fn bulk(addr: &str, config: &Arc<rustls::ClientConfig>, stop: &AtomicBool, bytes: &AtomicU64) -> Result<(), std::io::Error> {
@@ -555,11 +604,23 @@ fn load(mode: &str, addr: &str, threads: usize, seconds: u64, x25519: bool) {
     let config = client_config(x25519);
     let stop = Arc::new(AtomicBool::new(false));
     let (done, errors) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let handshakes = mode == "handshakes";
+    // `mixed`: every other thread resumes (its own ticket store), the rest
+    // make full handshakes.
+    let mixed = mode == "mixed";
+    let handshakes = mode == "handshakes" || mixed;
+    let resumed = Arc::new(AtomicU64::new(0));
     let mut joins = Vec::new();
-    for _ in 0..threads {
+    for i in 0..threads {
+        let config = if mixed && i % 2 == 1 {
+            let mut c = (*config).clone();
+            c.resumption = rustls::client::Resumption::in_memory_sessions(64);
+            Arc::new(c)
+        } else {
+            Arc::clone(&config)
+        };
+        let resumed = Arc::clone(&resumed);
         let (config, stop, done, errors, addr) = (
-            Arc::clone(&config),
+            config,
             Arc::clone(&stop),
             Arc::clone(&done),
             Arc::clone(&errors),
@@ -569,7 +630,12 @@ fn load(mode: &str, addr: &str, threads: usize, seconds: u64, x25519: bool) {
             if handshakes {
                 while !stop.load(Relaxed) {
                     match one_request(&addr, &config) {
-                        Ok(()) => done.fetch_add(1, Relaxed),
+                        Ok(r) => {
+                            if r {
+                                resumed.fetch_add(1, Relaxed);
+                            }
+                            done.fetch_add(1, Relaxed)
+                        }
                         Err(e) => {
                             if errors.fetch_add(1, Relaxed) < 3 {
                                 eprintln!("client error: {e:?}");
@@ -593,7 +659,13 @@ fn load(mode: &str, addr: &str, threads: usize, seconds: u64, x25519: bool) {
         let _ = j.join();
     }
     let rate = (at_end - at_start) as f64 / elapsed;
-    if handshakes {
+    if mixed {
+        println!(
+            "handshakes/s {rate:.0} total {at_end} resumed {} errors {}",
+            resumed.load(Relaxed),
+            errors.load(Relaxed)
+        );
+    } else if handshakes {
         println!("handshakes/s {rate:.0} errors {}", errors.load(Relaxed));
     } else {
         println!("MB/s {:.0} errors {}", rate / 1e6, errors.load(Relaxed));

@@ -147,3 +147,28 @@ fn test_accept_and_hello_parse_do_not_allocate_in_tls_net() {
     assert!(name.is_some());
     assert_eq!(n, 0, "SNI normalisation allocates nothing");
 }
+
+#[test]
+fn test_t27_half_open_session_allocates_nothing() {
+    // A connection that sent one byte of its ClientHello holds its session
+    // and nothing on the heap: 10,000 such connections cost 10,000 times the
+    // session's inline size, flat (T-27).
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .build()
+        .unwrap();
+    drop(server.accept().unwrap());
+    let mut out = vec![0u8; 64 * 1024];
+    let ((), n) = counting(|| {
+        for _ in 0..1_000 {
+            let mut s = server.accept().unwrap();
+            let mut first = [22u8];
+            let p = s.step(&mut first, &mut out).unwrap();
+            assert!(matches!(p.event, tls_net::Event::NeedInput));
+            drop(s);
+        }
+    });
+    assert_eq!(n, 0, "accept plus a one-byte step allocated");
+    assert!(std::mem::size_of::<tls_net::ServerSession>() < 2048);
+}

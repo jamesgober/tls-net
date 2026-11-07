@@ -106,6 +106,10 @@ jobs:
         run: cargo test --release --lib test_t21
         env:
           TLS_NET_TIMING: "1"
+      - name: Unknown-name refusal timing (T-25)
+        run: cargo test --release --test attacks test_t25
+        env:
+          TLS_NET_TIMING: "1"
 
   fips:
     # FIPS 140-3 build over aws-lc-rs: needs CMake and Go (on the runner).
@@ -136,6 +140,24 @@ jobs:
         run: cargo test --release --lib loom
         env:
           RUSTFLAGS: "--cfg tls_net_loom"
+
+  miri:
+    # Undefined-behaviour checks of the library code that runs without a
+    # crypto provider (parsers, SNI, tickets, snapshot), D-112. The providers
+    # are C and assembly, which Miri cannot run.
+    name: Miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri
+        run: cargo miri test --lib --no-default-features
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
 
   fuzz-build:
     name: Fuzz targets build
