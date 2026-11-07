@@ -7,18 +7,21 @@
 #   bash fuzz/run-24h.sh [hours]
 #
 # A crash stops its target and leaves the input in fuzz/artifacts/<target>/.
-# Timeouts are saved there too but do not stop the run (fork mode with
-# -ignore_timeouts): on WSL a clock step reports false ones ("timeout after
-# 18446744073709551615 seconds"). Replay each with
-# `cargo fuzz run <target> <file>` when the runs end.
+# libFuzzer's timeout is off (-timeout=0, D-115): it reads the wall clock,
+# which WSL steps, and it reported false timeouts ("timeout after
+# 18446744073709551615 seconds") and once hung in its own alarm handler.
+# fuzz/watchdog.sh watches progress instead and turns a hang into a crash
+# artifact. TARGETS picks targets (default all). Fork-mode temporary files
+# go to CORPUS/tmp, not the shared /tmp.
 set -eu
 cd "$(dirname "$0")"
 HOURS=${1:-24}
 CORPUS=${CORPUS:-$HOME/fuzz-corpus/tls-net}
 TD=${FUZZ_TARGET_DIR:-$HOME/tgt/tls-net-fuzz}
 : "${CORPUS:?}" "${TD:?}"
-TARGETS="hello_parse session_step_server session_step_client der_fields pem_intake ticket_open"
-mkdir -p "$CORPUS"
+TARGETS=${TARGETS:-hello_parse session_step_server session_step_client der_fields pem_intake ticket_open}
+mkdir -p "$CORPUS" "$CORPUS/tmp"
+export TMPDIR="$CORPUS/tmp"
 for t in $TARGETS; do mkdir -p "$CORPUS/$t"; done
 # Real ClientHellos, raw for the parser and behind a chunk-size byte (whole,
 # 5-byte, and 64-byte chunks) for the server session.
@@ -43,7 +46,10 @@ cargo +nightly fuzz build --target x86_64-unknown-linux-gnu --target-dir "$TD"
 SECS=$((HOURS * 3600))
 for t in $TARGETS; do
   setsid nohup nice -n 10 cargo +nightly fuzz run --target x86_64-unknown-linux-gnu --target-dir "$TD" "$t" "$CORPUS/$t" -- \
-    -max_total_time="$SECS" -timeout=20 -rss_limit_mb=2048 -print_final_stats=1 -fork=1 -ignore_timeouts=1 \
+    -max_total_time="$SECS" -timeout=0 -rss_limit_mb=2048 -print_final_stats=1 -fork=1 \
     >"$CORPUS/$t.log" 2>&1 </dev/null &
   echo "$t: pid $!"
 done
+# shellcheck disable=SC2086
+setsid nohup nice -n 10 bash watchdog.sh "$HOURS" $TARGETS >/dev/null 2>&1 </dev/null &
+echo "watchdog: pid $!"
