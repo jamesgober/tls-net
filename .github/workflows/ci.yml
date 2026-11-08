@@ -99,7 +99,7 @@ jobs:
           curl --version | head -n 1
           go version
       - name: Interop and network tests
-        run: cargo test --test interop --test network --test go
+        run: cargo test --test interop --test network --test go --test consumers
         env:
           TLS_NET_INTEROP: "1"
           TLS_NET_NETWORK: "1"
@@ -112,6 +112,31 @@ jobs:
         run: cargo test --release --test attacks test_t25
         env:
           TLS_NET_TIMING: "1"
+
+  mta:
+    # The STARTTLS shape against a real MTA (D-119): Postfix on loopback
+    # with the test certificate, smtp-net's dialogue through tls-net.
+    name: STARTTLS against Postfix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Postfix with the test certificate
+        run: |
+          echo "postfix postfix/main_mailer_type select Local only" | sudo debconf-set-selections
+          echo "postfix postfix/mailname string localhost" | sudo debconf-set-selections
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postfix
+          sudo install -m 644 tests/data/site.pem /etc/postfix/tls-net.pem
+          sudo install -m 600 tests/data/site.key /etc/postfix/tls-net.key
+          sudo postconf -e             "smtpd_tls_cert_file=/etc/postfix/tls-net.pem"             "smtpd_tls_key_file=/etc/postfix/tls-net.key"             "smtpd_tls_security_level=may"             "inet_interfaces=loopback-only"
+          sudo systemctl restart postfix
+          postconf -d mail_version
+      - name: STARTTLS tests
+        run: cargo test --test consumers starttls
+        env:
+          TLS_NET_MTA: "127.0.0.1:25"
 
   fips:
     # FIPS 140-3 build over aws-lc-rs: needs CMake and Go (on the runner).
