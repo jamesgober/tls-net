@@ -86,7 +86,7 @@ jobs:
 
   interop:
     # Opt-in tests against other TLS stacks and public sites (decision D-058).
-    name: Interop (OpenSSL, curl, public sites)
+    name: Interop (OpenSSL, curl, Go, public sites)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -97,11 +97,13 @@ jobs:
         run: |
           openssl version
           curl --version | head -n 1
+          go version
       - name: Interop and network tests
-        run: cargo test --test interop --test network
+        run: cargo test --test interop --test network --test go
         env:
           TLS_NET_INTEROP: "1"
           TLS_NET_NETWORK: "1"
+          TLS_NET_GO: "1"
       - name: Pin comparison timing (T-21)
         run: cargo test --release --lib test_t21
         env:
