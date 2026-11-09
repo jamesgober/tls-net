@@ -37,6 +37,12 @@ Alpha. No API change.
   for the peer key hash (D-122). Applications on net-io 0.4 to 0.6 stay on
   tls-net 0.7.
 
+### Documentation
+
+- `docs/PERFORMANCE.md`: on net-io 0.7.1 an idle connection costs half what
+  one on tokio-rustls does, cold or after traffic; the idle-memory target is
+  met (D-123).
+
 ---
 
 ## [0.7.1] - 2026-11-08
