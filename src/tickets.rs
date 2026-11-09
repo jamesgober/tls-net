@@ -650,9 +650,10 @@ impl ProducesTickets for BoundTickets {
     }
 }
 
-/// Unbound sealing, for the unit tests and the fuzz target.
+/// Unbound sealing, for the unit tests and (opening only) the fuzz target.
 #[cfg(any(test, fuzzing))]
 impl TicketKeyRing {
+    #[cfg(test)]
     pub(crate) fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
         self.seal(plain, &[0; 32])
     }
