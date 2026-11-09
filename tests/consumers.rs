@@ -12,7 +12,7 @@
 //!   scripted server here and against a real MTA with
 //!   `TLS_NET_MTA=host:port` (CI runs Postfix).
 
-#![cfg(any(feature = "aws-lc", feature = "ring"))]
+#![cfg(all(feature = "net-io", any(feature = "aws-lc", feature = "ring")))]
 
 mod common;
 
