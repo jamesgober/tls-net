@@ -960,3 +960,37 @@ fn test_t2_t4_internal_listener_refuses_tls12_and_x25519_only_peers() {
         assert_eq!(p.s.error, Some(TlsError::NoCommonGroup));
     }
 }
+
+#[test]
+fn test_settings_that_would_do_less_than_they_say_are_refused() {
+    // D-131: the internal preset is for links that authenticate the client,
+    // and CRLs without anchors would never be checked.
+    let refused = |b: ServerBuilder| matches!(b.build(), Err(TlsError::PolicyInvalid { .. }));
+    assert!(
+        refused(site().policy(Policy::internal())),
+        "internal without client auth"
+    );
+    assert!(refused(
+        site()
+            .policy(Policy::internal())
+            .client_auth(ClientAuth::optional(ca()))
+    ));
+    let crls = || tls_net::Crls::from_pem(&data("inter-empty.crl.pem")).unwrap();
+    let pin = [7u8; 32];
+    assert!(refused(site().client_auth(
+        ClientAuth::pinned(None, &[pin]).with_crls(crls(), tls_net::RevocationPolicy::default())
+    )));
+    assert!(refused(site().client_auth(
+        ClientAuth::none().with_crls(crls(), tls_net::RevocationPolicy::default())
+    )));
+    // With anchors the CRLs apply, and the build goes through.
+    assert!(
+        site()
+            .client_auth(
+                ClientAuth::pinned(Some(ca()), &[pin])
+                    .with_crls(crls(), tls_net::RevocationPolicy::default())
+            )
+            .build()
+            .is_ok()
+    );
+}

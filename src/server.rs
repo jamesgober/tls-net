@@ -187,7 +187,8 @@ impl HostPolicy {
 #[derive(Debug)]
 pub(crate) struct Capacity {
     in_progress: AtomicU32,
-    max: u32,
+    /// Set at build and by every publish (0 drains).
+    max: AtomicU32,
 }
 
 /// One handshake slot. It holds no reference: the session that owns it
@@ -198,7 +199,7 @@ pub(crate) struct CapacitySlot(());
 impl Capacity {
     fn acquire(&self) -> Option<CapacitySlot> {
         let prev = self.in_progress.fetch_add(1, Ordering::AcqRel);
-        if prev >= self.max {
+        if prev >= self.max.load(Ordering::Acquire) {
             self.in_progress.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -294,6 +295,8 @@ struct Shared {
     tickets: Option<Arc<TicketKeyRing>>,
     cache: Arc<dyn StoresServerSessions>,
     obs: Arc<Observation>,
+    /// Kept across reloads, so the count is the server's, not a snapshot's.
+    sni_mismatches: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct Inner {
@@ -537,11 +540,9 @@ impl TlsServer {
     #[must_use]
     pub fn sni_disagreements(&self) -> u64 {
         self.inner
-            .snapshot
-            .load()
-            .table
-            .group_mismatches
-            .load(Ordering::Relaxed)
+            .shared
+            .sni_mismatches
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -556,7 +557,7 @@ impl Inner {
     fn refuse(&self) -> TlsError {
         self.shared.obs.capacity(
             self.shared.capacity.in_progress.load(Ordering::Relaxed),
-            self.shared.capacity.max,
+            self.shared.capacity.max.load(Ordering::Relaxed),
         );
         TlsError::HandshakeCapacity
     }
@@ -651,6 +652,7 @@ impl ReloadHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let settings = next.settings();
+        let max_in_progress = next.limits.max_in_progress;
         let state = next
             .state(&self.inner.shared)
             .map_err(|e| self.inner.reload_refused(e))?;
@@ -661,6 +663,13 @@ impl ReloadHandle {
             .filter(|e| e.state >= expiry::ExpiryState::Warn)
             .count();
         let version = self.inner.snapshot.publish(state);
+        // The gate is the server's, but its limit follows the configuration:
+        // 0 drains, a higher limit lets a load spike through (D-132).
+        self.inner
+            .shared
+            .capacity
+            .max
+            .store(max_in_progress, Ordering::Release);
         self.inner
             .shared
             .obs
@@ -713,7 +722,6 @@ pub struct ServerBuilder {
     alpn_policy: AlpnPolicy,
     policy: Policy,
     limits: HandshakeLimits,
-    limits_set: bool,
     load_limits: LoadLimits,
     hello_limits: HelloLimits,
     client_auth: ClientAuth,
@@ -785,7 +793,6 @@ impl ServerBuilder {
             alpn_policy: AlpnPolicy::Optional,
             policy: Policy::compatible(),
             limits: HandshakeLimits::server(),
-            limits_set: false,
             load_limits: LoadLimits::new(),
             hello_limits: HelloLimits::new(),
             client_auth: ClientAuth::none(),
@@ -926,7 +933,6 @@ impl ServerBuilder {
     /// The handshake budgets.
     pub fn limits(mut self, limits: HandshakeLimits) -> Self {
         self.limits = limits;
-        self.limits_set = true;
         self
     }
 
@@ -1069,11 +1075,12 @@ impl ServerBuilder {
         let shared = Shared {
             capacity: Arc::new(Capacity {
                 in_progress: AtomicU32::new(0),
-                max: self.limits.max_in_progress,
+                max: AtomicU32::new(self.limits.max_in_progress),
             }),
             tickets,
             cache,
             obs,
+            sni_mismatches: Arc::default(),
         };
         let settings = self.settings();
         let state = self.state(&shared)?;
@@ -1123,6 +1130,7 @@ impl ServerBuilder {
         }
 
         let mut table = SniTable::new();
+        table.group_mismatches = Arc::clone(&shared.sni_mismatches);
         for (p, e) in self.pending.iter().zip(&entries) {
             let index = table.add_key(Arc::clone(&e.certified), e.entry_key());
             for name in &e.names {
@@ -1184,6 +1192,13 @@ impl ServerBuilder {
                     reason: "max_fragment_size below 512 does not fit net-io's write path",
                 });
             }
+            // The internal preset is for service-to-service links, which
+            // always authenticate the client (D-131).
+            if policy.preset() == Preset::Internal && !auth.is_required() {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "Policy::internal() needs ClientAuth::required or pinned",
+                });
+            }
             let provider = policy.provider()?;
             let verifier = auth.verifier(&provider)?;
             let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -1232,7 +1247,11 @@ impl ServerBuilder {
                 });
             }
             let client_auth = auth.is_enabled();
-            let max_handshake_bytes = if client_auth && !self.limits_set {
+            // Left at its default, the budget grows for client certificates;
+            // setting other limits does not count as setting this one (D-132).
+            let default_budget =
+                self.limits.max_handshake_bytes == HandshakeLimits::server().max_handshake_bytes;
+            let max_handshake_bytes = if client_auth && default_budget {
                 96 << 10
             } else {
                 self.limits.max_handshake_bytes
@@ -1410,6 +1429,31 @@ mod tests {
     }
 
     #[test]
+    fn test_client_auth_budget_survives_other_limits() {
+        // Setting only the handshake limit leaves the budget at its default,
+        // so client authentication still gets 96 KiB (D-132).
+        let ca = TrustAnchors::from_pem(&data("ca.pem")).unwrap();
+        let build = |limits: HandshakeLimits| {
+            ServerBuilder::new()
+                .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+                .unwrap()
+                .client_auth(ClientAuth::required(ca.clone()))
+                .limits(limits)
+                .build()
+                .unwrap()
+        };
+        let budget = |s: &TlsServer| s.inner.snapshot.load().groups[0].max_handshake_bytes;
+        let only_gate = build(HandshakeLimits::server().max_in_progress(64).unwrap());
+        assert_eq!(budget(&only_gate), 96 << 10);
+        let explicit = build(
+            HandshakeLimits::server()
+                .max_handshake_bytes(48 << 10)
+                .unwrap(),
+        );
+        assert_eq!(budget(&explicit), 48 << 10);
+    }
+
+    #[test]
     fn test_staple_checks() {
         let now = SystemTime::now();
         let good =
@@ -1439,7 +1483,7 @@ mod loom_tests {
         loom::model(|| {
             let gate = Arc::new(Capacity {
                 in_progress: AtomicU32::new(0),
-                max: 1,
+                max: AtomicU32::new(1),
             });
             let other = {
                 let gate = Arc::clone(&gate);

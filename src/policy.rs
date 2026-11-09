@@ -403,7 +403,8 @@ impl Policy {
     }
 
     /// TLS 1.3 only, X25519MLKEM768 only (post-quantum required). Servers
-    /// built with it refuse unknown names and send no tickets.
+    /// built with it refuse unknown names, send no tickets, and need
+    /// `ClientAuth::required` or `pinned` (D-131).
     #[must_use]
     pub fn internal() -> Policy {
         let mut p = Policy::base(&[Version::Tls13], Preset::Internal);

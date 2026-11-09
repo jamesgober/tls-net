@@ -196,8 +196,9 @@ pub(crate) struct SniTable {
     use_default: bool,
     /// The certified keys, indexed by slot entries.
     keys: Vec<(Arc<CertifiedKey>, EntryKey)>,
-    /// rustls's view of the SNI fell outside the session's group (D-032).
-    pub(crate) group_mismatches: AtomicU64,
+    /// rustls's view of the SNI fell outside the session's group (D-032);
+    /// the server's one counter, shared by every snapshot's table.
+    pub(crate) group_mismatches: Arc<AtomicU64>,
 }
 
 impl SniTable {

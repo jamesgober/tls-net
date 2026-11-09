@@ -72,7 +72,7 @@ Hand-off across a restart with `Ratchet`:
 
 1. The new process starts and receives the listening sockets.
 2. The old process calls `export_sealed(&wrap_key)` and sends the bytes over a local socket. The export is sealed and authenticated; tls-net never writes it to disk.
-3. The new process calls `import_sealed(&wrap_key, bytes)`. An export more than one epoch old, from another mode, under another wrap key, or altered in any byte is refused (T-24).
+3. The new process calls `import_sealed(&wrap_key, bytes)`. An export more than one epoch older or newer than the new process's clock, from another mode or ticket period, under another wrap key, or altered in any byte is refused (T-24). Keep the period the same across a hand-off; an export from tls-net 0.8 or older is refused by 0.9, so that one restart costs each client a full handshake.
 4. The old process drains and exits.
 
 The wrap key must reach both processes outside this path, for example from key-vault or a file readable only by the service account.

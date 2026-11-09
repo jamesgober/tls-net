@@ -322,6 +322,13 @@ impl ClientAuth {
                 reason: "client certificate anchors could not be used",
             })
         };
+        // CRLs are checked by the webpki verifier, which needs anchors: with
+        // none they would be accepted and never applied (D-131).
+        if self.crls.is_some() && matches!(self.mode, Mode::None | Mode::Pinned(None, _)) {
+            return Err(TlsError::PolicyInvalid {
+                reason: "CRLs need client certificate anchors",
+            });
+        }
         match &self.mode {
             Mode::None => Ok(Arc::new(rustls::server::NoClientAuth)),
             Mode::Optional(a) => webpki(a, true),

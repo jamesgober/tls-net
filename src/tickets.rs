@@ -409,11 +409,11 @@ impl TicketKeyRing {
     }
 }
 
-/// Export format version for sealed ticket keys.
-const EXPORT_VERSION: u8 = 1;
+/// Export format version for sealed ticket keys (2 adds the period, D-130).
+const EXPORT_VERSION: u8 = 2;
 const MODE_RATCHET: u8 = 1;
-/// Version, mode, epoch: the associated data of an export.
-const EXPORT_HEADER: usize = 10;
+/// Version, mode, epoch, period in seconds: the associated data of an export.
+const EXPORT_HEADER: usize = 18;
 
 /// Ticket keys sealed for a hand-off to the process that takes over the
 /// listening sockets. Wiped on drop.
@@ -493,7 +493,8 @@ impl TicketKeyRingHandle {
         let mut header = [0u8; EXPORT_HEADER];
         header[0] = EXPORT_VERSION;
         header[1] = MODE_RATCHET;
-        header[2..].copy_from_slice(&st.epoch.to_be_bytes());
+        header[2..10].copy_from_slice(&st.epoch.to_be_bytes());
+        header[10..].copy_from_slice(&self.ring.period.to_be_bytes());
         let mut plain = Zeroizing::new(Vec::with_capacity(65));
         plain.push(u8::from(st.previous.is_some()));
         plain.extend_from_slice(st.current.as_slice());
@@ -514,8 +515,9 @@ impl TicketKeyRingHandle {
     ///
     /// # Errors
     ///
-    /// `PolicyInvalid` for a mode mismatch, an export older than this ring's
-    /// previous epoch, a wrong wrap key, or any tampering (T-24).
+    /// `PolicyInvalid` for a mode or period mismatch, an export older than
+    /// this ring's previous epoch or more than one epoch ahead of it, a wrong
+    /// wrap key, or any tampering (T-24).
     pub fn import_sealed(&self, wrap_key: &[u8; 32], sealed: &[u8]) -> Result<(), TlsError> {
         let refused = TlsError::PolicyInvalid {
             reason: "the sealed ticket keys were refused",
@@ -529,14 +531,21 @@ impl TicketKeyRingHandle {
         {
             return Err(refused);
         }
-        let epoch = u64::from_be_bytes(
-            sealed[2..EXPORT_HEADER]
-                .try_into()
-                .map_err(|_| refused.clone())?,
-        );
+        let field = |r: std::ops::Range<usize>| -> Result<u64, TlsError> {
+            Ok(u64::from_be_bytes(
+                sealed[r].try_into().map_err(|_| refused.clone())?,
+            ))
+        };
+        let (epoch, period) = (field(2..10)?, field(10..EXPORT_HEADER)?);
+        // Another period would give an epoch this ring's clock reaches at
+        // another time; an epoch more than one ahead would stop rotation
+        // until this clock caught up (D-130).
+        if period != self.ring.period {
+            return Err(refused);
+        }
         self.ring.advance();
         let mine = self.ring.epoch();
-        if epoch.saturating_add(1) < mine {
+        if epoch.saturating_add(1) < mine || epoch > mine.saturating_add(1) {
             return Err(refused);
         }
         let plain = Crypt::xchacha20_poly1305()
@@ -842,6 +851,35 @@ mod tests {
         t.store(1_002 * HOUR, Ordering::Relaxed);
         let late = TicketKeyRingHandle::new(Arc::new(ring(hours(1), &t)));
         assert!(late.import_sealed(&[1; 32], sealed.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_export_from_another_period_or_the_future_refused_t24() {
+        // A period change across the hand-off, or an exporter whose clock
+        // runs ahead, would set an epoch this ring's clock reaches only much
+        // later, freezing rotation until then (D-130).
+        let t = Arc::new(Time::new(1_000 * HOUR));
+        let hourly = Arc::new(ring(hours(1), &t));
+        let sealed = TicketKeyRingHandle::new(Arc::clone(&hourly))
+            .export_sealed(&[1; 32])
+            .unwrap();
+        let six = TicketKeyRingHandle::new(Arc::new(ring(hours(6), &t)));
+        assert!(six.import_sealed(&[1; 32], sealed.as_bytes()).is_err());
+        // An exporter two epochs ahead of the importer: refused; one ahead
+        // (clock skew at an epoch boundary): taken.
+        t.store(1_002 * HOUR, Ordering::Relaxed);
+        let ahead = TicketKeyRingHandle::new(Arc::new(ring(hours(1), &t)))
+            .export_sealed(&[1; 32])
+            .unwrap();
+        t.store(1_000 * HOUR, Ordering::Relaxed);
+        let behind = TicketKeyRingHandle::new(Arc::new(ring(hours(1), &t)));
+        assert!(behind.import_sealed(&[1; 32], ahead.as_bytes()).is_err());
+        t.store(1_001 * HOUR, Ordering::Relaxed);
+        let near = TicketKeyRingHandle::new(Arc::new(ring(hours(1), &t)))
+            .export_sealed(&[1; 32])
+            .unwrap();
+        t.store(1_000 * HOUR, Ordering::Relaxed);
+        assert!(behind.import_sealed(&[1; 32], near.as_bytes()).is_ok());
     }
 
     #[test]
