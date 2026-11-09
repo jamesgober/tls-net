@@ -430,7 +430,7 @@ impl TlsServer {
     ///
     /// `ReloadRefused` with the load error as source; the old certificate stays.
     pub fn reload_from_pem(&self, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), TlsError> {
-        self.reload_single(|b| b.certificate(chain_pem, KeySource::Pem(key_pem)))
+        self.reload_single(|b| b.reload_entry(chain_pem, KeySource::Pem(key_pem)))
     }
 
     /// As [`reload_from_pem`](Self::reload_from_pem), reading the files.
@@ -446,7 +446,7 @@ impl TlsServer {
         self.reload_single(|b| {
             let limits = b.load_limits;
             let chain = pem::read_file(chain.as_ref(), limits.max_chain_file_bytes, false, false)?;
-            b.certificate(&chain, KeySource::File(key.as_ref()))
+            b.reload_entry(&chain, KeySource::File(key.as_ref()))
         })
     }
 
@@ -694,6 +694,8 @@ impl ReloadHandle {
 struct Pending {
     entry: CertificateEntry,
     is_default: bool,
+    /// Added with `certificate_for`: `entry.names` were configured, not the SANs.
+    explicit: bool,
 }
 
 /// Builds a [`TlsServer`]. Methods that parse return `Result` at once, so an
@@ -717,6 +719,9 @@ struct Pending {
 #[derive(Clone)]
 pub struct ServerBuilder {
     pending: Vec<Pending>,
+    /// For `reload_from_*`: the names the one certificate was configured
+    /// for with `certificate_for`, so a reload serves the same names (D-136).
+    reload_names: Option<Vec<Box<str>>>,
     unknown: Option<UnknownName>,
     alpn: Vec<Alpn>,
     alpn_policy: AlpnPolicy,
@@ -788,6 +793,7 @@ impl ServerBuilder {
     pub fn new() -> Self {
         ServerBuilder {
             pending: Vec::new(),
+            reload_names: None,
             unknown: None,
             alpn: Vec::new(),
             alpn_policy: AlpnPolicy::Optional,
@@ -834,10 +840,27 @@ impl ServerBuilder {
 
     /// These settings without certificates (the reload template).
     fn settings(&self) -> ServerBuilder {
+        let reload_names = match self.pending.as_slice() {
+            [one] if one.explicit => Some(one.entry.names.clone()),
+            _ => None,
+        };
         ServerBuilder {
             pending: Vec::new(),
+            reload_names,
             ocsp: Vec::new(),
             ..self.clone()
+        }
+    }
+
+    /// The one certificate of a `reload_from_*`, added the way the one it
+    /// replaces was: for the same configured names, or as the default.
+    fn reload_entry(self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError> {
+        match self.reload_names.clone() {
+            Some(names) => {
+                let names: Vec<&str> = names.iter().map(|n| &**n).collect();
+                self.certificate_for(&names, chain_pem, key)
+            }
+            None => self.certificate(chain_pem, key),
         }
     }
 
@@ -860,7 +883,11 @@ impl ServerBuilder {
     pub fn certificate(mut self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError> {
         let entry = certs::load(Chain::Pem(chain_pem), key, None, &self.options())?;
         let is_default = !self.pending.iter().any(|p| p.is_default);
-        self.pending.push(Pending { entry, is_default });
+        self.pending.push(Pending {
+            entry,
+            is_default,
+            explicit: false,
+        });
         Ok(self)
     }
 
@@ -885,6 +912,7 @@ impl ServerBuilder {
         self.pending.push(Pending {
             entry,
             is_default: false,
+            explicit: true,
         });
         Ok(self)
     }
@@ -901,7 +929,11 @@ impl ServerBuilder {
     ) -> Result<Self, TlsError> {
         let entry = certs::load(Chain::Der(chain_der), key, None, &self.options())?;
         let is_default = !self.pending.iter().any(|p| p.is_default);
-        self.pending.push(Pending { entry, is_default });
+        self.pending.push(Pending {
+            entry,
+            is_default,
+            explicit: false,
+        });
         Ok(self)
     }
 
@@ -998,12 +1030,16 @@ impl ServerBuilder {
 
     /// An OCSP staple for the certificate that serves `name`, sent to clients
     /// that ask for one. Checked now: at most 16 KiB, a successful response,
-    /// status good, and `nextUpdate` (if present) in the future.
+    /// status good, and `nextUpdate` (if present) in the future. At `build`
+    /// it goes to the certificate serving `name` whose serial its `certID`
+    /// names (D-137).
     ///
     /// # Errors
     ///
     /// `PemInvalid { what: "OCSP response" }` for a malformed, revoked, or
-    /// stale staple; `InvalidName`.
+    /// stale staple; `InvalidName`. At `build`: `NameNotCovered` when no
+    /// certificate serves `name`, `PolicyInvalid` when none of them is the
+    /// staple's.
     pub fn ocsp_staple(mut self, name: &str, staple_der: &[u8]) -> Result<Self, TlsError> {
         let n = sni::normalize_pattern(name).ok_or_else(|| TlsError::InvalidName {
             name: crate::error::escape(name.as_bytes()),
@@ -1113,19 +1149,39 @@ impl ServerBuilder {
             self.pending.iter().map(|p| p.entry.clone()).collect();
         for (name, staple) in &self.ocsp {
             let mut hit = false;
+            // A staple goes to the certificate its certID names (by serial),
+            // among those serving the name: an ECDSA and an RSA certificate
+            // for one name each need their own (D-137).
+            let serial = crate::der::ocsp_facts(staple).map(|f| f.serial);
+            let mut covered = false;
             for e in &mut entries {
                 if e.names
                     .iter()
                     .any(|n| **n == **name || sni::san_covers(n, name))
                 {
+                    covered = true;
+                    let leaf_serial = e
+                        .certified
+                        .cert
+                        .first()
+                        .and_then(|c| crate::der::parse_certificate(c.as_ref()))
+                        .map(|f| f.serial.to_vec());
+                    if leaf_serial.is_none() || leaf_serial != serial {
+                        continue;
+                    }
                     let mut ck: CertifiedKey = (*e.certified).clone();
                     ck.ocsp = Some(staple.clone());
                     e.certified = Arc::new(ck);
                     hit = true;
                 }
             }
-            if !hit {
+            if !covered {
                 return Err(TlsError::NameNotCovered { name: name.clone() });
+            }
+            if !hit {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "the OCSP staple is for none of the certificates serving its name",
+                });
             }
         }
 

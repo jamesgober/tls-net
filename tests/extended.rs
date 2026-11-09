@@ -1059,3 +1059,59 @@ fn test_pinned_identity_with_platform_anchors() {
     };
     assert!(client.connect_to(&id).is_ok());
 }
+
+#[test]
+fn test_reload_keeps_the_names_a_certificate_was_configured_for() {
+    // A certificate added with certificate_for serves only its names; a
+    // reload_from_pem must not turn it into the default for every name
+    // (D-136).
+    let server = TlsServer::builder()
+        .certificate_for(&["api.other.test"], &data("api.pem"), KeySource::Pem(&data("api.key")))
+        .unwrap()
+        .build()
+        .unwrap();
+    let client = ClientBuilder::new().trust(ca()).build().unwrap();
+    let served = |name: &str| {
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (server.accept().unwrap(), client.connect(name).unwrap());
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        s.error.clone()
+    };
+    assert_eq!(served("api.other.test"), None);
+    assert_eq!(served("unknown.test"), Some(TlsError::UnknownServerName));
+    server
+        .reload_from_pem(&data("api.pem"), &data("api.key"))
+        .unwrap();
+    assert_eq!(served("api.other.test"), None);
+    assert_eq!(
+        served("unknown.test"),
+        Some(TlsError::UnknownServerName),
+        "the reload made the certificate the default"
+    );
+}
+
+#[test]
+fn test_ocsp_staple_goes_to_its_own_certificate() {
+    // site.ocsp is for site.pem. A server whose only certificate for the
+    // name is another one (here RSA) must not send it (D-137).
+    let rsa_only = TlsServer::builder()
+        .certificate(&data("site-rsa.pem"), KeySource::Pem(&data("site-rsa.key")))
+        .unwrap()
+        .ocsp_staple("localhost", &data("site.ocsp"))
+        .unwrap()
+        .build();
+    assert!(
+        matches!(rsa_only, Err(TlsError::PolicyInvalid { .. })),
+        "{rsa_only:?}"
+    );
+    // With both, the staple goes to site.pem and the build goes through.
+    assert!(
+        site()
+            .certificate(&data("site-rsa.pem"), KeySource::Pem(&data("site-rsa.key")))
+            .unwrap()
+            .ocsp_staple("localhost", &data("site.ocsp"))
+            .unwrap()
+            .build()
+            .is_ok()
+    );
+}

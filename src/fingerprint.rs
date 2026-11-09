@@ -18,7 +18,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 /// A JA4 fingerprint: 36 ASCII bytes, `a_b_c`.
 ///
 /// ```
-/// let ja4 = tls_net::Ja4::from_str("t13d1516h2_8daaf6152771_e5627efa2ab1").unwrap();
+/// let ja4 = tls_net::Ja4::parse("t13d1516h2_8daaf6152771_e5627efa2ab1").unwrap();
 /// assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,10 +78,10 @@ impl Ja4 {
         Ja4(out)
     }
 
-    /// Parses a JA4 string (for configured lists of refused fingerprints).
+    /// Parses a JA4 string (for configured lists of refused fingerprints):
+    /// 36 printable ASCII bytes with `_` at 10 and 23; `None` otherwise.
     #[must_use]
-    #[allow(clippy::should_implement_trait, reason = "returns Option, not Result")]
-    pub fn from_str(s: &str) -> Option<Ja4> {
+    pub fn parse(s: &str) -> Option<Ja4> {
         let bytes: [u8; 36] = s.as_bytes().try_into().ok()?;
         (bytes[10] == b'_' && bytes[23] == b'_' && bytes.iter().all(u8::is_ascii_graphic))
             .then_some(Ja4(bytes))

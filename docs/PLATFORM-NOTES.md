@@ -42,6 +42,8 @@ The check reads the metadata of the open file, so a file swapped after the check
 
 `mozilla()` gives the same answer on every machine and changes only with a tls-net release. `platform()` follows the operating system, including roots an administrator added (useful inside a company network) and roots an administrator removed; the result can differ between two machines. On Linux, `platform()` does not check revocation, so `mozilla()` with `ClientBuilder::crls` is the stricter choice there.
 
+A `ServerIdentity::Pinned { require_chain: true }` checks the chain with the verifier the client was built with, so with `platform()` the pin sits on top of the operating system's verdict, revocation included where the OS checks it (D-133).
+
 The platform verifier can block on the operating system (for example a revocation fetch on Windows or macOS) during certificate verification. Drive sessions that use it from a thread that may block, not from a readiness loop that serves other connections. `mozilla()` and private anchors never block.
 
 ---
@@ -49,3 +51,7 @@ The platform verifier can block on the operating system (for example a revocatio
 ## Clocks
 
 Certificate validity, expiry reports, and ticket key rotation read the system clock (`SystemTime`). A ticket ring never moves back: after a clock step backwards it keeps its current key until the clock passes the epoch again. A `Ratchet` ring that would have to step forward more than 1,000 periods (a large clock jump, or a process that slept that long) draws a new random key instead of running the chain (`TicketKeyRotated { reseeded: true }`); outstanding tickets then need a full handshake. Handshake durations in events use the monotonic clock (`Instant`).
+
+A ticket-key hand-off (`import_sealed`) accepts an export from one epoch behind to one epoch ahead of the new process's clock, so two machines whose clocks differ by less than a ticket period hand off cleanly; a larger difference is refused rather than freezing rotation (D-130). A resumed handshake with a client certificate is refused once that certificate's `not_after` has passed on this machine's clock (D-125).
+
+A key path that reports no length (a FIFO, `/dev/fd/N` from process substitution, a procfs file) is read into a buffer sized for `LoadLimits::max_key_file_bytes`, so no partial copy of the key is freed unwiped (D-135).

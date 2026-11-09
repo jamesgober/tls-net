@@ -1,7 +1,7 @@
 # tls-net &mdash; API Reference
 
 > Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.8.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0, 0.7.x, and 0.8.0 added no API). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: `0.9.0`, frozen.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0, 0.7.x, and 0.8.0 added no API; 0.9.0 added `server_name_raw` and renamed `Ja4::from_str` to `Ja4::parse`). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -1330,7 +1330,7 @@ impl<'a> ClientHelloView<'a> {
     pub fn server_name(&self) -> Option<&'a str>;                           // validated LDH ASCII, as sent, one record
     pub fn has_server_name(&self) -> bool;
     pub fn normalized_server_name(&self) -> Option<NormalizedName>;         // FR-17, across records
-    pub fn server_name_raw(&self) -> Option<&'a [u8]>;                      // P2: bytes as sent, for forensics
+    pub fn server_name_raw(&self) -> Option<&'a [u8]>;                      // P2 0.9: bytes as sent, for forensics
     pub fn alpn(&self) -> impl Iterator<Item = &'a [u8]> + 'a;              // names inside one record
     pub fn has_alpn(&self) -> bool;
     pub fn groups(&self) -> impl Iterator<Item = u16> + 'a;
@@ -1359,6 +1359,7 @@ pub fn normalize_server_name(name: &str) -> Option<NormalizedName>;   // the FR-
 pub struct Ja4([u8; 36]);
 impl Ja4 {
     pub fn compute(view: &ClientHelloView<'_>) -> Ja4;
+    pub fn parse(s: &str) -> Option<Ja4>;                // P1 0.9: for configured refusal lists
     pub fn as_str(&self) -> &str;
 }
 impl fmt::Display for Ja4 { /* as_str */ }

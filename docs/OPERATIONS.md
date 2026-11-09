@@ -36,6 +36,9 @@ What a reload guarantees:
 - The new configuration is built and checked completely before anything changes. On any failure the old configuration stays, the call returns `ReloadRefused` (`TLS-0021`) with the cause as its source, and observers get `ReloadRefused`.
 - Handshakes already running finish with the configuration they started with; new handshakes get the new one from the next `accept`.
 - Ticket keys and the session cache carry over, so clients keep resuming across a reload. The ticket mode is fixed for the server's lifetime.
+- Resumption is bound to each host group's client-authentication rules (mode, anchors, pins, CRLs). A publish that changes them ends resumption for that group: each of its clients makes one full handshake, and a session made under the old rules never resumes under the new ones (D-125). Publishing new CRLs therefore takes effect for resumed clients at once, at the cost of one full handshake each.
+- A certificate added with `certificate_for` keeps its names through `reload_from_*`; it does not become the default (D-136).
+- `HandshakeLimits::max_in_progress` follows each publish: publish 0 to drain, a higher value to let a spike through (D-132).
 - `publish` returns the new version, the number of certificates, and how many of them are already in `Warn` or worse; log all three. An expired or not-yet-valid certificate is refused (`TLS-0017`); one that is only close to expiry loads, since refusing it would leave the older one in place, and `expiring` says so.
 
 Cost: building 100 ECDSA certificates takes about 2 ms; the swap about 25 ns (`docs/PERFORMANCE.md`).
@@ -87,7 +90,7 @@ If a ticket key may have leaked, call `ticket_keys().rotate_now()`: the current 
 |---|---|---|---|---|
 | `Policy::compatible()` (server default) | TLS 1.3, TLS 1.2 | ECDHE with AES-GCM or ChaCha20, extended master secret required | X25519MLKEM768, X25519, P-256, P-384 | public listeners |
 | `Policy::modern()` | TLS 1.3 | none | same | public listeners whose clients all speak TLS 1.3 |
-| `Policy::internal()` | TLS 1.3 | none | X25519MLKEM768 only | service-to-service links; client certificates required; no tickets |
+| `Policy::internal()` | TLS 1.3 | none | X25519MLKEM768 only | service-to-service links; `build` requires `ClientAuth::required` or `pinned` (D-131); no tickets |
 | `Policy::fips()` | TLS 1.3, TLS 1.2 | AES-GCM only | P-256, P-384, ML-KEM hybrids from the FIPS module | builds with feature `fips` |
 
 Nothing weaker than these can be configured: rustls has no CBC, static RSA, finite-field DHE, compression, or renegotiation, and tls-net's enums name nothing outside the presets. Start public listeners on `compatible`, then move to `modern` when the counters below say it is safe.

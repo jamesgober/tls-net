@@ -12,6 +12,7 @@
 - [Threat model](#threat-model)
 - [Threats, defences, tests, costs](#threats-defences-tests-costs)
 - [Hardening record (0.7)](#hardening-record-07)
+- [Adversarial review (0.9)](#adversarial-review-09)
 - [Where tls-net is stricter than the RFCs](#where-tls-net-is-stricter-than-the-rfcs)
 - [What tls-net does not defend against](#what-tls-net-does-not-defend-against)
 
@@ -132,6 +133,30 @@ RSS rose 4.1 MB over the first four and a half hours, more slowly each hour, the
 **Miri.** The library tests that need no crypto provider (parsers, PEM intake, SNI, fingerprints, tickets, snapshot, expiry, errors: 66 tests) run under Miri in CI with no undefined behaviour reported (D-112). The providers are C and assembly, which Miri cannot execute.
 
 **loom.** The capacity gate, the configuration snapshot, and the ticket ring are model-checked with loom in CI (NFR-20), including the 0.6 change to the capacity slot (D-102).
+
+---
+
+## Adversarial review (0.9)
+
+Three reviewers read the source with no access to the author's notes, each over one area: the code that takes bytes from the network (sessions, the net-io seam, the hello parser); tickets, verifiers, and certificate and key intake; and server and client configuration (reload, the handshake gate, SNI, policies, observers). Each finding was reproduced with a test that fails on 0.8.0 before it was fixed, except where noted.
+
+| Finding | Severity | Fix |
+|---|---|---|
+| A peer could make `encrypt` or `close` panic, in release builds too, by sending one valid record holding part of a post-handshake message (a ticket or key update): rustls kept the part in the caller's input and was then called on an empty buffer. net-io calls `close` on every graceful close | high | D-126, T-29 |
+| Resumption skipped client authentication: rustls does not ask for a certificate on resumption, so after a publish that required client certificates, dropped a pin, or added a CRL, old sessions still resumed; and an identity carried in tickets never expired | high | D-125, T-30 |
+| `refuse_malformed(false)`, which a peer reaches by going over a budget, also skipped the hello hook, host groups, and a required ALPN; and a second hello after a HelloRetryRequest could drop ALPN (no available client does this and still completes, so that path is covered by the completion check without a test of its own) | medium | D-127 |
+| A ticket-key export from another period, or from a clock running ahead, froze key rotation | medium | D-130 |
+| `HelloLimits` fields assigned directly could index past the parser's fixed arrays | low | D-128 |
+| `close` into a short buffer lost close_notify; records queued by `step` could be lost by `encrypt`; a hello over several records asked net-io for one record's room | low | D-129 |
+| `Policy::internal()` let anonymous clients in; CRLs without anchors were never checked | low | D-131 |
+| `publish` ignored a new `max_in_progress`; the SNI counter reset on reload; setting only the gate cut the client-auth budget | low | D-132 |
+| Pinned client identities never resumed, and failed with platform anchors | low | D-133 |
+| A verified client certificate with one name tls-net could not read got no identity | low | D-134 |
+| A key read from a FIFO left unwiped copies in freed memory; the PEM decoder's scratch was described as wiped | low | D-135 |
+| `reload_from_*` made a `certificate_for` entry the default | low | D-136 |
+| OCSP staples went to every certificate for a name, not the one they are for | low | D-137 |
+
+What held, in the reviewers' words condensed: offsets and budgets in the session and the parser; data never handed out before completion or after a failure; the ticket construction (fresh nonces, bound epochs, only two epochs open, nothing printed); constant-time pin comparison over the full SPKI; the verified end-entity as the only source of a peer identity; reload built completely before the swap; the capacity gate released on every path; SNI normalisation and one-label wildcards; presets that cannot weaken; STARTTLS leftovers refused; nothing secret or unescaped in events and errors.
 
 ---
 

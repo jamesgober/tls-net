@@ -159,10 +159,12 @@ pub(crate) struct CertFacts<'a> {
 }
 
 /// What an OCSP response says about its first certificate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OcspFacts {
     /// `certStatus` is `good`.
     pub(crate) good: bool,
+    /// The serial number in the first response's `certID`.
+    pub(crate) serial: Vec<u8>,
     pub(crate) this_update: SystemTime,
     pub(crate) next_update: Option<SystemTime>,
 }
@@ -190,7 +192,12 @@ pub(crate) fn ocsp_facts(der: &[u8]) -> Option<OcspFacts> {
     data.expect(GENERALIZED_TIME)?; // producedAt
     let mut responses = Reader::new(data.expect(SEQUENCE)?);
     let mut single = Reader::new(responses.expect(SEQUENCE)?);
-    single.expect(SEQUENCE)?; // certID
+    // certID: hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber.
+    let mut cert_id = Reader::new(single.expect(SEQUENCE)?);
+    cert_id.expect(SEQUENCE)?;
+    cert_id.expect(OCTET_STRING)?;
+    cert_id.expect(OCTET_STRING)?;
+    let serial = cert_id.expect(INTEGER)?.to_vec();
     let status = single.next()?;
     let this_update = time(single.next()?)?;
     let next_update = match single.optional(0xa0) {
@@ -199,6 +206,7 @@ pub(crate) fn ocsp_facts(der: &[u8]) -> Option<OcspFacts> {
     };
     Some(OcspFacts {
         good: status.tag == 0x80,
+        serial,
         this_update,
         next_update,
     })

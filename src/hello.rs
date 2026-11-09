@@ -774,6 +774,15 @@ impl<'a> ClientHelloView<'a> {
             .flatten()
     }
 
+    /// The SNI bytes exactly as sent, for forensics, when they sit in one
+    /// record. Peer-controlled and unchecked: escape them before logging
+    /// (T-20); for decisions use [`normalized_server_name`](Self::normalized_server_name).
+    #[must_use]
+    pub fn server_name_raw(&self) -> Option<&'a [u8]> {
+        let span = self.server_name?;
+        self.stream.slice(span.pos(), span.len())
+    }
+
     /// Whether the hello carries a `server_name` extension.
     #[must_use]
     pub fn has_server_name(&self) -> bool {
@@ -1026,6 +1035,24 @@ pub(crate) mod tests {
             }
             HelloParse::Incomplete { needed } => panic!("incomplete, needs {needed}"),
         }
+    }
+
+    #[test]
+    fn test_server_name_raw_is_the_bytes_as_sent() {
+        let records = HelloBuilder::new().sni(b"Web_01.Example.").records(16_000);
+        let Ok(HelloParse::Complete { view, .. }) = HelloParser::parse(&records, &HelloLimits::new())
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(view.server_name_raw(), Some(&b"Web_01.Example."[..]));
+        // The checked forms refuse the underscore.
+        assert_eq!(view.server_name(), None);
+        let none = HelloBuilder::new().records(16_000);
+        let Ok(HelloParse::Complete { view, .. }) = HelloParser::parse(&none, &HelloLimits::new())
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(view.server_name_raw(), None);
     }
 
     #[test]

@@ -13,6 +13,61 @@
 
 ---
 
+## [0.9.0] - 2026-11-08
+
+Beta. The API is frozen: later changes are additive or fix a finding.
+
+### Security
+
+- A peer could make `encrypt` or `close` panic by sending a valid record
+  holding part of a post-handshake message (a ticket or key update split over
+  records). Both now return `WrongState` until `step` has the rest (D-126,
+  T-29).
+- Resumption is bound to each host group's client-authentication rules
+  (mode, anchors, pins, CRLs): a session made under looser rules no longer
+  resumes after a publish tightens them, and a resumed session whose client
+  certificate has expired is refused (D-125, T-30).
+- With `refuse_malformed(false)`, a hello tls-net cannot read goes to rustls
+  only when there is one host group, no hook, and no required ALPN; a
+  required ALPN is checked again at completion, which also covers a second
+  hello after a HelloRetryRequest (D-127).
+- `import_sealed` refuses an export from another ticket period or more than
+  one epoch ahead, which could freeze key rotation (D-130).
+- `HelloLimits` fields are held to their ranges inside the parser (D-128).
+
+### Changed
+
+- `Ja4::from_str` is now `Ja4::parse` (D-138).
+- `Policy::internal()` needs `ClientAuth::required` or `pinned`, and CRLs need
+  anchors, at `build` (D-131).
+- `publish` applies `max_in_progress`; `sni_disagreements` counts for the
+  server's lifetime; the 96 KiB client-auth budget applies whenever
+  `max_handshake_bytes` is at its default (D-132).
+- `close` asks for 64 bytes of output before it writes; `encrypt` and `close`
+  wait while records from `step` are queued; in `Hello` the session asks for
+  the input the hello parser needs (D-129).
+- Ticket exports carry the period (format version 2); exports from 0.8 are
+  refused, and tickets from 0.8 do not open, so the upgrade costs each client
+  one full handshake.
+- `reload_from_*` keeps the names of a `certificate_for` certificate (D-136).
+- OCSP staples go to the certificate their `certID` names (D-137).
+
+### Fixed
+
+- Pinned client identities resume, and work with `TrustAnchors::platform()`
+  (D-133).
+- A verified client certificate with one unreadable name keeps its identity
+  (D-134).
+- A key read from a path without a length (a FIFO, procfs) is read into a
+  buffer that never grows (D-135).
+
+### Added
+
+- `ClientHelloView::server_name_raw`: the SNI bytes as sent (D-138).
+- `docs/SECURITY.md`: the 0.9 adversarial review.
+
+---
+
 ## [0.8.0] - 2026-11-08
 
 Alpha. No API change.
@@ -295,7 +350,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/tls-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/tls-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/tls-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/tls-net/compare/v0.6.0...v0.7.0

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: alpha (<code>0.8.0</code>).</strong> Every planned feature before 1.0 is in and tested against OpenSSL, curl, and Go: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, on net-io's reactor bulk transfer runs 1.23 times tokio-rustls, and an idle connection costs half as much memory; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Every threat in the model has an attack test, and the fuzz campaign, soak, conformance runs, and Miri results are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. The consumers' shapes (a net-io server in direct mode, a mutual-TLS back-channel, STARTTLS against Postfix) run end to end in CI; running a server is in <a href="./docs/OPERATIONS.md"><code>docs/OPERATIONS.md</code></a>. Next: the beta in <code>0.9.0</code>, with rustls 0.24 when it is released, an adversarial review, and the API frozen (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: beta (<code>0.9.0</code>), API frozen.</strong> Every planned feature before 1.0 is in and tested against OpenSSL, curl, and Go: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, on net-io's reactor bulk transfer runs 1.23 times tokio-rustls, and an idle connection costs half as much memory; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Every threat in the model has an attack test, and the fuzz campaign, soak, conformance runs, and Miri results are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. The consumers' shapes (a net-io server in direct mode, a mutual-TLS back-channel, STARTTLS against Postfix) run end to end in CI; running a server is in <a href="./docs/OPERATIONS.md"><code>docs/OPERATIONS.md</code></a>. An adversarial review of the whole crate found and fixed two high and two medium findings, each with a test (<code>docs/SECURITY.md</code>). Next: <code>0.9.x</code> polish and a 1.0 readiness note; rustls 0.24 and its exporters when 0.24 is released (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -55,7 +55,7 @@
 
 ```toml
 [dependencies]
-tls-net = "0.8"
+tls-net = "0.9"
 ```
 
 The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange. Build needs per platform, FIPS included, are in [`docs/PLATFORM-NOTES.md`](./docs/PLATFORM-NOTES.md).
