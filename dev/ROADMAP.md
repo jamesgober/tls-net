@@ -72,13 +72,13 @@ Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hou
 - [x] NFR-21 soak (`perf/soak.sh`), 6 hours; 24 hours belongs to the 1.0 gate (D-108).
 - [x] `docs/SECURITY.md`.
 
-## v0.8.0 - Alpha
+## v0.8.0 - Alpha (DONE, 2026-11-08)
 Exit (D-039): the consumers' shapes run in this repository against real binaries: a serve-net-style net-io server in direct mode, a back-channel pair with mutual TLS, an smtp-net-style STARTTLS client against a local MTA; interop with curl, OpenSSL, and Go in CI; `docs/OPERATIONS.md` written; every finding fixed test-first.
 - [x] Go interop both ways in CI (D-118).
 - [x] Consumer shapes in `tests/consumers.rs`: direct mode, a pinned back-channel, STARTTLS against a scripted server and Postfix in CI (D-119).
 - [x] `docs/OPERATIONS.md`.
 - [x] Finding D-120 fixed: net-io's `TlsInfo` carries the verified client key hash, so a back-channel server can tell its peers apart (D-122).
-- [ ] API changes only from findings, each logged.
+- [x] API changes only from findings, each logged: none in tls-net's API; D-122 sets one more net-io field.
 
 ## v0.9.0 - Beta
 Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with exporters and channel binding (D-052); adversarial review in a dedicated session with every finding fixed test-first; API review against `docs/API.md`; `docs/OPERATIONS.md` and `docs/PLATFORM-NOTES.md` complete. API frozen at 0.9.0.

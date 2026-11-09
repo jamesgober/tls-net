@@ -11,6 +11,12 @@
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] - 2026-11-08
+
+Alpha. No API change.
+
 ### Added
 
 - The net-io seam sets `TlsInfo::peer_spki_sha256` to the SHA-256 of the
@@ -283,7 +289,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/tls-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/tls-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/tls-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/tls-net/compare/v0.5.0...v0.6.0
