@@ -90,6 +90,7 @@ Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with ex
 ## v0.9.x - Pre-1.0 polish
 Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by item, what is met and what still needs James.
 - [ ] Revisit every gap and every deferred item in this file and in `PLAN.md`; close each or record why it waits for after 1.0.
+- [ ] An unexplained failure: once in CI's interop job on PR 9 (run 42557890037 and the next), `test_back_channel_principal_per_peer` got `UncleanClose` on the first peer, within a second of starting; it passed on the rerun, in every other job, and in 170 local runs on WSL (alone, in parallel, with the interop tests). Waits for evidence: the test now names the round, peer, and step that fail; the next failure tells which. Not a release blocker because nothing points at tls-net's code, but it is not closed until explained.
 - [ ] Re-tune handshake and throughput performance against the 0.6 baselines; no regression over 5%.
 - [ ] The end-to-end item carried from 0.6 (D-106): CPU per handshake against tokio-rustls, measured with `perf/` on the net-io release that ships coalesced sends and accept in the worker. Idle memory is met on net-io 0.7.1 (D-123).
 - [ ] Re-run the security review (threat table, attack tests, dependency footprint, `cargo audit`, `cargo deny`).
