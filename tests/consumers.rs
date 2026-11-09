@@ -359,9 +359,11 @@ fn ask_at(addr: SocketAddr, client: &TlsClient) -> Result<String, TlsError> {
     };
     let session = client.connect_to(&to_server)?;
     let mut c = TcpClient::new(TcpStream::connect(addr).unwrap(), session);
-    c.handshake()?;
-    c.write(b"status\n")?;
-    let got = c.read(1)?;
+    c.handshake()
+        .inspect_err(|e| eprintln!("handshake: {e:?}"))?;
+    c.write(b"status\n")
+        .inspect_err(|e| eprintln!("write: {e:?}"))?;
+    let got = c.read(1).inspect_err(|e| eprintln!("read: {e:?}"))?;
     Ok(String::from_utf8_lossy(&got).into_owned())
 }
 
@@ -418,15 +420,14 @@ fn test_back_channel_principal_per_peer() {
     let (server, addr) = back_channel(&[a, b]);
     let first = client_with("client.pem", "client.key");
     let second = client_with("client-only.pem", "client-only.key");
-    for _ in 0..2 {
-        assert_eq!(
-            ask_at(addr, &first).unwrap(),
-            format!("{} status\n", hex(&a))
-        );
-        assert_eq!(
-            ask_at(addr, &second).unwrap(),
-            format!("{} status\n", hex(&b))
-        );
+    for round in 0..2 {
+        for (name, client, key) in [("first", &first, &a), ("second", &second, &b)] {
+            assert_eq!(
+                ask_at(addr, client),
+                Ok(format!("{} status\n", hex(key))),
+                "round {round}, {name} peer"
+            );
+        }
     }
     let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
 }
