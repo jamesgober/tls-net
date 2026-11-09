@@ -212,6 +212,74 @@ impl ClientAuth {
         matches!(self.mode, Mode::Required(_) | Mode::Pinned(..))
     }
 
+    /// SHA-256 over everything that decides whether a client certificate is
+    /// accepted: the mode, the anchors, the pins, the CRLs and their policy
+    /// (D-125). Tickets and cached sessions are bound to it, so a session
+    /// authenticated under other rules does not resume here. Computed once
+    /// per build; the CA-name setting is left out, since it accepts nothing.
+    pub(crate) fn binding(&self) -> [u8; 32] {
+        fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
+            buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        fn anchors(buf: &mut Vec<u8>, a: &TrustAnchors) {
+            buf.push(u8::from(a.platform));
+            buf.extend_from_slice(&(a.roots.roots.len() as u64).to_be_bytes());
+            for r in &a.roots.roots {
+                put(buf, r.subject.as_ref());
+                put(buf, r.subject_public_key_info.as_ref());
+                match &r.name_constraints {
+                    Some(nc) => {
+                        buf.push(1);
+                        put(buf, nc.as_ref());
+                    }
+                    None => buf.push(0),
+                }
+            }
+        }
+        let mut buf = b"tls-net client-auth binding v1".to_vec();
+        match &self.mode {
+            Mode::None => buf.push(0),
+            Mode::Optional(a) => {
+                buf.push(1);
+                anchors(&mut buf, a);
+            }
+            Mode::Required(a) => {
+                buf.push(2);
+                anchors(&mut buf, a);
+            }
+            Mode::Pinned(a, pins) => {
+                buf.push(3);
+                match a {
+                    Some(a) => {
+                        buf.push(1);
+                        anchors(&mut buf, a);
+                    }
+                    None => buf.push(0),
+                }
+                let mut pins = pins.clone();
+                pins.sort_unstable();
+                pins.dedup();
+                buf.extend_from_slice(&(pins.len() as u64).to_be_bytes());
+                for p in &pins {
+                    buf.extend_from_slice(p);
+                }
+            }
+        }
+        match &self.crls {
+            Some((crls, policy)) => {
+                buf.push(1);
+                buf.push(policy.0);
+                buf.extend_from_slice(&(crls.0.len() as u64).to_be_bytes());
+                for c in crls.0.iter() {
+                    put(&mut buf, c.as_ref());
+                }
+            }
+            None => buf.push(0),
+        }
+        crypt_io::hash::sha256(&buf)
+    }
+
     /// Whether client certificates are requested at all.
     pub(crate) fn is_enabled(&self) -> bool {
         !matches!(self.mode, Mode::None)
@@ -254,6 +322,13 @@ impl ClientAuth {
                 reason: "client certificate anchors could not be used",
             })
         };
+        // CRLs are checked by the webpki verifier, which needs anchors: with
+        // none they would be accepted and never applied (D-131).
+        if self.crls.is_some() && matches!(self.mode, Mode::None | Mode::Pinned(None, _)) {
+            return Err(TlsError::PolicyInvalid {
+                reason: "CRLs need client certificate anchors",
+            });
+        }
         match &self.mode {
             Mode::None => Ok(Arc::new(rustls::server::NoClientAuth)),
             Mode::Optional(a) => webpki(a, true),
@@ -405,7 +480,7 @@ impl ClientCertVerifier for PinnedClient {
 /// The client side: a pinned server identity (`ServerIdentity::Pinned`).
 #[derive(Debug)]
 pub(crate) struct PinnedServer {
-    pub(crate) inner: Option<Arc<WebPkiServerVerifier>>,
+    pub(crate) inner: Option<Arc<dyn ServerCertVerifier>>,
     pub(crate) pins: Pins,
     pub(crate) algs: WebPkiSupportedAlgorithms,
 }

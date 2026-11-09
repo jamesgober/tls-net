@@ -16,13 +16,16 @@ use crate::hook::{HelloContext, HelloVerdict};
 use crate::identity::{HandshakeInfo, HandshakeKind, PeerIdentity};
 use crate::observe::{HelloRefusal, Observation, TlsEvent};
 use crate::policy::{CipherSuite, Group, Version};
-use crate::server::{CapacitySlot, ServerState};
+use crate::server::{CapacitySlot, Group as HostGroup, ServerState};
 
 /// The largest plaintext in one TLS record.
 pub const MAX_RECORD_PAYLOAD: usize = 16_384;
 /// The free output space `step` needs: one maximum wire record (rustls's
 /// `MAX_WIRE_SIZE`: 16,384 + 2,048 + 5).
 pub const OUTGOING_MIN: usize = 18_437;
+/// Room `close` asks for: a close_notify record is at most 31 bytes
+/// (TLS 1.2 with AES-GCM's explicit nonce), with margin.
+const CLOSE_NOTIFY_MAX: usize = 64;
 /// The input buffer a session needs once established: one maximum wire record.
 pub const INCOMING_MIN: usize = 18_437;
 
@@ -146,6 +149,11 @@ enum Stop {
     Failed(TlsError),
 }
 
+/// Whether `bytes` starts with a whole TLS record (header and payload).
+fn complete_record_at(bytes: &[u8]) -> bool {
+    bytes.len() >= 5 && bytes.len() - 5 >= usize::from(u16::from_be_bytes([bytes[3], bytes[4]]))
+}
+
 /// State shared by both session kinds.
 pub(crate) struct Core<C> {
     conn: Option<C>,
@@ -163,6 +171,12 @@ pub(crate) struct Core<C> {
     held_plain: usize,
     /// `close_notify` that arrived with the last handshake flight.
     held_peer_closed: bool,
+    /// rustls holds part of a post-handshake message (a ticket or a key
+    /// update split over records) in the caller's unconsumed input, so it
+    /// must not run on any other buffer until the next `step` (D-126).
+    partial_message: bool,
+    /// The input the hello parser last asked for, while in `Hello`.
+    pub(crate) hello_needed: usize,
     peer_closed: bool,
     pub(crate) tag: u64,
     pub(crate) started: Option<Instant>,
@@ -181,6 +195,8 @@ impl<C: Engine> Core<C> {
             held: 0,
             held_plain: 0,
             held_peer_closed: false,
+            partial_message: false,
+            hello_needed: 0,
             peer_closed: false,
             tag: 0,
             started: None,
@@ -314,6 +330,12 @@ impl<C: Engine> Core<C> {
         let mut consumed = 0usize;
         let mut written = 0usize;
         let mut stop = self.drive(input, output, &mut consumed, &mut written);
+        // rustls reads every complete record before it stops for anything but
+        // data, so a complete record it left undiscarded holds part of a
+        // handshake message: rustls reads it again from the caller's next
+        // input, and a call on an empty buffer would index past its end (D-126).
+        self.partial_message = !matches!(stop, Stop::Data { .. } | Stop::Failed(_))
+            && complete_record_at(&input[consumed..]);
         // rustls hands out application data (or close_notify) that came in the
         // same flight as the peer's Finished before it reports the handshake
         // complete. Report completion first; keep the plaintext at the front
@@ -539,7 +561,16 @@ impl<C: Engine> Core<C> {
         if plaintext.is_empty() {
             return Ok(0);
         }
+        if self.partial_message {
+            return Err(TlsError::WrongState);
+        }
         let conn = self.conn.as_mut().ok_or(TlsError::WrongState)?;
+        // Records `step` left queued (its output was full) go out through
+        // `step`: encoding them here could lose them to a short output, or
+        // put them after this call's bytes (D-129).
+        if conn.common().wants_write() {
+            return Err(TlsError::WrongState);
+        }
         let mut written = 0;
         loop {
             let status = conn.process(&mut []);
@@ -579,7 +610,20 @@ impl<C: Engine> Core<C> {
             SessionState::Established | SessionState::HalfClosed => {}
             _ => return Err(TlsError::WrongState),
         }
+        if self.partial_message {
+            return Err(TlsError::WrongState);
+        }
         let conn = self.conn.as_mut().ok_or(TlsError::WrongState)?;
+        if conn.common().wants_write() {
+            return Err(TlsError::WrongState);
+        }
+        // rustls marks close_notify sent before it checks the output's size,
+        // so a short output would lose it (D-129).
+        if output.len() < CLOSE_NOTIFY_MAX {
+            return Err(TlsError::OutputFull {
+                required: CLOSE_NOTIFY_MAX,
+            });
+        }
         let status = conn.process(&mut []);
         match status.state {
             Ok(ConnectionState::WriteTraffic(mut w)) => match w.queue_close_notify(output) {
@@ -613,9 +657,10 @@ impl<C: Engine> Core<C> {
 
     pub(crate) fn input_capacity_required(&self) -> usize {
         match self.state {
-            SessionState::Hello | SessionState::Handshake => {
-                INCOMING_MIN.max(self.held.saturating_add(1))
-            }
+            // A hello may span up to 16 records of up to 65,535 bytes in
+            // all (`HelloLimits`): ask for what the parser said it needs.
+            SessionState::Hello => INCOMING_MIN.max(self.hello_needed),
+            SessionState::Handshake => INCOMING_MIN.max(self.held.saturating_add(1)),
             _ => INCOMING_MIN,
         }
     }
@@ -665,6 +710,17 @@ impl<C: Engine> Core<C> {
         self.conn.as_ref()?.common().peer_certificates()
     }
 
+    fn resumed(&self) -> bool {
+        self.conn.as_ref().and_then(|c| c.common().handshake_kind())
+            == Some(rustls::HandshakeKind::Resumed)
+    }
+
+    fn alpn_negotiated(&self) -> bool {
+        self.conn
+            .as_ref()
+            .is_some_and(|c| c.common().alpn_protocol().is_some())
+    }
+
     /// The peer's identity, parsed from its end-entity certificate on the
     /// first call and kept in `cell` (D-104).
     fn peer_identity<'a>(
@@ -702,6 +758,8 @@ pub struct ServerSession {
     fingerprint: Option<Fingerprint>,
     /// Built on first use from the client certificate; boxed (D-096, D-104).
     peer: OnceCell<Option<Box<PeerIdentity>>>,
+    /// The host group's rules, checked again at completion.
+    group: Option<HostGroup>,
     refusal: Option<HelloRefusal>,
     reported: bool,
 }
@@ -732,6 +790,7 @@ impl ServerSession {
             sni: None,
             fingerprint: None,
             peer: OnceCell::new(),
+            group: None,
             refusal: None,
             reported: false,
         }
@@ -797,7 +856,8 @@ impl ServerSession {
         }
         if self.core.state == SessionState::Hello {
             match HelloParser::parse(input, &self.state.hello_limits) {
-                Ok(HelloParse::Incomplete { .. }) => {
+                Ok(HelloParse::Incomplete { needed }) => {
+                    self.core.hello_needed = needed;
                     return Ok(Progress {
                         consumed: 0,
                         written: 0,
@@ -843,6 +903,7 @@ impl ServerSession {
                         .get(slot.group)
                         .copied()
                         .ok_or(TlsError::Other)?;
+                    self.group = Some(group);
                     if group.alpn_required && !view.has_alpn() {
                         self.refusal = Some(HelloRefusal::AlpnRequired);
                         self.release();
@@ -872,8 +933,21 @@ impl ServerSession {
                     self.release();
                     return Err(self.core.fail(e));
                 }
-                Err(_) => {
-                    // refuse_malformed is off: rustls decides, no fingerprint.
+                Err(e) => {
+                    // refuse_malformed is off: rustls decides, without a
+                    // fingerprint. Only where nothing else depends on the
+                    // hello: with a hook, host groups, or a required ALPN the
+                    // hello is refused as before (D-127).
+                    let first = self.state.groups.first().copied();
+                    let lenient = self.state.groups.len() == 1
+                        && self.state.hook.is_none()
+                        && first.is_some_and(|g| !g.alpn_required);
+                    if !lenient {
+                        self.refusal = Some(HelloRefusal::Malformed);
+                        self.release();
+                        return Err(self.core.fail(e));
+                    }
+                    self.group = first;
                     let config = self.state.configs.first().cloned().ok_or(TlsError::Other)?;
                     let conn = UnbufferedServerConnection::new(config)
                         .map_err(|e| self.core.fail(error::from_rustls(&e)))?;
@@ -896,8 +970,32 @@ impl ServerSession {
         result
     }
 
-    /// At completion: the client certificate's budgets.
+    /// At completion: the group's rules again, then the client certificate's
+    /// budgets. rustls checks ALPN on the first hello only, so a second hello
+    /// after a HelloRetryRequest could drop it (D-127); and it does not ask
+    /// for a certificate on resumption, so a resumed session is checked
+    /// against the group's rules and its certificate's expiry (D-125).
     fn complete(&mut self) -> Result<(), TlsError> {
+        if let Some(g) = self.group {
+            if g.alpn_required && !self.core.alpn_negotiated() {
+                return Err(TlsError::NoApplicationProtocol);
+            }
+            if self.core.resumed() {
+                match self.core.peer_chain().and_then(|c| c.first()) {
+                    None if g.auth_required => return Err(TlsError::PeerCertificateRequired),
+                    None => {}
+                    Some(cert) => {
+                        let expired = crate::der::parse_certificate(cert.as_ref())
+                            .is_none_or(|f| f.not_after <= crate::server::wall_clock());
+                        if expired {
+                            return Err(TlsError::PeerCertificateInvalid(
+                                crate::error::CertificateProblem::Expired,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let limits = self.state.limits;
         if let Some(chain) = self.core.peer_chain() {
             let too_large = chain.len() > usize::from(limits.max_peer_chain_len)

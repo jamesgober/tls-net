@@ -158,7 +158,6 @@ pub mod fuzz {
     /// Opens arbitrary bytes as a session ticket: never panics, never succeeds
     /// on anything this ring did not seal.
     pub fn ticket_open(data: &[u8]) -> bool {
-        use rustls::server::ProducesTickets;
         use std::sync::OnceLock;
         static RING: OnceLock<Option<crate::tickets::TicketKeyRing>> = OnceLock::new();
         let ring = RING.get_or_init(|| {

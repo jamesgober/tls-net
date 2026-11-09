@@ -25,7 +25,7 @@ use crate::policy::{Policy, Preset};
 use crate::session::ServerSession;
 use crate::snapshot::{Reader, Snapshot};
 use crate::sni::{self, GroupResolver, SniTable};
-use crate::tickets::{TicketKeyRing, TicketKeyRingHandle, TicketMode};
+use crate::tickets::{BoundTickets, TicketKeyRing, TicketKeyRingHandle, TicketMode};
 use crate::verify::ClientAuth;
 
 /// An application protocol name for ALPN (RFC 7301): 1 to 255 bytes.
@@ -187,7 +187,8 @@ impl HostPolicy {
 #[derive(Debug)]
 pub(crate) struct Capacity {
     in_progress: AtomicU32,
-    max: u32,
+    /// Set at build and by every publish (0 drains).
+    max: AtomicU32,
 }
 
 /// One handshake slot. It holds no reference: the session that owns it
@@ -198,7 +199,7 @@ pub(crate) struct CapacitySlot(());
 impl Capacity {
     fn acquire(&self) -> Option<CapacitySlot> {
         let prev = self.in_progress.fetch_add(1, Ordering::AcqRel);
-        if prev >= self.max {
+        if prev >= self.max.load(Ordering::Acquire) {
             self.in_progress.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -216,6 +217,8 @@ impl Capacity {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Group {
     pub(crate) alpn_required: bool,
+    /// The group requires a client certificate (checked again on resumption, D-125).
+    pub(crate) auth_required: bool,
     pub(crate) max_handshake_bytes: u32,
 }
 
@@ -235,12 +238,65 @@ pub(crate) struct ServerState {
     pub(crate) capacity: Arc<Capacity>,
 }
 
+/// The wall clock for the checks at completion. Unit tests move it forward
+/// to reach a client certificate's expiry on resumption (D-125).
+pub(crate) fn wall_clock() -> SystemTime {
+    #[cfg(test)]
+    let ahead = Duration::from_secs(tests::CLOCK_AHEAD.load(std::sync::atomic::Ordering::Relaxed));
+    #[cfg(not(test))]
+    let ahead = Duration::ZERO;
+    SystemTime::now() + ahead
+}
+
+/// One group's view of the shared session cache: every key is prefixed
+/// with the group's client-authentication binding (D-125), so a session
+/// stored under one set of rules is not found under another.
+struct BoundCache {
+    inner: Arc<dyn StoresServerSessions>,
+    bind: [u8; 32],
+}
+
+impl fmt::Debug for BoundCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundCache").finish_non_exhaustive()
+    }
+}
+
+impl BoundCache {
+    fn key(&self, key: &[u8]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(32 + key.len());
+        k.extend_from_slice(&self.bind);
+        k.extend_from_slice(key);
+        k
+    }
+}
+
+impl StoresServerSessions for BoundCache {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.inner.put(self.key(&key), value)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.get(&self.key(key))
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.take(&self.key(key))
+    }
+
+    fn can_cache(&self) -> bool {
+        self.inner.can_cache()
+    }
+}
+
 /// State that belongs to the server's lifetime, carried across reloads (FR-32).
 struct Shared {
     capacity: Arc<Capacity>,
     tickets: Option<Arc<TicketKeyRing>>,
     cache: Arc<dyn StoresServerSessions>,
     obs: Arc<Observation>,
+    /// Kept across reloads, so the count is the server's, not a snapshot's.
+    sni_mismatches: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct Inner {
@@ -374,7 +430,7 @@ impl TlsServer {
     ///
     /// `ReloadRefused` with the load error as source; the old certificate stays.
     pub fn reload_from_pem(&self, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), TlsError> {
-        self.reload_single(|b| b.certificate(chain_pem, KeySource::Pem(key_pem)))
+        self.reload_single(|b| b.reload_entry(chain_pem, KeySource::Pem(key_pem)))
     }
 
     /// As [`reload_from_pem`](Self::reload_from_pem), reading the files.
@@ -390,7 +446,7 @@ impl TlsServer {
         self.reload_single(|b| {
             let limits = b.load_limits;
             let chain = pem::read_file(chain.as_ref(), limits.max_chain_file_bytes, false, false)?;
-            b.certificate(&chain, KeySource::File(key.as_ref()))
+            b.reload_entry(&chain, KeySource::File(key.as_ref()))
         })
     }
 
@@ -484,11 +540,9 @@ impl TlsServer {
     #[must_use]
     pub fn sni_disagreements(&self) -> u64 {
         self.inner
-            .snapshot
-            .load()
-            .table
-            .group_mismatches
-            .load(Ordering::Relaxed)
+            .shared
+            .sni_mismatches
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -503,7 +557,7 @@ impl Inner {
     fn refuse(&self) -> TlsError {
         self.shared.obs.capacity(
             self.shared.capacity.in_progress.load(Ordering::Relaxed),
-            self.shared.capacity.max,
+            self.shared.capacity.max.load(Ordering::Relaxed),
         );
         TlsError::HandshakeCapacity
     }
@@ -598,6 +652,7 @@ impl ReloadHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let settings = next.settings();
+        let max_in_progress = next.limits.max_in_progress;
         let state = next
             .state(&self.inner.shared)
             .map_err(|e| self.inner.reload_refused(e))?;
@@ -608,6 +663,13 @@ impl ReloadHandle {
             .filter(|e| e.state >= expiry::ExpiryState::Warn)
             .count();
         let version = self.inner.snapshot.publish(state);
+        // The gate is the server's, but its limit follows the configuration:
+        // 0 drains, a higher limit lets a load spike through (D-132).
+        self.inner
+            .shared
+            .capacity
+            .max
+            .store(max_in_progress, Ordering::Release);
         self.inner
             .shared
             .obs
@@ -632,6 +694,8 @@ impl ReloadHandle {
 struct Pending {
     entry: CertificateEntry,
     is_default: bool,
+    /// Added with `certificate_for`: `entry.names` were configured, not the SANs.
+    explicit: bool,
 }
 
 /// Builds a [`TlsServer`]. Methods that parse return `Result` at once, so an
@@ -655,12 +719,14 @@ struct Pending {
 #[derive(Clone)]
 pub struct ServerBuilder {
     pending: Vec<Pending>,
+    /// For `reload_from_*`: the names the one certificate was configured
+    /// for with `certificate_for`, so a reload serves the same names (D-136).
+    reload_names: Option<Vec<Box<str>>>,
     unknown: Option<UnknownName>,
     alpn: Vec<Alpn>,
     alpn_policy: AlpnPolicy,
     policy: Policy,
     limits: HandshakeLimits,
-    limits_set: bool,
     load_limits: LoadLimits,
     hello_limits: HelloLimits,
     client_auth: ClientAuth,
@@ -727,12 +793,12 @@ impl ServerBuilder {
     pub fn new() -> Self {
         ServerBuilder {
             pending: Vec::new(),
+            reload_names: None,
             unknown: None,
             alpn: Vec::new(),
             alpn_policy: AlpnPolicy::Optional,
             policy: Policy::compatible(),
             limits: HandshakeLimits::server(),
-            limits_set: false,
             load_limits: LoadLimits::new(),
             hello_limits: HelloLimits::new(),
             client_auth: ClientAuth::none(),
@@ -774,10 +840,27 @@ impl ServerBuilder {
 
     /// These settings without certificates (the reload template).
     fn settings(&self) -> ServerBuilder {
+        let reload_names = match self.pending.as_slice() {
+            [one] if one.explicit => Some(one.entry.names.clone()),
+            _ => None,
+        };
         ServerBuilder {
             pending: Vec::new(),
+            reload_names,
             ocsp: Vec::new(),
             ..self.clone()
+        }
+    }
+
+    /// The one certificate of a `reload_from_*`, added the way the one it
+    /// replaces was: for the same configured names, or as the default.
+    fn reload_entry(self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError> {
+        match self.reload_names.clone() {
+            Some(names) => {
+                let names: Vec<&str> = names.iter().map(|n| &**n).collect();
+                self.certificate_for(&names, chain_pem, key)
+            }
+            None => self.certificate(chain_pem, key),
         }
     }
 
@@ -800,7 +883,11 @@ impl ServerBuilder {
     pub fn certificate(mut self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError> {
         let entry = certs::load(Chain::Pem(chain_pem), key, None, &self.options())?;
         let is_default = !self.pending.iter().any(|p| p.is_default);
-        self.pending.push(Pending { entry, is_default });
+        self.pending.push(Pending {
+            entry,
+            is_default,
+            explicit: false,
+        });
         Ok(self)
     }
 
@@ -825,6 +912,7 @@ impl ServerBuilder {
         self.pending.push(Pending {
             entry,
             is_default: false,
+            explicit: true,
         });
         Ok(self)
     }
@@ -841,7 +929,11 @@ impl ServerBuilder {
     ) -> Result<Self, TlsError> {
         let entry = certs::load(Chain::Der(chain_der), key, None, &self.options())?;
         let is_default = !self.pending.iter().any(|p| p.is_default);
-        self.pending.push(Pending { entry, is_default });
+        self.pending.push(Pending {
+            entry,
+            is_default,
+            explicit: false,
+        });
         Ok(self)
     }
 
@@ -873,7 +965,6 @@ impl ServerBuilder {
     /// The handshake budgets.
     pub fn limits(mut self, limits: HandshakeLimits) -> Self {
         self.limits = limits;
-        self.limits_set = true;
         self
     }
 
@@ -939,12 +1030,16 @@ impl ServerBuilder {
 
     /// An OCSP staple for the certificate that serves `name`, sent to clients
     /// that ask for one. Checked now: at most 16 KiB, a successful response,
-    /// status good, and `nextUpdate` (if present) in the future.
+    /// status good, and `nextUpdate` (if present) in the future. At `build`
+    /// it goes to the certificate serving `name` whose serial its `certID`
+    /// names (D-137).
     ///
     /// # Errors
     ///
     /// `PemInvalid { what: "OCSP response" }` for a malformed, revoked, or
-    /// stale staple; `InvalidName`.
+    /// stale staple; `InvalidName`. At `build`: `NameNotCovered` when no
+    /// certificate serves `name`, `PolicyInvalid` when none of them is the
+    /// staple's.
     pub fn ocsp_staple(mut self, name: &str, staple_der: &[u8]) -> Result<Self, TlsError> {
         let n = sni::normalize_pattern(name).ok_or_else(|| TlsError::InvalidName {
             name: crate::error::escape(name.as_bytes()),
@@ -1016,11 +1111,12 @@ impl ServerBuilder {
         let shared = Shared {
             capacity: Arc::new(Capacity {
                 in_progress: AtomicU32::new(0),
-                max: self.limits.max_in_progress,
+                max: AtomicU32::new(self.limits.max_in_progress),
             }),
             tickets,
             cache,
             obs,
+            sni_mismatches: Arc::default(),
         };
         let settings = self.settings();
         let state = self.state(&shared)?;
@@ -1053,23 +1149,44 @@ impl ServerBuilder {
             self.pending.iter().map(|p| p.entry.clone()).collect();
         for (name, staple) in &self.ocsp {
             let mut hit = false;
+            // A staple goes to the certificate its certID names (by serial),
+            // among those serving the name: an ECDSA and an RSA certificate
+            // for one name each need their own (D-137).
+            let serial = crate::der::ocsp_facts(staple).map(|f| f.serial);
+            let mut covered = false;
             for e in &mut entries {
                 if e.names
                     .iter()
                     .any(|n| **n == **name || sni::san_covers(n, name))
                 {
+                    covered = true;
+                    let leaf_serial = e
+                        .certified
+                        .cert
+                        .first()
+                        .and_then(|c| crate::der::parse_certificate(c.as_ref()))
+                        .map(|f| f.serial.to_vec());
+                    if leaf_serial.is_none() || leaf_serial != serial {
+                        continue;
+                    }
                     let mut ck: CertifiedKey = (*e.certified).clone();
                     ck.ocsp = Some(staple.clone());
                     e.certified = Arc::new(ck);
                     hit = true;
                 }
             }
-            if !hit {
+            if !covered {
                 return Err(TlsError::NameNotCovered { name: name.clone() });
+            }
+            if !hit {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "the OCSP staple is for none of the certificates serving its name",
+                });
             }
         }
 
         let mut table = SniTable::new();
+        table.group_mismatches = Arc::clone(&shared.sni_mismatches);
         for (p, e) in self.pending.iter().zip(&entries) {
             let index = table.add_key(Arc::clone(&e.certified), e.entry_key());
             for name in &e.names {
@@ -1131,6 +1248,13 @@ impl ServerBuilder {
                     reason: "max_fragment_size below 512 does not fit net-io's write path",
                 });
             }
+            // The internal preset is for service-to-service links, which
+            // always authenticate the client (D-131).
+            if policy.preset() == Preset::Internal && !auth.is_required() {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "Policy::internal() needs ClientAuth::required or pinned",
+                });
+            }
             let provider = policy.provider()?;
             let verifier = auth.verifier(&provider)?;
             let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -1147,9 +1271,18 @@ impl ServerBuilder {
             config.ignore_client_order = policy.server_order_wins();
             config.max_fragment_size = policy.fragment().map(|f| f + 5);
             config.require_ems = policy.ems();
-            config.session_storage = Arc::clone(&shared.cache);
+            // Resumption is bound to the group's client-authentication rules
+            // (D-125): rustls does not ask for a certificate again on resume.
+            let bind = auth.binding();
+            config.session_storage = Arc::new(BoundCache {
+                inner: Arc::clone(&shared.cache),
+                bind,
+            });
             if let Some(ring) = &shared.tickets {
-                config.ticketer = Arc::clone(ring) as Arc<dyn rustls::server::ProducesTickets>;
+                config.ticketer = Arc::new(BoundTickets {
+                    ring: Arc::clone(ring),
+                    bind,
+                });
             }
             config.send_tls13_tickets = if policy.preset() == Preset::Internal {
                 0
@@ -1170,7 +1303,11 @@ impl ServerBuilder {
                 });
             }
             let client_auth = auth.is_enabled();
-            let max_handshake_bytes = if client_auth && !self.limits_set {
+            // Left at its default, the budget grows for client certificates;
+            // setting other limits does not count as setting this one (D-132).
+            let default_budget =
+                self.limits.max_handshake_bytes == HandshakeLimits::server().max_handshake_bytes;
+            let max_handshake_bytes = if client_auth && default_budget {
                 96 << 10
             } else {
                 self.limits.max_handshake_bytes
@@ -1178,6 +1315,7 @@ impl ServerBuilder {
             configs.push(Arc::new(config));
             groups.push(Group {
                 alpn_required: alpn_policy == AlpnPolicy::Required,
+                auth_required: auth.is_required(),
                 max_handshake_bytes,
             });
         }
@@ -1256,6 +1394,125 @@ pub fn server_from_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
+    use crate::{ClientBuilder, Event, HandshakeKind, TrustAnchors};
+
+    pub(crate) static CLOCK_AHEAD: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
+    fn data(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
+    /// Runs a server and a client session against each other in memory.
+    fn handshake(server: &TlsServer, client: &crate::TlsClient) -> Result<HandshakeKind, TlsError> {
+        let mut s = server.accept()?;
+        let mut c = client.connect("localhost")?;
+        let (mut to_s, mut to_c) = (Vec::new(), Vec::new());
+        let mut out = vec![0u8; 64 * 1024];
+        for _ in 0..64 {
+            let mut moved = false;
+            loop {
+                let p = c.step(&mut to_c, &mut out)?;
+                let (n, w, need) = (p.consumed, p.written, p.event == Event::NeedInput);
+                to_s.extend_from_slice(&out[..w]);
+                to_c.drain(..n);
+                moved |= n > 0 || w > 0;
+                if need && n == 0 && w == 0 {
+                    break;
+                }
+            }
+            loop {
+                let p = s.step(&mut to_s, &mut out)?;
+                let (n, w, need) = (p.consumed, p.written, p.event == Event::NeedInput);
+                to_c.extend_from_slice(&out[..w]);
+                to_s.drain(..n);
+                moved |= n > 0 || w > 0;
+                if need && n == 0 && w == 0 {
+                    break;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        s.info().map(|i| i.kind).ok_or(TlsError::WrongState)
+    }
+
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
+    #[test]
+    fn test_resumed_client_certificate_checked_for_expiry() {
+        // rustls carries the client chain in the ticket and issues fresh
+        // tickets on every resumption, so without this check an identity
+        // would outlive its certificate (D-125).
+        let ca = TrustAnchors::from_pem(&data("ca.pem")).unwrap();
+        let server = ServerBuilder::new()
+            .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+            .unwrap()
+            .client_auth(ClientAuth::required(ca.clone()))
+            .build()
+            .unwrap();
+        let client = ClientBuilder::new()
+            .trust(ca)
+            .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
+            .unwrap()
+            .resumption(8)
+            .build()
+            .unwrap();
+        assert_eq!(handshake(&server, &client), Ok(HandshakeKind::Full));
+        assert_eq!(handshake(&server, &client), Ok(HandshakeKind::Resumed));
+        use rustls::pki_types::pem::PemObject;
+        let pem = data("client.pem");
+        let leaf = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+            .next()
+            .unwrap()
+            .unwrap();
+        let not_after = crate::der::parse_certificate(leaf.as_ref())
+            .unwrap()
+            .not_after;
+        let ahead = not_after
+            .duration_since(SystemTime::now())
+            .unwrap()
+            .as_secs()
+            + 1;
+        CLOCK_AHEAD.store(ahead, std::sync::atomic::Ordering::Relaxed);
+        let late = handshake(&server, &client);
+        CLOCK_AHEAD.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            late,
+            Err(TlsError::PeerCertificateInvalid(
+                crate::error::CertificateProblem::Expired
+            ))
+        );
+    }
+
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
+    #[test]
+    fn test_client_auth_budget_survives_other_limits() {
+        // Setting only the handshake limit leaves the budget at its default,
+        // so client authentication still gets 96 KiB (D-132).
+        let ca = TrustAnchors::from_pem(&data("ca.pem")).unwrap();
+        let build = |limits: HandshakeLimits| {
+            ServerBuilder::new()
+                .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+                .unwrap()
+                .client_auth(ClientAuth::required(ca.clone()))
+                .limits(limits)
+                .build()
+                .unwrap()
+        };
+        let budget = |s: &TlsServer| s.inner.snapshot.load().groups[0].max_handshake_bytes;
+        let only_gate = build(HandshakeLimits::server().max_in_progress(64).unwrap());
+        assert_eq!(budget(&only_gate), 96 << 10);
+        let explicit = build(
+            HandshakeLimits::server()
+                .max_handshake_bytes(48 << 10)
+                .unwrap(),
+        );
+        assert_eq!(budget(&explicit), 48 << 10);
+    }
 
     #[test]
     fn test_staple_checks() {
@@ -1287,7 +1544,7 @@ mod loom_tests {
         loom::model(|| {
             let gate = Arc::new(Capacity {
                 in_progress: AtomicU32::new(0),
-                max: 1,
+                max: AtomicU32::new(1),
             });
             let other = {
                 let gate = Arc::clone(&gate);

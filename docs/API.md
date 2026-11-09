@@ -1,7 +1,7 @@
 # tls-net &mdash; API Reference
 
 > Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.8.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0, 0.7.x, and 0.8.0 added no API). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: `0.9.0`, frozen.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0, 0.7.x, and 0.8.0 added no API; 0.9.0 added `server_name_raw` and renamed `Ja4::from_str` to `Ja4::parse`). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -458,7 +458,7 @@ pub enum KeySource<'a> {
 pub enum KeyCustody { #[default] Resident, PerSignature }
 ```
 
-`KeySource` borrows; key bytes are never copied into a long-lived tls-net buffer, and every buffer tls-net decodes into is wiped. `Debug` prints only the variant name and, for files, the path.
+`KeySource` borrows; key bytes are never copied into a long-lived tls-net buffer, and every buffer tls-net reads or decodes into is wiped. The PEM decoder in rustls-pki-types frees scratch buffers of its own without wiping them; `KeySource::Vault` keeps the key out of ordinary memory altogether (D-135). `Debug` prints only the variant name and, for files, the path.
 
 - `Pem`: one key block (PKCS#8, PKCS#1 RSA, or SEC1 EC). `ENCRYPTED PRIVATE KEY` is refused with `EncryptedPrivateKey`.
 - `Der`: PKCS#8, PKCS#1, or SEC1 DER; the form is detected.
@@ -569,6 +569,7 @@ pub fn certificate_der_from_pem(pem: &[u8]) -> Result<Vec<Vec<u8>>, TlsError>;
 - `required` verifies the client chain against `anchors` (rustls-webpki), with optional CRLs; no certificate is `PeerCertificateRequired` (`TLS-0038`).
 - `optional` also allows a client without a certificate; `HandshakeInfo::peer` is then `None`, and upper layers must treat that as anonymous.
 - `pinned` requires the end-entity SPKI SHA-256 to equal one of the pins (constant-time compare). With `anchors`, the chain is verified first. Without anchors, a self-issued certificate is accepted only when its SPKI matches a pin, and the handshake signature and validity window are still verified (T-6b).
+- CRLs are checked against the anchors' chain, so `with_crls` on `none()` or on `pinned(None, ..)` is `PolicyInvalid` at `build` rather than accepted and never applied (D-131).
 - CA name hints are sent by default; `hide_ca_names()` clears them when the CA names are themselves sensitive.
 
 Peer chain budgets come from `HandshakeLimits` (default 5 certificates of at most 16 KiB).
@@ -683,7 +684,7 @@ impl Policy {
 impl Default for Policy { /* compatible() */ }
 ```
 
-The presets are in PLAN 6.9. Setters validate their own argument: empty lists, duplicates, and `max_fragment_size` below 32 or above 16,384 are `PolicyInvalid`. Lists keep their order (the server's preference). Cross-checks against the provider happen at `build` (FR-8): no suite for an allowed version, a group the provider lacks, post-quantum required with `ring` (`PostQuantumUnavailable`), a FIPS policy outside FIPS mode (`FipsUnavailable`). `Policy::fips()` exists in every build so configuration code compiles the same way everywhere; only a build with feature `fips` can use it (D-084). It allows TLS 1.3 and TLS 1.2 with AES-GCM suites, P-256 and P-384, and the ML-KEM hybrids the FIPS module offers. In a `fips` build every preset leaves out what rustls does not report as approved (ChaCha20, X25519), so `is_fips()` holds for every configuration; naming such an item explicitly is `PolicyInvalid` (D-095). Nothing weaker than these enums can be named, so a weak configuration cannot be written.
+The presets are in PLAN 6.9. Setters validate their own argument: empty lists, duplicates, and `max_fragment_size` below 32 or above 16,384 are `PolicyInvalid`. Lists keep their order (the server's preference). A server on `Policy::internal()` needs `ClientAuth::required` or `pinned`, else `build` is `PolicyInvalid` (D-131). Cross-checks against the provider happen at `build` (FR-8): no suite for an allowed version, a group the provider lacks, post-quantum required with `ring` (`PostQuantumUnavailable`), a FIPS policy outside FIPS mode (`FipsUnavailable`). `Policy::fips()` exists in every build so configuration code compiles the same way everywhere; only a build with feature `fips` can use it (D-084). It allows TLS 1.3 and TLS 1.2 with AES-GCM suites, P-256 and P-384, and the ML-KEM hybrids the FIPS module offers. In a `fips` build every preset leaves out what rustls does not report as approved (ChaCha20, X25519), so `is_fips()` holds for every configuration; naming such an item explicitly is `PolicyInvalid` (D-095). Nothing weaker than these enums can be named, so a weak configuration cannot be written.
 
 ```rust
 // TLS 1.3 only, ChaCha20 first for clients without AES hardware.
@@ -993,7 +994,7 @@ pub struct SealedTicketKeys { /* wipes on drop */ }
 impl SealedTicketKeys { pub fn as_bytes(&self) -> &[u8]; }
 ```
 
-For restarts that hand the listening sockets to a new process: the old process exports, the new one imports, and resumption survives. Only `Ratchet` rings export and import; `Ephemeral` has nothing worth keeping and `Derived` processes already share their root, so both return `PolicyInvalid` (D-085). `TlsServer::ticket_keys()` returns the handle, `None` when tickets are off. `import_sealed` refuses an export older than the importer's epoch minus one, a mode mismatch, a wrong wrap key, and any tampering (T-24). The export is AEAD-sealed, so it is safe on a local socket; tls-net never writes it to disk. `rotate_now` replaces the current key with a random one and drops the previous key, so every outstanding ticket needs a full handshake (for a suspected key compromise); it returns the epoch and is refused for `Derived` rings, whose keys come from the shared root (D-086). Cost: an export is 10 bytes of header plus 65 bytes sealed plus a 16-byte tag; import and export take the ring's write lock once (about a microsecond, an estimate).
+For restarts that hand the listening sockets to a new process: the old process exports, the new one imports, and resumption survives. Only `Ratchet` rings export and import; `Ephemeral` has nothing worth keeping and `Derived` processes already share their root, so both return `PolicyInvalid` (D-085). `TlsServer::ticket_keys()` returns the handle, `None` when tickets are off. `import_sealed` refuses an export older than the importer's epoch minus one or newer than its epoch plus one, a mode or period mismatch, a wrong wrap key, and any tampering (T-24, D-130). The export is AEAD-sealed, so it is safe on a local socket; tls-net never writes it to disk. `rotate_now` replaces the current key with a random one and drops the previous key, so every outstanding ticket needs a full handshake (for a suspected key compromise); it returns the epoch and is refused for `Derived` rings, whose keys come from the shared root (D-086). Cost: an export is 18 bytes of header plus 65 bytes sealed plus a 16-byte tag; import and export take the ring's write lock once (about a microsecond, an estimate).
 
 ---
 
@@ -1329,7 +1330,7 @@ impl<'a> ClientHelloView<'a> {
     pub fn server_name(&self) -> Option<&'a str>;                           // validated LDH ASCII, as sent, one record
     pub fn has_server_name(&self) -> bool;
     pub fn normalized_server_name(&self) -> Option<NormalizedName>;         // FR-17, across records
-    pub fn server_name_raw(&self) -> Option<&'a [u8]>;                      // P2: bytes as sent, for forensics
+    pub fn server_name_raw(&self) -> Option<&'a [u8]>;                      // P2 0.9: bytes as sent, for forensics
     pub fn alpn(&self) -> impl Iterator<Item = &'a [u8]> + 'a;              // names inside one record
     pub fn has_alpn(&self) -> bool;
     pub fn groups(&self) -> impl Iterator<Item = u16> + 'a;
@@ -1358,6 +1359,7 @@ pub fn normalize_server_name(name: &str) -> Option<NormalizedName>;   // the FR-
 pub struct Ja4([u8; 36]);
 impl Ja4 {
     pub fn compute(view: &ClientHelloView<'_>) -> Ja4;
+    pub fn parse(s: &str) -> Option<Ja4>;                // P1 0.9: for configured refusal lists
     pub fn as_str(&self) -> &str;
 }
 impl fmt::Display for Ja4 { /* as_str */ }

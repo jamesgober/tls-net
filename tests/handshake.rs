@@ -527,3 +527,28 @@ fn test_hello_record_version_0x0300_completes_d110() {
     assert!(c.complete && s.complete, "{:?} {:?}", s.error, c.error);
     assert_eq!(ss.info().unwrap().version, Version::Tls13);
 }
+
+#[test]
+fn test_publish_changes_the_handshake_limit() {
+    // The gate is the server's, but its limit follows each publish: 0
+    // drains, a higher limit lets a spike through (D-132).
+    let server = site()
+        .limits(HandshakeLimits::server().max_in_progress(10).unwrap())
+        .build()
+        .unwrap();
+    let held = server.accept().unwrap();
+    server
+        .reload_handle()
+        .publish(site().limits(HandshakeLimits::server().max_in_progress(0).unwrap()))
+        .unwrap();
+    assert_eq!(server.accept().unwrap_err(), TlsError::HandshakeCapacity);
+    drop(held);
+    server
+        .reload_handle()
+        .publish(site().limits(HandshakeLimits::server().max_in_progress(2).unwrap()))
+        .unwrap();
+    let (a, b) = (server.accept().unwrap(), server.accept().unwrap());
+    assert_eq!(server.accept().unwrap_err(), TlsError::HandshakeCapacity);
+    drop((a, b));
+    assert_eq!(server.stats().in_progress, 0);
+}

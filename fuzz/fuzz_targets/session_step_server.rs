@@ -1,7 +1,8 @@
 #![no_main]
 
 //! Arbitrary bytes as ciphertext into a server session, split into chunks
-//! chosen by the first byte: never panics, budgets hold.
+//! chosen by the first byte: never panics, budgets hold. `encrypt` and
+//! `close` are called between chunks too (D-126).
 
 use std::sync::OnceLock;
 
@@ -39,5 +40,7 @@ fuzz_target!(|data: &[u8]| {
                 Err(_) => return,
             }
         }
+        let _ = session.encrypt(b"x", &mut out);
     }
+    let _ = session.close(&mut out);
 });

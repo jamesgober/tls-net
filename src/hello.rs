@@ -106,6 +106,24 @@ impl HelloLimits {
     setter!(/// Most key shares, 1 to 16.
         max_key_shares: u8, 1, 16, "max_key_shares must be 1 to 16");
 
+    /// Every limit held to its setter's range. The fields are public, so a
+    /// caller can assign one outside it; the parser's fixed arrays (128
+    /// extensions, 1,024 suites) must never see such a value (D-128).
+    #[must_use]
+    pub(crate) fn clamped(self) -> Self {
+        HelloLimits {
+            max_hello_bytes: self.max_hello_bytes.clamp(512, 65_535),
+            max_records: self.max_records.clamp(1, 16),
+            max_ciphers: self.max_ciphers.clamp(1, 1024),
+            max_extensions: self.max_extensions.clamp(1, 128),
+            max_alpn: self.max_alpn.clamp(1, 64),
+            max_groups: self.max_groups.clamp(1, 128),
+            max_signature_algorithms: self.max_signature_algorithms.clamp(1, 128),
+            max_key_shares: self.max_key_shares.clamp(1, 16),
+            refuse_malformed: self.refuse_malformed,
+        }
+    }
+
     /// Whether to refuse a hello the parser rejects (on by default). Off lets
     /// it continue to rustls without a fingerprint: for emergencies only.
     #[must_use]
@@ -158,6 +176,7 @@ impl HelloParser {
     /// (`TLS-0031`); `HelloTooLarge`, `HelloTooFragmented`,
     /// `HelloOverBudget` (`TLS-0032`).
     pub fn parse<'a>(input: &'a [u8], limits: &HelloLimits) -> Result<HelloParse<'a>, TlsError> {
+        let limits = &limits.clamped();
         let max_records = usize::from(limits.max_records).min(MAX_SEGMENTS);
         let mut segs: [&'a [u8]; MAX_SEGMENTS] = [&[]; MAX_SEGMENTS];
         let mut nseg = 0usize;
@@ -755,6 +774,15 @@ impl<'a> ClientHelloView<'a> {
             .flatten()
     }
 
+    /// The SNI bytes exactly as sent, for forensics, when they sit in one
+    /// record. Peer-controlled and unchecked: escape them before logging
+    /// (T-20); for decisions use [`normalized_server_name`](Self::normalized_server_name).
+    #[must_use]
+    pub fn server_name_raw(&self) -> Option<&'a [u8]> {
+        let span = self.server_name?;
+        self.stream.slice(span.pos(), span.len())
+    }
+
     /// Whether the hello carries a `server_name` extension.
     #[must_use]
     pub fn has_server_name(&self) -> bool {
@@ -1007,6 +1035,42 @@ pub(crate) mod tests {
             }
             HelloParse::Incomplete { needed } => panic!("incomplete, needs {needed}"),
         }
+    }
+
+    #[test]
+    fn test_server_name_raw_is_the_bytes_as_sent() {
+        let records = HelloBuilder::new().sni(b"Web_01.Example.").records(16_000);
+        let Ok(HelloParse::Complete { view, .. }) =
+            HelloParser::parse(&records, &HelloLimits::new())
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(view.server_name_raw(), Some(&b"Web_01.Example."[..]));
+        // The checked forms refuse the underscore.
+        assert_eq!(view.server_name(), None);
+        let none = HelloBuilder::new().records(16_000);
+        let Ok(HelloParse::Complete { view, .. }) = HelloParser::parse(&none, &HelloLimits::new())
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(view.server_name_raw(), None);
+    }
+
+    #[test]
+    fn test_limit_assigned_out_of_range_is_held_to_its_range() {
+        // The fields are public: an assignment skips the setter's check. The
+        // parser must not index past its 128-entry extension array (D-128).
+        let mut limits = HelloLimits::new();
+        limits.max_extensions = 200;
+        let mut b = HelloBuilder::new();
+        for typ in 0..129u16 {
+            b = b.ext(0xfe00 + typ, Vec::new());
+        }
+        let records = b.records(16_000);
+        assert!(matches!(
+            HelloParser::parse(&records, &limits),
+            Err(TlsError::HelloOverBudget { .. })
+        ));
     }
 
     #[test]

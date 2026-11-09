@@ -159,10 +159,12 @@ pub(crate) struct CertFacts<'a> {
 }
 
 /// What an OCSP response says about its first certificate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OcspFacts {
     /// `certStatus` is `good`.
     pub(crate) good: bool,
+    /// The serial number in the first response's `certID`.
+    pub(crate) serial: Vec<u8>,
     pub(crate) this_update: SystemTime,
     pub(crate) next_update: Option<SystemTime>,
 }
@@ -190,7 +192,12 @@ pub(crate) fn ocsp_facts(der: &[u8]) -> Option<OcspFacts> {
     data.expect(GENERALIZED_TIME)?; // producedAt
     let mut responses = Reader::new(data.expect(SEQUENCE)?);
     let mut single = Reader::new(responses.expect(SEQUENCE)?);
-    single.expect(SEQUENCE)?; // certID
+    // certID: hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber.
+    let mut cert_id = Reader::new(single.expect(SEQUENCE)?);
+    cert_id.expect(SEQUENCE)?;
+    cert_id.expect(OCTET_STRING)?;
+    cert_id.expect(OCTET_STRING)?;
+    let serial = cert_id.expect(INTEGER)?.to_vec();
     let status = single.next()?;
     let this_update = time(single.next()?)?;
     let next_update = match single.optional(0xa0) {
@@ -199,6 +206,7 @@ pub(crate) fn ocsp_facts(der: &[u8]) -> Option<OcspFacts> {
     };
     Some(OcspFacts {
         good: status.tag == 0x80,
+        serial,
         this_update,
         next_update,
     })
@@ -355,20 +363,28 @@ fn names<'a>(value: &'a [u8], facts: &mut CertFacts<'a>) -> Option<()> {
         if count > MAX_NAMES {
             return None;
         }
+        // A name tls-net cannot read is skipped, not the certificate: a
+        // verifier that never parses SANs (an unconstrained client CA) can
+        // accept it, and the identity's key hash is still sound (D-134). A
+        // skipped name is never registered or matched, so this fails closed.
         match name.tag {
-            0x82 => facts.dns_names.push(std::str::from_utf8(name.value).ok()?),
-            0x86 => facts.uri_names.push(std::str::from_utf8(name.value).ok()?),
-            0x87 => match name.value.len() {
-                4 => {
-                    let b: [u8; 4] = name.value.try_into().ok()?;
+            0x82 => {
+                if let Ok(dns) = std::str::from_utf8(name.value) {
+                    facts.dns_names.push(dns);
+                }
+            }
+            0x86 => {
+                if let Ok(uri) = std::str::from_utf8(name.value) {
+                    facts.uri_names.push(uri);
+                }
+            }
+            0x87 => {
+                if let Ok(b) = <[u8; 4]>::try_from(name.value) {
+                    facts.ip_addresses.push(IpAddr::from(b));
+                } else if let Ok(b) = <[u8; 16]>::try_from(name.value) {
                     facts.ip_addresses.push(IpAddr::from(b));
                 }
-                16 => {
-                    let b: [u8; 16] = name.value.try_into().ok()?;
-                    facts.ip_addresses.push(IpAddr::from(b));
-                }
-                _ => return None,
-            },
+            }
             _ => {}
         }
     }
@@ -463,6 +479,33 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unreadable_name_is_skipped_not_the_certificate() {
+        // SEQUENCE { iPAddress of 8 bytes, dNSName not UTF-8, dNSName "a.test" } (D-134)
+        let mut seq = vec![0x87, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0x82, 2, 0xff, 0xfe];
+        seq.extend([0x82, 6]);
+        seq.extend(b"a.test");
+        let mut value = vec![0x30, u8::try_from(seq.len()).unwrap()];
+        value.extend(seq);
+        let mut facts = CertFacts {
+            serial: &[],
+            issuer: &[],
+            subject: &[],
+            not_before: SystemTime::UNIX_EPOCH,
+            not_after: SystemTime::UNIX_EPOCH,
+            spki: &[],
+            key: KeyAlg::Other,
+            weak_signature: false,
+            dns_names: Vec::new(),
+            ip_addresses: Vec::new(),
+            uri_names: Vec::new(),
+            eku: None,
+        };
+        assert!(names(&value, &mut facts).is_some());
+        assert_eq!(facts.dns_names, ["a.test"]);
+        assert!(facts.ip_addresses.is_empty());
+    }
 
     fn der(name: &str) -> Vec<u8> {
         let pem = std::fs::read(format!(

@@ -29,9 +29,9 @@ use crate::verify::{Crls, PinnedServer, Pins, RevocationPolicy};
 /// ```
 #[derive(Clone)]
 pub struct TrustAnchors {
-    roots: Arc<RootCertStore>,
+    pub(crate) roots: Arc<RootCertStore>,
     /// Verify with the operating system instead (feature `platform-verifier`).
-    platform: bool,
+    pub(crate) platform: bool,
 }
 
 impl fmt::Debug for TrustAnchors {
@@ -225,10 +225,20 @@ struct Inner {
     algs: rustls::crypto::WebPkiSupportedAlgorithms,
     limits: HandshakeLimits,
     provider_name: &'static str,
-    trust: Option<TrustAnchors>,
-    crls: Option<(Crls, RevocationPolicy)>,
+    /// The anchors' chain verifier (webpki with the CRLs, or the platform's),
+    /// for pinned identities that also require a chain (D-133).
+    chain: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    /// One configuration per pin set, so a pinned identity resumes: rustls
+    /// resumes only with the verifier that made the session (D-133).
+    pinned: std::sync::Mutex<Vec<PinnedConfig>>,
     obs: Arc<Observation>,
 }
+
+/// A pin set (sorted), whether it requires a chain, and its configuration.
+type PinnedConfig = (Vec<[u8; 32]>, bool, Arc<rustls::ClientConfig>);
+
+/// The most pinned configurations a client keeps (the oldest goes first).
+const PINNED_CONFIGS: usize = 16;
 
 /// One client certificate for mutual TLS.
 #[derive(Debug)]
@@ -351,25 +361,7 @@ impl TlsClient {
                 if *require_chain && !self.inner.anchors {
                     return Err(no_anchors);
                 }
-                // One configuration for this connection; the resumption store
-                // is shared with the client (it sits behind an Arc).
-                let inner = match (&self.inner.trust, *require_chain) {
-                    (Some(anchors), true) => Some(crate::verify::server_verifier(
-                        anchors,
-                        self.inner.crls.as_ref(),
-                        self.inner.config.crypto_provider(),
-                    )?),
-                    _ => None,
-                };
-                let mut config = (*self.inner.config).clone();
-                config
-                    .dangerous()
-                    .set_certificate_verifier(Arc::new(PinnedServer {
-                        inner,
-                        pins: Pins(spki_sha256.clone()),
-                        algs: self.inner.algs,
-                    }));
-                Arc::new(config)
+                self.pinned_config(spki_sha256, *require_chain)
             }
             _ if !self.inner.anchors => return Err(no_anchors),
             _ => Arc::clone(&self.inner.config),
@@ -383,6 +375,45 @@ impl TlsClient {
             &self.inner.limits,
             Arc::clone(&self.inner.obs),
         ))
+    }
+
+    /// The configuration for a pin set: kept, so a second connection to the
+    /// same pinned identity resumes. The resumption store is the client's
+    /// (it sits behind an Arc), and the chain verifier is the one the client
+    /// was built with, the platform's included.
+    fn pinned_config(&self, pins: &[[u8; 32]], require_chain: bool) -> Arc<rustls::ClientConfig> {
+        let mut key = pins.to_vec();
+        key.sort_unstable();
+        key.dedup();
+        let mut cache = self
+            .inner
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, _, config)) = cache
+            .iter()
+            .find(|(k, chain, _)| *k == key && *chain == require_chain)
+        {
+            return Arc::clone(config);
+        }
+        let mut config = (*self.inner.config).clone();
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(PinnedServer {
+                inner: if require_chain {
+                    self.inner.chain.clone()
+                } else {
+                    None
+                },
+                pins: Pins(key.clone()),
+                algs: self.inner.algs,
+            }));
+        let config = Arc::new(config);
+        if cache.len() == PINNED_CONFIGS {
+            cache.remove(0);
+        }
+        cache.push((key, require_chain, Arc::clone(&config)));
+        config
     }
 
     /// A session that starts TLS after a plaintext phase (STARTTLS).
@@ -575,7 +606,7 @@ impl ClientBuilder {
                 reason: "the provider cannot do these versions",
             })?;
         let anchors = self.trust.is_some();
-        let builder = match &self.trust {
+        let chain: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>> = match &self.trust {
             #[cfg(feature = "platform-verifier")]
             Some(anchors) if anchors.is_platform() => {
                 if self.crls.is_some() {
@@ -588,19 +619,18 @@ impl ClientBuilder {
                         reason: "the platform verifier is not available",
                     },
                 )?;
-                builder
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(v))
+                Some(Arc::new(v))
             }
-            Some(anchors) => builder.with_webpki_verifier(crate::verify::server_verifier(
+            Some(anchors) => Some(crate::verify::server_verifier(
                 anchors,
                 self.crls.as_ref(),
                 &provider,
             )?),
-            None => builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoAnchors(algs))),
+            None => None,
         };
+        let builder = builder.dangerous().with_custom_certificate_verifier(
+            chain.clone().unwrap_or_else(|| Arc::new(NoAnchors(algs))),
+        );
         let mut config = match self.certificate {
             Some(entry) => builder
                 .with_client_cert_resolver(Arc::new(OneClientCert(Arc::clone(&entry.certified)))),
@@ -634,8 +664,8 @@ impl ClientBuilder {
                 algs,
                 limits: self.limits,
                 provider_name,
-                trust: self.trust,
-                crls: self.crls,
+                chain,
+                pinned: std::sync::Mutex::new(Vec::new()),
                 obs: Arc::new(Observation::new(self.observer, 0)),
             }),
         })

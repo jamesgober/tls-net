@@ -80,8 +80,12 @@ Exit (D-039): the consumers' shapes run in this repository against real binaries
 - [x] Finding D-120 fixed: net-io's `TlsInfo` carries the verified client key hash, so a back-channel server can tell its peers apart (D-122).
 - [x] API changes only from findings, each logged: none in tls-net's API; D-122 sets one more net-io field.
 
-## v0.9.0 - Beta
+## v0.9.0 - Beta (DONE, 2026-11-08)
 Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with exporters and channel binding (D-052); adversarial review in a dedicated session with every finding fixed test-first; API review against `docs/API.md`; `docs/OPERATIONS.md` and `docs/PLATFORM-NOTES.md` complete. API frozen at 0.9.0.
+- [x] rustls 0.24: not released as stable (0.24.0-dev.2 only); 0.9 stays on 0.23.46, exporters and channel binding come with 0.24 as additive API (D-124).
+- [x] Adversarial review, every finding fixed test-first: three independent reviewers by area, two high, two medium, nine low, all fixed (D-125 to D-137, T-29, T-30; `docs/SECURITY.md`).
+- [x] API review against `docs/API.md`: every public item documented and every documented item present except the exporters (D-124); `Ja4::parse` replaces an undocumented `Ja4::from_str`, `ClientHelloView::server_name_raw` added (D-138).
+- [x] `docs/OPERATIONS.md` and `docs/PLATFORM-NOTES.md` complete (resumption and reloads, the internal preset, hand-off clocks, pinned identities on platform anchors).
 
 ## v0.9.x - Pre-1.0 polish
 Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by item, what is met and what still needs James.

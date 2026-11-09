@@ -36,6 +36,9 @@ What a reload guarantees:
 - The new configuration is built and checked completely before anything changes. On any failure the old configuration stays, the call returns `ReloadRefused` (`TLS-0021`) with the cause as its source, and observers get `ReloadRefused`.
 - Handshakes already running finish with the configuration they started with; new handshakes get the new one from the next `accept`.
 - Ticket keys and the session cache carry over, so clients keep resuming across a reload. The ticket mode is fixed for the server's lifetime.
+- Resumption is bound to each host group's client-authentication rules (mode, anchors, pins, CRLs). A publish that changes them ends resumption for that group: each of its clients makes one full handshake, and a session made under the old rules never resumes under the new ones (D-125). Publishing new CRLs therefore takes effect for resumed clients at once, at the cost of one full handshake each.
+- A certificate added with `certificate_for` keeps its names through `reload_from_*`; it does not become the default (D-136).
+- `HandshakeLimits::max_in_progress` follows each publish: publish 0 to drain, a higher value to let a spike through (D-132).
 - `publish` returns the new version, the number of certificates, and how many of them are already in `Warn` or worse; log all three. An expired or not-yet-valid certificate is refused (`TLS-0017`); one that is only close to expiry loads, since refusing it would leave the older one in place, and `expiring` says so.
 
 Cost: building 100 ECDSA certificates takes about 2 ms; the swap about 25 ns (`docs/PERFORMANCE.md`).
@@ -72,7 +75,7 @@ Hand-off across a restart with `Ratchet`:
 
 1. The new process starts and receives the listening sockets.
 2. The old process calls `export_sealed(&wrap_key)` and sends the bytes over a local socket. The export is sealed and authenticated; tls-net never writes it to disk.
-3. The new process calls `import_sealed(&wrap_key, bytes)`. An export more than one epoch old, from another mode, under another wrap key, or altered in any byte is refused (T-24).
+3. The new process calls `import_sealed(&wrap_key, bytes)`. An export more than one epoch older or newer than the new process's clock, from another mode or ticket period, under another wrap key, or altered in any byte is refused (T-24). Keep the period the same across a hand-off; an export from tls-net 0.8 or older is refused by 0.9, so that one restart costs each client a full handshake.
 4. The old process drains and exits.
 
 The wrap key must reach both processes outside this path, for example from key-vault or a file readable only by the service account.
@@ -87,7 +90,7 @@ If a ticket key may have leaked, call `ticket_keys().rotate_now()`: the current 
 |---|---|---|---|---|
 | `Policy::compatible()` (server default) | TLS 1.3, TLS 1.2 | ECDHE with AES-GCM or ChaCha20, extended master secret required | X25519MLKEM768, X25519, P-256, P-384 | public listeners |
 | `Policy::modern()` | TLS 1.3 | none | same | public listeners whose clients all speak TLS 1.3 |
-| `Policy::internal()` | TLS 1.3 | none | X25519MLKEM768 only | service-to-service links; client certificates required; no tickets |
+| `Policy::internal()` | TLS 1.3 | none | X25519MLKEM768 only | service-to-service links; `build` requires `ClientAuth::required` or `pinned` (D-131); no tickets |
 | `Policy::fips()` | TLS 1.3, TLS 1.2 | AES-GCM only | P-256, P-384, ML-KEM hybrids from the FIPS module | builds with feature `fips` |
 
 Nothing weaker than these can be configured: rustls has no CBC, static RSA, finite-field DHE, compression, or renegotiation, and tls-net's enums name nothing outside the presets. Start public listeners on `compatible`, then move to `modern` when the counters below say it is safe.

@@ -1,6 +1,7 @@
 #![no_main]
 
-//! Arbitrary bytes as the server's reply into a client session.
+//! Arbitrary bytes as the server's reply into a client session; `encrypt`
+//! and `close` are called between steps too (D-126).
 
 use std::sync::OnceLock;
 
@@ -23,7 +24,9 @@ fuzz_target!(|data: &[u8]| {
             Ok(p) => {
                 let (consumed, need) = (p.consumed, matches!(p.event, Event::NeedInput));
                 input.drain(..consumed);
+                let _ = session.encrypt(b"x", &mut out);
                 if need && consumed == 0 {
+                    let _ = session.close(&mut out);
                     return;
                 }
             }

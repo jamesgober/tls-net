@@ -1,6 +1,6 @@
 # tls-net - Security
 
-> The threat model, every threat with its defence, its test, and its cost; where tls-net is deliberately stricter than the RFCs; and the 0.7 hardening record (threat audit, fuzz campaign, soak, conformance runs, Miri). Every threat T-1 to T-28 has an attack test. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md) section 8 and the decision log.
+> The threat model, every threat with its defence, its test, and its cost; where tls-net is deliberately stricter than the RFCs; and the 0.7 hardening record (threat audit, fuzz campaign, soak, conformance runs, Miri). Every threat T-1 to T-30 has an attack test. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md) section 8 and the decision log.
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -12,6 +12,7 @@
 - [Threat model](#threat-model)
 - [Threats, defences, tests, costs](#threats-defences-tests-costs)
 - [Hardening record (0.7)](#hardening-record-07)
+- [Adversarial review (0.9)](#adversarial-review-09)
 - [Where tls-net is stricter than the RFCs](#where-tls-net-is-stricter-than-the-rfcs)
 - [What tls-net does not defend against](#what-tls-net-does-not-defend-against)
 
@@ -55,7 +56,7 @@ Costs are per handshake or per record unless stated; measured values are from `d
 | T-6 | Wrong or misissued server certificate | rustls-webpki path validation and name check; optional CRLs; pins | `tests/handshake.rs` (wrong name, unknown root); `tests/attacks.rs` (`test_t6_*`: expired, self-signed, revoked by CRL against a CRL-free control) | rustls's [est. tens to hundreds of µs per chain] |
 | T-6b | Pin bypass by a verifier that skips signature checks | the pinned verifier calls rustls's signature verification; constant-time pin comparison | `tests/extended.rs` (`test_t6b_*`: the pinned certificate signed with another key is refused) | one signature verification, as without pinning |
 | T-7 | Renegotiation and the triple handshake | rustls does not renegotiate; extended master secret required for TLS 1.2 | `tests/attacks.rs` (`test_t7_*`: a TLS 1.2 client without EMS is refused). A renegotiation attempt cannot be produced against tls-net: tlsfuzzer's renegotiation script sends no EMS and is refused first; rustls has no renegotiation code to reach | 0 |
-| T-8 | Private key leakage through logs, errors, dumps, freed memory | key-vault custody; PEM and DER buffers wiped; no key or ticket secret in any `Debug` or `Display`; key file permission check (Unix); key log absent by default and refused with FIPS | `tests/complete.rs` (`test_t8_*`: the `Debug` of every type that can hold key material, and the key errors' `Display`, scanned for the test key and a known ticket seed, raw, hex, and listed); `src/pem.rs` (a world-readable key file is refused) | vault access 34 to 157 ns; per-signature custody about the same handshake rate as resident keys |
+| T-8 | Private key leakage through logs, errors, dumps, freed memory | key-vault custody; tls-net's PEM and DER buffers wiped, and a key file's buffer never reallocated (the PEM decoder's own scratch is not wiped, D-135); no key or ticket secret in any `Debug` or `Display`; key file permission check (Unix); key log absent by default and refused with FIPS | `tests/complete.rs` (`test_t8_*`: the `Debug` of every type that can hold key material, and the key errors' `Display`, scanned for the test key and a known ticket seed, raw, hex, and listed); `src/pem.rs` (a world-readable key file is refused) | vault access 34 to 157 ns; per-signature custody about the same handshake rate as resident keys |
 | T-9 | Weak or wrong server configuration shipped | validation at load (key strength, signature algorithm, key match, chain order, expiry, purpose, names); reload refuses rather than degrades | `tests/attacks.rs` (`test_t9_*`: RSA-1024, SHA-1, mismatched key, reversed chain, expired, client-only purpose, P-521, wrong name: each its named error) | build time only |
 | T-10 | 0-RTT replay | no early data: tickets carry `max_early_data_size` 0 | `tests/extended.rs` (`test_t10_*`: a rustls client with early data enabled resumes and has no 0-RTT window; data sent after the handshake arrives once) | 0 |
 | T-11 | Resumption linkability and ticket-key compromise | `psk_dhe_ke` only; two-epoch ring; the ratchet cannot recompute old keys; per-client ticket stores | `src/tickets.rs` (epoch e-2 refused; a ratchet ticket unreadable after two rotations even with the current key); `tests/attacks.rs` (`test_t11_*`: two clients never resume with each other's tickets) | seal 1.6 µs, open 1.5 µs; 49 bytes per ticket |
@@ -76,6 +77,8 @@ Costs are per handshake or per record unless stated; measured values are from `d
 | T-26 | Legacy attack classes (BEAST, POODLE, Lucky13, CRIME, FREAK, Logjam, Raccoon, ROBOT, Sweet32, Heartbleed, DROWN) | the features they need do not exist in rustls | testssl.sh vulnerability checks in the conformance workflow (weekly): every one "not vulnerable" | 0 |
 | T-27 | Memory exhaustion through half-open handshakes | capacity cap; handshake byte budget; no rustls connection until a whole hello has arrived; net-io's buffer limits and deadline | `tests/complete.rs` (`test_t27_*`: 10,000 one-byte half-open connections); `tests/alloc.rs` (`test_t27_*`: `accept` plus a one-byte `step` allocates nothing) | the session's inline size, under 2 KiB, per half-open connection |
 | T-28 | Process-wide provider confusion | tls-net never reads or installs the process default | `tests/provider.rs` (`test_t28_*`: after another crate installs a secp384r1-only default, tls-net still negotiates X25519MLKEM768) | 0 |
+| T-29 | A post-handshake message split over records to crash the session | while rustls holds part of a message, `encrypt` and `close` wait for `step` instead of calling rustls on an empty buffer (D-126) | `tests/attacks.rs` (`test_t29_*`: a ticket in 64-byte records; `encrypt` and `close` return `WrongState`, then work once the rest arrives) | one header check per `step` |
+| T-30 | Resumption past a client-authentication change, or past the client certificate's expiry | tickets and cached sessions are bound to the group's client-auth rules; a resumed handshake is refused without a required certificate or with an expired one (D-125) | `tests/attacks.rs` (`test_t30_*`: required auth published after an anonymous session, with tickets and with the cache; a removed pin); `src/server.rs` (`test_resumed_client_certificate_checked_for_expiry`) | 32 bytes more associated data per ticket; 1 to 2 µs per resumed handshake with a client certificate (estimate) |
 
 ---
 
@@ -130,6 +133,30 @@ RSS rose 4.1 MB over the first four and a half hours, more slowly each hour, the
 **Miri.** The library tests that need no crypto provider (parsers, PEM intake, SNI, fingerprints, tickets, snapshot, expiry, errors: 66 tests) run under Miri in CI with no undefined behaviour reported (D-112). The providers are C and assembly, which Miri cannot execute.
 
 **loom.** The capacity gate, the configuration snapshot, and the ticket ring are model-checked with loom in CI (NFR-20), including the 0.6 change to the capacity slot (D-102).
+
+---
+
+## Adversarial review (0.9)
+
+Three reviewers read the source with no access to the author's notes, each over one area: the code that takes bytes from the network (sessions, the net-io seam, the hello parser); tickets, verifiers, and certificate and key intake; and server and client configuration (reload, the handshake gate, SNI, policies, observers). Each finding was reproduced with a test that fails on 0.8.0 before it was fixed, except where noted.
+
+| Finding | Severity | Fix |
+|---|---|---|
+| A peer could make `encrypt` or `close` panic, in release builds too, by sending one valid record holding part of a post-handshake message (a ticket or key update): rustls kept the part in the caller's input and was then called on an empty buffer. net-io calls `close` on every graceful close | high | D-126, T-29 |
+| Resumption skipped client authentication: rustls does not ask for a certificate on resumption, so after a publish that required client certificates, dropped a pin, or added a CRL, old sessions still resumed; and an identity carried in tickets never expired | high | D-125, T-30 |
+| `refuse_malformed(false)`, which a peer reaches by going over a budget, also skipped the hello hook, host groups, and a required ALPN; and a second hello after a HelloRetryRequest could drop ALPN (no available client does this and still completes, so that path is covered by the completion check without a test of its own) | medium | D-127 |
+| A ticket-key export from another period, or from a clock running ahead, froze key rotation | medium | D-130 |
+| `HelloLimits` fields assigned directly could index past the parser's fixed arrays | low | D-128 |
+| `close` into a short buffer lost close_notify; records queued by `step` could be lost by `encrypt`; a hello over several records asked net-io for one record's room | low | D-129 |
+| `Policy::internal()` let anonymous clients in; CRLs without anchors were never checked | low | D-131 |
+| `publish` ignored a new `max_in_progress`; the SNI counter reset on reload; setting only the gate cut the client-auth budget | low | D-132 |
+| Pinned client identities never resumed, and failed with platform anchors | low | D-133 |
+| A verified client certificate with one name tls-net could not read got no identity | low | D-134 |
+| A key read from a FIFO left unwiped copies in freed memory; the PEM decoder's scratch was described as wiped | low | D-135 |
+| `reload_from_*` made a `certificate_for` entry the default | low | D-136 |
+| OCSP staples went to every certificate for a name, not the one they are for | low | D-137 |
+
+What held, in the reviewers' words condensed: offsets and budgets in the session and the parser; data never handed out before completion or after a failure; the ticket construction (fresh nonces, bound epochs, only two epochs open, nothing printed); constant-time pin comparison over the full SPKI; the verified end-entity as the only source of a peer identity; reload built completely before the swap; the capacity gate released on every path; SNI normalisation and one-label wildcards; presets that cannot weaken; STARTTLS leftovers refused; nothing secret or unescaped in events and errors.
 
 ---
 

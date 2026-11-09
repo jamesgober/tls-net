@@ -2,7 +2,11 @@
 //!
 //! tls-net adds the size gate, the Unix permission check, a label scan (so an
 //! encrypted key is named rather than reported as "no key"), and key
-//! counting. Every buffer that holds key bytes is wiped when dropped.
+//! counting. Every buffer tls-net reads or decodes key bytes into is wiped
+//! when dropped, and a key file's buffer never grows (so no copy is freed
+//! unwiped). The PEM decoder in rustls-pki-types has scratch buffers of its
+//! own that it frees without wiping; `KeySource::Vault` keeps the key out of
+//! this process's ordinary memory altogether (D-135).
 
 use std::fs::File;
 use std::io::Read;
@@ -70,7 +74,15 @@ pub(crate) fn read_file(
     if is_key && !allow_group_readable {
         check_permissions(path, &meta)?;
     }
-    let mut buf = Zeroizing::new(Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0)));
+    // A key file's buffer is sized for the limit up front: a FIFO or procfs
+    // path reports length 0, and growing the buffer would free copies of the
+    // key that are never wiped (D-135).
+    let capacity = if is_key {
+        limit as usize + 1
+    } else {
+        usize::try_from(meta.len()).unwrap_or(0)
+    };
+    let mut buf = Zeroizing::new(Vec::with_capacity(capacity));
     // Bounded by the same limit in case the file grew after the metadata call.
     file.take(u64::from(limit) + 1)
         .read_to_end(&mut buf)
@@ -203,6 +215,17 @@ fn labels(pem: &[u8]) -> impl Iterator<Item = &[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_key_file_buffer_sized_before_the_read() {
+        // A path that reports length 0 (a FIFO, procfs) must not make the
+        // buffer grow: each reallocation would free an unwiped copy (D-135).
+        let path =
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/site.key"));
+        let buf = read_file(&path, 4096, true, true).unwrap();
+        assert_eq!(buf.capacity(), 4097);
+        assert!(buf.starts_with(b"-----BEGIN"));
+    }
 
     fn data(name: &str) -> Vec<u8> {
         std::fs::read(format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()

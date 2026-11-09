@@ -960,3 +960,162 @@ fn test_t2_t4_internal_listener_refuses_tls12_and_x25519_only_peers() {
         assert_eq!(p.s.error, Some(TlsError::NoCommonGroup));
     }
 }
+
+#[test]
+fn test_settings_that_would_do_less_than_they_say_are_refused() {
+    // D-131: the internal preset is for links that authenticate the client,
+    // and CRLs without anchors would never be checked.
+    let refused = |b: ServerBuilder| matches!(b.build(), Err(TlsError::PolicyInvalid { .. }));
+    assert!(
+        refused(site().policy(Policy::internal())),
+        "internal without client auth"
+    );
+    assert!(refused(
+        site()
+            .policy(Policy::internal())
+            .client_auth(ClientAuth::optional(ca()))
+    ));
+    let crls = || tls_net::Crls::from_pem(&data("inter-empty.crl.pem")).unwrap();
+    let pin = [7u8; 32];
+    assert!(refused(site().client_auth(
+        ClientAuth::pinned(None, &[pin]).with_crls(crls(), tls_net::RevocationPolicy::default())
+    )));
+    assert!(refused(site().client_auth(
+        ClientAuth::none().with_crls(crls(), tls_net::RevocationPolicy::default())
+    )));
+    // With anchors the CRLs apply, and the build goes through.
+    assert!(
+        site()
+            .client_auth(
+                ClientAuth::pinned(Some(ca()), &[pin])
+                    .with_crls(crls(), tls_net::RevocationPolicy::default())
+            )
+            .build()
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_pinned_identity_resumes() {
+    // rustls resumes only with the verifier that made the session, so a
+    // pinned identity keeps one configuration per pin set (D-133).
+    let server = site()
+        .tickets(
+            TicketMode::Ephemeral {
+                period: Duration::from_secs(3600),
+            },
+            2,
+        )
+        .build()
+        .unwrap();
+    let client = ClientBuilder::new()
+        .trust(ca())
+        .resumption(8)
+        .build()
+        .unwrap();
+    let spki = {
+        let cert = CertificateDer::pem_slice_iter(&data("site.pem"))
+            .next()
+            .unwrap()
+            .unwrap();
+        tls_net::spki_sha256(cert.as_ref()).unwrap()
+    };
+    let kind = |require_chain: bool| {
+        let id = ServerIdentity::Pinned {
+            name: DnsName::new("localhost").unwrap(),
+            spki_sha256: vec![spki],
+            require_chain,
+        };
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (server.accept().unwrap(), client.connect_to(&id).unwrap());
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        assert!(c.complete, "{:?} {:?}", s.error, c.error);
+        ss.info().unwrap().kind
+    };
+    for require_chain in [true, false] {
+        assert_eq!(kind(require_chain), HandshakeKind::Full);
+        assert_eq!(
+            kind(require_chain),
+            HandshakeKind::Resumed,
+            "require_chain {require_chain}"
+        );
+    }
+}
+
+#[cfg(feature = "platform-verifier")]
+#[test]
+fn test_pinned_identity_with_platform_anchors() {
+    // A chain-checked pin uses the verifier the client was built with, the
+    // platform's included; it was refused as "anchors could not be used"
+    // (D-133).
+    let client = ClientBuilder::new()
+        .trust(TrustAnchors::platform())
+        .build()
+        .unwrap();
+    let id = ServerIdentity::Pinned {
+        name: DnsName::new("example.com").unwrap(),
+        spki_sha256: vec![[1; 32]],
+        require_chain: true,
+    };
+    assert!(client.connect_to(&id).is_ok());
+}
+
+#[test]
+fn test_reload_keeps_the_names_a_certificate_was_configured_for() {
+    // A certificate added with certificate_for serves only its names; a
+    // reload_from_pem must not turn it into the default for every name
+    // (D-136).
+    let server = TlsServer::builder()
+        .certificate_for(
+            &["api.other.test"],
+            &data("api.pem"),
+            KeySource::Pem(&data("api.key")),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let client = ClientBuilder::new().trust(ca()).build().unwrap();
+    let served = |name: &str| {
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (server.accept().unwrap(), client.connect(name).unwrap());
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        s.error.clone()
+    };
+    assert_eq!(served("api.other.test"), None);
+    assert_eq!(served("unknown.test"), Some(TlsError::UnknownServerName));
+    server
+        .reload_from_pem(&data("api.pem"), &data("api.key"))
+        .unwrap();
+    assert_eq!(served("api.other.test"), None);
+    assert_eq!(
+        served("unknown.test"),
+        Some(TlsError::UnknownServerName),
+        "the reload made the certificate the default"
+    );
+}
+
+#[test]
+fn test_ocsp_staple_goes_to_its_own_certificate() {
+    // site.ocsp is for site.pem. A server whose only certificate for the
+    // name is another one (here RSA) must not send it (D-137).
+    let rsa_only = TlsServer::builder()
+        .certificate(&data("site-rsa.pem"), KeySource::Pem(&data("site-rsa.key")))
+        .unwrap()
+        .ocsp_staple("localhost", &data("site.ocsp"))
+        .unwrap()
+        .build();
+    assert!(
+        matches!(rsa_only, Err(TlsError::PolicyInvalid { .. })),
+        "{rsa_only:?}"
+    );
+    // With both, the staple goes to site.pem and the build goes through.
+    assert!(
+        site()
+            .certificate(&data("site-rsa.pem"), KeySource::Pem(&data("site-rsa.key")))
+            .unwrap()
+            .ocsp_staple("localhost", &data("site.ocsp"))
+            .unwrap()
+            .build()
+            .is_ok()
+    );
+}
