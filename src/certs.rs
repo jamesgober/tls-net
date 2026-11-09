@@ -15,7 +15,9 @@ use crate::pem::{self, KeyDer};
 use crate::sni::{self, EntryKey};
 
 /// Where a private key comes from. Key bytes are never copied into a
-/// long-lived tls-net buffer, and every buffer tls-net decodes into is wiped.
+/// long-lived tls-net buffer, and every buffer tls-net reads or decodes into
+/// is wiped. The PEM decoder's own scratch buffers are not (D-135); use
+/// `Vault` to keep the key out of ordinary memory.
 ///
 /// ```
 /// use tls_net::KeySource;

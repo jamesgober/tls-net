@@ -480,7 +480,7 @@ impl ClientCertVerifier for PinnedClient {
 /// The client side: a pinned server identity (`ServerIdentity::Pinned`).
 #[derive(Debug)]
 pub(crate) struct PinnedServer {
-    pub(crate) inner: Option<Arc<WebPkiServerVerifier>>,
+    pub(crate) inner: Option<Arc<dyn ServerCertVerifier>>,
     pub(crate) pins: Pins,
     pub(crate) algs: WebPkiSupportedAlgorithms,
 }

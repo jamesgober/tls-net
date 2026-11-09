@@ -458,7 +458,7 @@ pub enum KeySource<'a> {
 pub enum KeyCustody { #[default] Resident, PerSignature }
 ```
 
-`KeySource` borrows; key bytes are never copied into a long-lived tls-net buffer, and every buffer tls-net decodes into is wiped. `Debug` prints only the variant name and, for files, the path.
+`KeySource` borrows; key bytes are never copied into a long-lived tls-net buffer, and every buffer tls-net reads or decodes into is wiped. The PEM decoder in rustls-pki-types frees scratch buffers of its own without wiping them; `KeySource::Vault` keeps the key out of ordinary memory altogether (D-135). `Debug` prints only the variant name and, for files, the path.
 
 - `Pem`: one key block (PKCS#8, PKCS#1 RSA, or SEC1 EC). `ENCRYPTED PRIVATE KEY` is refused with `EncryptedPrivateKey`.
 - `Der`: PKCS#8, PKCS#1, or SEC1 DER; the form is detected.

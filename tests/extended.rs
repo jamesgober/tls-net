@@ -994,3 +994,68 @@ fn test_settings_that_would_do_less_than_they_say_are_refused() {
             .is_ok()
     );
 }
+
+#[test]
+fn test_pinned_identity_resumes() {
+    // rustls resumes only with the verifier that made the session, so a
+    // pinned identity keeps one configuration per pin set (D-133).
+    let server = site()
+        .tickets(
+            TicketMode::Ephemeral {
+                period: Duration::from_secs(3600),
+            },
+            2,
+        )
+        .build()
+        .unwrap();
+    let client = ClientBuilder::new()
+        .trust(ca())
+        .resumption(8)
+        .build()
+        .unwrap();
+    let spki = {
+        let cert = CertificateDer::pem_slice_iter(&data("site.pem"))
+            .next()
+            .unwrap()
+            .unwrap();
+        tls_net::spki_sha256(cert.as_ref()).unwrap()
+    };
+    let kind = |require_chain: bool| {
+        let id = ServerIdentity::Pinned {
+            name: DnsName::new("localhost").unwrap(),
+            spki_sha256: vec![spki],
+            require_chain,
+        };
+        let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+        let (mut ss, mut cs) = (server.accept().unwrap(), client.connect_to(&id).unwrap());
+        pump(&mut ss, &mut s, &mut cs, &mut c);
+        assert!(c.complete, "{:?} {:?}", s.error, c.error);
+        ss.info().unwrap().kind
+    };
+    for require_chain in [true, false] {
+        assert_eq!(kind(require_chain), HandshakeKind::Full);
+        assert_eq!(
+            kind(require_chain),
+            HandshakeKind::Resumed,
+            "require_chain {require_chain}"
+        );
+    }
+}
+
+#[cfg(feature = "platform-verifier")]
+#[test]
+fn test_pinned_identity_with_platform_anchors() {
+    // A chain-checked pin uses the verifier the client was built with, the
+    // platform's included; it was refused as "anchors could not be used"
+    // (D-133).
+    let client = ClientBuilder::new()
+        .trust(TrustAnchors::platform())
+        .build()
+        .unwrap();
+    let id = ServerIdentity::Pinned {
+        name: DnsName::new("example.com").unwrap(),
+        spki_sha256: vec![[1; 32]],
+        require_chain: true,
+    };
+    assert!(client.connect_to(&id).is_ok());
+}
