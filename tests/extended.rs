@@ -1066,7 +1066,11 @@ fn test_reload_keeps_the_names_a_certificate_was_configured_for() {
     // reload_from_pem must not turn it into the default for every name
     // (D-136).
     let server = TlsServer::builder()
-        .certificate_for(&["api.other.test"], &data("api.pem"), KeySource::Pem(&data("api.key")))
+        .certificate_for(
+            &["api.other.test"],
+            &data("api.pem"),
+            KeySource::Pem(&data("api.key")),
+        )
         .unwrap()
         .build()
         .unwrap();

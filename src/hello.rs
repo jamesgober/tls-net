@@ -1040,7 +1040,8 @@ pub(crate) mod tests {
     #[test]
     fn test_server_name_raw_is_the_bytes_as_sent() {
         let records = HelloBuilder::new().sni(b"Web_01.Example.").records(16_000);
-        let Ok(HelloParse::Complete { view, .. }) = HelloParser::parse(&records, &HelloLimits::new())
+        let Ok(HelloParse::Complete { view, .. }) =
+            HelloParser::parse(&records, &HelloLimits::new())
         else {
             panic!("not parsed");
         };

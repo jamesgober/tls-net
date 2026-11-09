@@ -1394,15 +1394,18 @@ pub fn server_from_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
     use crate::{ClientBuilder, Event, HandshakeKind, TrustAnchors};
 
     pub(crate) static CLOCK_AHEAD: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
     fn data(name: &str) -> Vec<u8> {
         std::fs::read(format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
     /// Runs a server and a client session against each other in memory.
     fn handshake(server: &TlsServer, client: &crate::TlsClient) -> Result<HandshakeKind, TlsError> {
         let mut s = server.accept()?;
@@ -1438,6 +1441,7 @@ mod tests {
         s.info().map(|i| i.kind).ok_or(TlsError::WrongState)
     }
 
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
     #[test]
     fn test_resumed_client_certificate_checked_for_expiry() {
         // rustls carries the client chain in the ticket and issues fresh
@@ -1484,6 +1488,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "aws-lc", feature = "ring"))]
     #[test]
     fn test_client_auth_budget_survives_other_limits() {
         // Setting only the handshake limit leaves the budget at its default,
