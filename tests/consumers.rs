@@ -304,66 +304,90 @@ fn go_peer() -> std::path::PathBuf {
 
 // Back-channel.
 
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Answers a line with the principal net-io reports for the connection: the
+/// SHA-256 of the verified client key, as the application maps it.
 fn echo_line(conn: &mut TcpConnection) -> Result<(), NetError> {
     let mut buf = [0u8; 256];
     let n = conn.read(&mut buf)?;
-    let mut reply = b"ack ".to_vec();
+    let peer = conn
+        .info()
+        .tls
+        .as_deref()
+        .and_then(|t| t.peer_spki_sha256())
+        .map_or_else(|| "none".to_owned(), |h| hex(h));
+    let mut reply = format!("{peer} ").into_bytes();
     reply.extend_from_slice(&buf[..n]);
     conn.write_all(&reply)?;
     Ok(())
 }
 
-#[test]
-fn test_back_channel_pinned_client_key() {
-    // The server admits the one client key it pins (with the chain checked
-    // against the shared CA); the client pins the server's key. A client
-    // with another key, or none, is refused before any request.
+/// A back-channel server over net-io admitting the client keys it pins,
+/// with the chain checked against the shared CA.
+fn back_channel(pins: &[[u8; 32]]) -> (net_io::Server, SocketAddr) {
     let tls = TlsServer::builder()
         .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
         .unwrap()
-        .client_auth(ClientAuth::pinned(Some(trust()), &[spki("client.pem")]))
+        .client_auth(ClientAuth::pinned(Some(trust()), pins))
         .build()
         .unwrap();
     let server = ServerBuilder::new()
         .handler(echo_line)
         .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
         .workers(2)
-        .tls(tls.clone())
+        .tls(tls)
         .gate(AllowAll)
         .build()
         .expect("build");
     server.open_door().expect("open");
     let addr = server.listeners()[0].local.socket_addr().unwrap();
+    (server, addr)
+}
+
+fn ask_at(addr: SocketAddr, client: &TlsClient) -> Result<String, TlsError> {
     let to_server = ServerIdentity::Pinned {
         name: tls_net::DnsName::new("localhost").unwrap(),
         spki_sha256: vec![spki("site.pem")],
         require_chain: true,
     };
-    let ask = |client: &TlsClient| -> Result<String, TlsError> {
-        let session = client.connect_to(&to_server)?;
-        let mut c = TcpClient::new(TcpStream::connect(addr).unwrap(), session);
-        c.handshake()?;
-        c.write(b"status\n")?;
-        let got = c.read(1)?;
-        Ok(String::from_utf8_lossy(&got).into_owned())
-    };
-    let peer = ClientBuilder::new()
+    let session = client.connect_to(&to_server)?;
+    let mut c = TcpClient::new(TcpStream::connect(addr).unwrap(), session);
+    c.handshake()?;
+    c.write(b"status\n")?;
+    let got = c.read(1)?;
+    Ok(String::from_utf8_lossy(&got).into_owned())
+}
+
+fn client_with(cert: &str, key: &str) -> TlsClient {
+    ClientBuilder::new()
         .trust(trust())
-        .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
+        .client_certificate(&data(cert), KeySource::Pem(&data(key)))
         .unwrap()
         .build()
-        .unwrap();
-    assert_eq!(ask(&peer).unwrap(), "ack status\n");
+        .unwrap()
+}
+
+#[test]
+fn test_back_channel_pinned_client_key() {
+    // The server admits the one client key it pins; the client pins the
+    // server's key. A client with another key, or none, is refused before
+    // any request.
+    let (server, addr) = back_channel(&[spki("client.pem")]);
+    let ask = |client: &TlsClient| ask_at(addr, client);
+    let peer = client_with("client.pem", "client.key");
+    assert_eq!(
+        ask(&peer).unwrap(),
+        format!("{} status\n", hex(&spki("client.pem")))
+    );
     // A certificate from the same CA with another key: refused.
-    let other = ClientBuilder::new()
-        .trust(trust())
-        .client_certificate(
-            &data("client-only.pem"),
-            KeySource::Pem(&data("client-only.key")),
-        )
-        .unwrap()
-        .build()
-        .unwrap();
+    let other = client_with("client-only.pem", "client-only.key");
     assert!(
         ask(&other).map_or(true, |s| s.is_empty()),
         "other key admitted"
@@ -382,6 +406,28 @@ fn test_back_channel_pinned_client_key() {
     let session = peer.connect_to(&wrong).unwrap();
     let mut c = TcpClient::new(TcpStream::connect(addr).unwrap(), session);
     assert_eq!(c.handshake(), Err(TlsError::PinMismatch));
+    let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
+}
+
+#[test]
+fn test_back_channel_principal_per_peer() {
+    // Two pinned peers on one server: net-io's connection facts carry each
+    // one's own verified key, so the application can tell them apart (D-120).
+    let (a, b) = (spki("client.pem"), spki("client-only.pem"));
+    assert_ne!(a, b);
+    let (server, addr) = back_channel(&[a, b]);
+    let first = client_with("client.pem", "client.key");
+    let second = client_with("client-only.pem", "client-only.key");
+    for _ in 0..2 {
+        assert_eq!(
+            ask_at(addr, &first).unwrap(),
+            format!("{} status\n", hex(&a))
+        );
+        assert_eq!(
+            ask_at(addr, &second).unwrap(),
+            format!("{} status\n", hex(&b))
+        );
+    }
     let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
 }
 

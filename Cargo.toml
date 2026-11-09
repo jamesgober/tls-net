@@ -102,16 +102,16 @@ crypt-io = { version = "1.2.2", default-features = false, features = ["std", "ze
 # Custody of private keys and ticket keys.
 key-vault = { version = "1.1", optional = true, default-features = false, features = ["std", "mlock", "zeroize", "fragment-standard"] }
 
-# The TLS seam traits (TlsAcceptor, TlsSession). The seam is identical in
-# net-io 0.4.0 through 0.7 (decisions D-036, D-121).
-net-io = { version = ">=0.4, <0.8", optional = true, default-features = false }
+# The TLS seam traits (TlsAcceptor, TlsSession). net-io 0.7.0 added the
+# verified client key hash that the seam sets on TlsInfo (decisions D-036, D-122).
+net-io = { version = ">=0.7, <0.8", optional = true, default-features = false }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
 # The net-io server integration for the adapter's end-to-end tests.
-net-io = { version = ">=0.4, <0.8", features = ["tls"] }
+net-io = { version = ">=0.7, <0.8", features = ["tls"] }
 # Property tests.
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Benchmarks (benches/, PLAN section 9); no rayon, no plots.

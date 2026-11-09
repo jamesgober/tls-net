@@ -1448,13 +1448,13 @@ impl net_io::TlsSession for ClientSession { /* same */ }
 impl From<&TlsError> for net_io::TlsError { /* kind, code, alert */ }
 ```
 
-Type conversions only: no extra state, no allocation. Works with net-io `>= 0.4, < 0.7` (D-036). Mapping:
+Type conversions only: no extra state, no allocation. Works with net-io `>= 0.7, < 0.8` (D-036, D-122; tls-net 0.7.x accepts `>= 0.4`). Mapping:
 
 | tls-net | net-io |
 |---|---|
 | `Event::NeedInput`, `Transmit`, `HandshakeComplete`, `Data`, `OutputFull`, `PeerClosed`, `Closed` | the `TlsEvent` of the same name |
 | `on_eof()` | `on_transport_closed()` |
-| `info()` | `TlsInfo::new(sni, alpn, version code, suite code)` (ALPN over 32 bytes is reported as absent) |
+| `info()` | `TlsInfo::new(sni, alpn, version code, suite code)` (ALPN over 32 bytes is reported as absent), with `with_peer_spki_sha256` when the peer sent a certificate tls-net verified (0.8.0) |
 | `Refused` | `TlsFailure::HelloRefused` |
 | `HandshakeCapacity` | `TlsFailure::Capacity` |
 | `OutputFull` | `TlsFailure::OutputFull` |

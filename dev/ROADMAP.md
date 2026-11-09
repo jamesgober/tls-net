@@ -51,7 +51,7 @@ Exit: smtp-net-shaped STARTTLS and implicit TLS flows against a scripted relay a
 - [x] Hand-off between two processes and the platform verifier on all three operating systems (D-093); STARTTLS against a scripted relay and a public relay.
 
 ## Standing: net-io releases
-When net-io publishes a release outside the seam range (`>= 0.4, < 0.8` today, D-036, D-121), read its changelog for seam changes and ship a tls-net patch release that widens the range (or adapts the seam) without waiting for the next milestone, so serve-net and smtp-net can move with net-io. The `net-io-range` CI job keeps checking the lowest release of the range.
+When net-io publishes a release outside the seam range (`>= 0.7, < 0.8` today, D-036, D-122), read its changelog for seam changes and ship a tls-net patch release that widens the range (or adapts the seam) without waiting for the next milestone, so serve-net and smtp-net can move with net-io. The `net-io-range` CI job keeps checking the lowest release of the range.
 
 ## v0.6.0 - Optimisation
 Exit: every bench of PLAN section 9 with committed baselines; the end-to-end comparison against tokio plus tokio-rustls published; the 20% target met, or the gap explained with a plan, and 0.6 does not close until it is met; per-signature custody cost measured; `docs/PERFORMANCE.md` written.
@@ -74,6 +74,10 @@ Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hou
 
 ## v0.8.0 - Alpha
 Exit (D-039): the consumers' shapes run in this repository against real binaries: a serve-net-style net-io server in direct mode, a back-channel pair with mutual TLS, an smtp-net-style STARTTLS client against a local MTA; interop with curl, OpenSSL, and Go in CI; `docs/OPERATIONS.md` written; every finding fixed test-first.
+- [x] Go interop both ways in CI (D-118).
+- [x] Consumer shapes in `tests/consumers.rs`: direct mode, a pinned back-channel, STARTTLS against a scripted server and Postfix in CI (D-119).
+- [x] `docs/OPERATIONS.md`.
+- [x] Finding D-120 fixed: net-io's `TlsInfo` carries the verified client key hash, so a back-channel server can tell its peers apart (D-122).
 - [ ] API changes only from findings, each logged.
 
 ## v0.9.0 - Beta

@@ -59,8 +59,14 @@ fn info(i: Option<HandshakeInfo<'_>>) -> Option<TlsInfo> {
     let i = i?;
     let (version, suite) = (i.version.wire(), i.cipher_suite.wire());
     // net-io keeps at most 32 bytes of ALPN; a longer name is reported as absent.
-    TlsInfo::new(i.server_name, i.alpn, version, suite)
-        .or_else(|| TlsInfo::new(i.server_name, None, version, suite))
+    let t = TlsInfo::new(i.server_name, i.alpn, version, suite)
+        .or_else(|| TlsInfo::new(i.server_name, None, version, suite))?;
+    // A peer identity exists only for a certificate rustls verified (the chain,
+    // or a pin), so the hash net-io carries is never from unverified bytes.
+    Some(match i.peer {
+        Some(p) => t.with_peer_spki_sha256(p.spki_sha256),
+        None => t,
+    })
 }
 
 fn close_kind(k: CloseKind) -> TlsCloseKind {
