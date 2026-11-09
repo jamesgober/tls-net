@@ -51,7 +51,7 @@ Exit: smtp-net-shaped STARTTLS and implicit TLS flows against a scripted relay a
 - [x] Hand-off between two processes and the platform verifier on all three operating systems (D-093); STARTTLS against a scripted relay and a public relay.
 
 ## Standing: net-io releases
-When net-io publishes a release outside the seam range (`>= 0.4, < 0.7` today, D-036), read its changelog for seam changes and ship a tls-net patch release that widens the range (or adapts the seam) without waiting for the next milestone, so serve-net and smtp-net can move with net-io. The `net-io-range` CI job keeps checking the lowest release of the range.
+When net-io publishes a release outside the seam range (`>= 0.4, < 0.8` today, D-036, D-121), read its changelog for seam changes and ship a tls-net patch release that widens the range (or adapts the seam) without waiting for the next milestone, so serve-net and smtp-net can move with net-io. The `net-io-range` CI job keeps checking the lowest release of the range.
 
 ## v0.6.0 - Optimisation
 Exit: every bench of PLAN section 9 with committed baselines; the end-to-end comparison against tokio plus tokio-rustls published; the 20% target met, or the gap explained with a plan, and 0.6 does not close until it is met; per-signature custody cost measured; `docs/PERFORMANCE.md` written.
