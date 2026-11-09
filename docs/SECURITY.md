@@ -1,6 +1,6 @@
 # tls-net - Security
 
-> The threat model, every threat with its defence, its test, and its cost; where tls-net is deliberately stricter than the RFCs; and the 0.7 hardening record (threat audit, fuzz campaign, soak, conformance runs, Miri). Every threat T-1 to T-28 has an attack test. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md) section 8 and the decision log.
+> The threat model, every threat with its defence, its test, and its cost; where tls-net is deliberately stricter than the RFCs; and the 0.7 hardening record (threat audit, fuzz campaign, soak, conformance runs, Miri). Every threat T-1 to T-30 has an attack test. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md) section 8 and the decision log.
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -76,6 +76,8 @@ Costs are per handshake or per record unless stated; measured values are from `d
 | T-26 | Legacy attack classes (BEAST, POODLE, Lucky13, CRIME, FREAK, Logjam, Raccoon, ROBOT, Sweet32, Heartbleed, DROWN) | the features they need do not exist in rustls | testssl.sh vulnerability checks in the conformance workflow (weekly): every one "not vulnerable" | 0 |
 | T-27 | Memory exhaustion through half-open handshakes | capacity cap; handshake byte budget; no rustls connection until a whole hello has arrived; net-io's buffer limits and deadline | `tests/complete.rs` (`test_t27_*`: 10,000 one-byte half-open connections); `tests/alloc.rs` (`test_t27_*`: `accept` plus a one-byte `step` allocates nothing) | the session's inline size, under 2 KiB, per half-open connection |
 | T-28 | Process-wide provider confusion | tls-net never reads or installs the process default | `tests/provider.rs` (`test_t28_*`: after another crate installs a secp384r1-only default, tls-net still negotiates X25519MLKEM768) | 0 |
+| T-29 | A post-handshake message split over records to crash the session | while rustls holds part of a message, `encrypt` and `close` wait for `step` instead of calling rustls on an empty buffer (D-126) | `tests/attacks.rs` (`test_t29_*`: a ticket in 64-byte records; `encrypt` and `close` return `WrongState`, then work once the rest arrives) | one header check per `step` |
+| T-30 | Resumption past a client-authentication change, or past the client certificate's expiry | tickets and cached sessions are bound to the group's client-auth rules; a resumed handshake is refused without a required certificate or with an expired one (D-125) | `tests/attacks.rs` (`test_t30_*`: required auth published after an anonymous session, with tickets and with the cache; a removed pin); `src/server.rs` (`test_resumed_client_certificate_checked_for_expiry`) | 32 bytes more associated data per ticket; 1 to 2 µs per resumed handshake with a client certificate (estimate) |
 
 ---
 

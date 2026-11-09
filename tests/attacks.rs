@@ -812,3 +812,305 @@ fn test_t14_second_bad_record_after_a_failure_sends_no_second_alert_d111() {
     }
     assert!(fatal_alerts(&sent) <= 1, "{sent:?}");
 }
+
+/// A tls-net client that completed against a plain rustls server sending
+/// records of at most 64 bytes, and the records of that server's ticket
+/// flight, not yet delivered.
+fn split_ticket_flight(client: &TlsClient) -> (tls_net::ClientSession, Vec<Vec<u8>>) {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    #[cfg(feature = "aws-lc")]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    #[cfg(not(feature = "aws-lc"))]
+    let provider = rustls::crypto::ring::default_provider();
+    let certs = CertificateDer::pem_slice_iter(&data("site.pem"))
+        .map(Result::unwrap)
+        .collect();
+    let key = PrivateKeyDer::from_pem_slice(&data("site.key")).unwrap();
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    config.max_fragment_size = Some(64);
+    config.send_tls13_tickets = 1;
+    let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+    let mut session = client.connect("localhost").unwrap();
+    let (mut to_server, mut to_client) = (Vec::new(), Vec::new());
+    let mut out = vec![0u8; 64 * 1024];
+    let mut complete = false;
+    for _ in 0..16 {
+        loop {
+            let p = session.step(&mut to_client, &mut out).unwrap();
+            let (consumed, written) = (p.consumed, p.written);
+            complete |= matches!(p.event, Event::HandshakeComplete);
+            let idle = matches!(p.event, Event::NeedInput);
+            to_server.extend_from_slice(&out[..written]);
+            to_client.drain(..consumed);
+            if idle && consumed == 0 && written == 0 {
+                break;
+            }
+        }
+        let mut rd = &to_server[..];
+        while !rd.is_empty() {
+            server.read_tls(&mut rd).unwrap();
+        }
+        to_server.clear();
+        server.process_new_packets().unwrap();
+        while server.wants_write() {
+            server.write_tls(&mut to_client).unwrap();
+        }
+        if complete {
+            break;
+        }
+    }
+    assert!(complete, "the handshake did not complete");
+    let mut records = Vec::new();
+    let mut rest = &to_client[..];
+    while rest.len() >= 5 {
+        let len = 5 + usize::from(u16::from_be_bytes([rest[3], rest[4]]));
+        records.push(rest[..len].to_vec());
+        rest = &rest[len..];
+    }
+    (session, records)
+}
+
+#[test]
+fn test_t29_partial_post_handshake_message_leaves_encrypt_and_close_safe() {
+    // A peer sends one complete record holding only part of a handshake
+    // message (here the server's ticket, split over 64-byte records).
+    // rustls keeps the part inside the caller's input; encrypt and close
+    // must not call into rustls without it (D-126).
+    let client = test_ca_client().resumption(4).build().unwrap();
+    let (mut session, records) = split_ticket_flight(&client);
+    assert!(
+        records.len() >= 2,
+        "the ticket fits one record: {records:?}"
+    );
+    let mut out = vec![0u8; 64 * 1024];
+    let mut input = records[0].clone();
+    let p = session.step(&mut input, &mut out).unwrap();
+    assert!(matches!(p.event, Event::NeedInput));
+    let consumed = p.consumed;
+    assert_eq!(
+        session.encrypt(b"request", &mut out),
+        Err(TlsError::WrongState)
+    );
+    assert_eq!(session.close(&mut out), Err(TlsError::WrongState));
+    // Not fatal: with the rest of the message the session goes on.
+    let mut input: Vec<u8> = input[consumed..].to_vec();
+    for r in &records[1..] {
+        input.extend_from_slice(r);
+    }
+    loop {
+        let p = session.step(&mut input, &mut out).unwrap();
+        let (consumed, written) = (p.consumed, p.written);
+        let idle = matches!(p.event, Event::NeedInput);
+        input.drain(..consumed);
+        if idle && consumed == 0 && written == 0 {
+            break;
+        }
+    }
+    assert!(input.is_empty(), "{} bytes left", input.len());
+    assert!(session.encrypt(b"request", &mut out).unwrap() > 0);
+    assert!(session.close(&mut out).unwrap() > 0);
+}
+
+/// The kind of the server's completed handshake, or the first error either
+/// side saw.
+fn resumes(server: &TlsServer, client: &TlsClient) -> Result<HandshakeKind, TlsError> {
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    let (mut ss, mut cs) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    pump(&mut ss, &mut s, &mut cs, &mut c);
+    if let Some(e) = s.error.or(c.error) {
+        return Err(e);
+    }
+    Ok(ss.info().unwrap().kind)
+}
+
+#[test]
+fn test_t30_resumption_follows_a_client_auth_change() {
+    // rustls does not ask for a certificate again on resumption. A session
+    // made under looser client-authentication rules must not resume after
+    // a publish tightens them, with tickets or with the session cache
+    // (D-125).
+    use tls_net::ClientAuth;
+    let ca = || TrustAnchors::from_pem(&data("ca.pem")).unwrap();
+    for mode in [
+        TicketMode::Ephemeral {
+            period: Duration::from_secs(3600),
+        },
+        TicketMode::Off,
+    ] {
+        let site = || {
+            TlsServer::builder()
+                .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+                .unwrap()
+                .tickets(mode.clone(), 2)
+        };
+        let server = site().build().unwrap();
+        let anonymous = test_ca_client().resumption(8).build().unwrap();
+        assert_eq!(resumes(&server, &anonymous), Ok(HandshakeKind::Full));
+        assert_eq!(
+            resumes(&server, &anonymous),
+            Ok(HandshakeKind::Resumed),
+            "{mode:?}"
+        );
+        server
+            .reload_handle()
+            .publish(site().client_auth(ClientAuth::required(ca())))
+            .unwrap();
+        assert_eq!(
+            resumes(&server, &anonymous),
+            Err(TlsError::PeerCertificateRequired),
+            "{mode:?}: an anonymous session resumed under required client auth"
+        );
+    }
+}
+
+#[test]
+fn test_t30_resumption_follows_a_removed_pin() {
+    use tls_net::ClientAuth;
+    let pin = |pem: &str| {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        let cert = CertificateDer::pem_slice_iter(&data(pem))
+            .next()
+            .unwrap()
+            .unwrap();
+        tls_net::spki_sha256(cert.as_ref()).unwrap()
+    };
+    let ca = || TrustAnchors::from_pem(&data("ca.pem")).unwrap();
+    let site = |pins: &[[u8; 32]]| {
+        TlsServer::builder()
+            .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+            .unwrap()
+            .client_auth(ClientAuth::pinned(Some(ca()), pins))
+    };
+    let server = site(&[pin("client.pem"), pin("client-only.pem")])
+        .build()
+        .unwrap();
+    let other = test_ca_client()
+        .client_certificate(
+            &data("client-only.pem"),
+            KeySource::Pem(&data("client-only.key")),
+        )
+        .unwrap()
+        .resumption(8)
+        .build()
+        .unwrap();
+    assert_eq!(resumes(&server, &other), Ok(HandshakeKind::Full));
+    assert_eq!(resumes(&server, &other), Ok(HandshakeKind::Resumed));
+    // The operator drops the second peer's pin.
+    server
+        .reload_handle()
+        .publish(site(&[pin("client.pem")]))
+        .unwrap();
+    assert!(
+        resumes(&server, &other).is_err(),
+        "a removed pin still resumed"
+    );
+}
+
+struct RefuseAll;
+
+impl tls_net::HelloHook for RefuseAll {
+    fn on_client_hello(&self, _: &tls_net::HelloContext<'_>) -> tls_net::HelloVerdict {
+        tls_net::HelloVerdict::Refuse(tls_net::RefuseReason::Fingerprint)
+    }
+}
+
+#[test]
+fn test_t14_lenient_hello_keeps_the_hook() {
+    // refuse_malformed(false) lets a hello tls-net cannot read go on to
+    // rustls. A peer picks that path by going over a budget (here 513
+    // suites), so it must not skip what depends on the hello: the hook,
+    // host groups, a required ALPN (D-127).
+    let limits = tls_net::HelloLimits::new().refuse_malformed(false);
+    let mut suites = vec![0x0a0a; 509];
+    suites.extend(ECDHE_SUITES);
+    let hello = RawHello::tls12(&suites).sni(b"localhost").record();
+    let lenient = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .hello_limits(limits)
+        .build()
+        .unwrap();
+    let (sent, err) = refuse(&lenient, &hello);
+    assert!(err.is_none() && !sent.is_empty(), "control: {err:?}");
+    let hooked = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .hello_limits(limits)
+        .hello_hook(Arc::new(RefuseAll))
+        .build()
+        .unwrap();
+    let (sent, err) = refuse(&hooked, &hello);
+    assert!(sent.is_empty(), "the server answered: {} bytes", sent.len());
+    assert!(
+        matches!(err, Some(TlsError::HelloOverBudget { .. })),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn test_close_with_a_short_output_keeps_close_notify() {
+    // rustls marks close_notify sent before it checks the output's size; a
+    // close into 8 bytes must leave it to a retry with room (D-129).
+    let server = server();
+    let client = test_ca_client().build().unwrap();
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    let (mut ss, mut cs) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    pump(&mut ss, &mut s, &mut cs, &mut c);
+    assert!(c.complete && s.complete);
+    assert!(matches!(
+        cs.close(&mut [0u8; 8]),
+        Err(TlsError::OutputFull { .. })
+    ));
+    let mut out = vec![0u8; 64];
+    let n = cs.close(&mut out).unwrap();
+    assert!(n > 0, "close_notify was lost");
+    let mut wire = out[..n].to_vec();
+    let mut buf = vec![0u8; 64 * 1024];
+    let p = ss.step(&mut wire, &mut buf).unwrap();
+    assert_eq!(p.event, Event::PeerClosed);
+}
+
+#[test]
+fn test_hello_over_several_records_reports_the_input_it_needs() {
+    // A hello may be up to 65,535 bytes over 16 records (HelloLimits); the
+    // session must ask net-io for room for all of it, not one record.
+    let limits = tls_net::HelloLimits::new().max_hello_bytes(40_000).unwrap();
+    let server = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .hello_limits(limits)
+        .build()
+        .unwrap();
+    let mut hello = RawHello::tls12(&ECDHE_SUITES).sni(b"localhost");
+    hello.extensions.push((21, vec![0; 30_000]));
+    let record = hello.record();
+    let message = &record[5..];
+    let mut wire = Vec::new();
+    for part in message.chunks(16_000) {
+        wire.extend([22, 3, 1]);
+        wire.extend(u16::try_from(part.len()).unwrap().to_be_bytes());
+        wire.extend(part);
+    }
+    let mut s = server.accept().unwrap();
+    let mut out = vec![0u8; 64 * 1024];
+    let mut first = wire[..16_010].to_vec();
+    let p = s.step(&mut first, &mut out).unwrap();
+    assert_eq!((p.consumed, p.event), (0, Event::NeedInput));
+    assert!(
+        s.input_capacity_required() >= wire.len(),
+        "asks for {}, the hello needs {}",
+        s.input_capacity_required(),
+        wire.len()
+    );
+}

@@ -29,9 +29,9 @@ use crate::verify::{Crls, PinnedServer, Pins, RevocationPolicy};
 /// ```
 #[derive(Clone)]
 pub struct TrustAnchors {
-    roots: Arc<RootCertStore>,
+    pub(crate) roots: Arc<RootCertStore>,
     /// Verify with the operating system instead (feature `platform-verifier`).
-    platform: bool,
+    pub(crate) platform: bool,
 }
 
 impl fmt::Debug for TrustAnchors {

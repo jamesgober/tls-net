@@ -358,32 +358,36 @@ impl TicketKeyRing {
         }
     }
 
-    fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
+    /// Seals `plain` under the current key. The associated data is the
+    /// header and `bind`, the group's client-authentication binding (D-125):
+    /// `bind` is not sent, so a ticket opens only where it was issued.
+    fn seal(&self, plain: &[u8], bind: &[u8; 32]) -> Option<Vec<u8>> {
         let st = self.current();
-        let mut header = [0u8; HEADER];
-        header[0] = VERSION;
-        header[1..].copy_from_slice(&st.epoch.to_be_bytes());
+        let mut aad = [0u8; HEADER + 32];
+        aad[0] = VERSION;
+        aad[1..HEADER].copy_from_slice(&st.epoch.to_be_bytes());
+        aad[HEADER..].copy_from_slice(bind);
         // One allocation: the capacity covers the header, so moving the
         // sealed bytes up to make room for it does not reallocate.
         let mut out = Vec::with_capacity(OVERHEAD + plain.len());
         Crypt::xchacha20_poly1305()
-            .encrypt_with_aad_into(st.current.as_slice(), plain, &header, &mut out)
+            .encrypt_with_aad_into(st.current.as_slice(), plain, &aad, &mut out)
             .ok()?;
         drop(st);
-        out.splice(0..0, header);
+        out.splice(0..0, aad[..HEADER].iter().copied());
         self.issued.fetch_add(1, Ordering::Relaxed);
         Some(out)
     }
 
-    fn open(&self, ticket: &[u8]) -> Option<Vec<u8>> {
-        let opened = self.try_open(ticket);
+    fn open(&self, ticket: &[u8], bind: &[u8; 32]) -> Option<Vec<u8>> {
+        let opened = self.try_open(ticket, bind);
         if opened.is_none() {
             self.rejected.fetch_add(1, Ordering::Relaxed);
         }
         opened
     }
 
-    fn try_open(&self, ticket: &[u8]) -> Option<Vec<u8>> {
+    fn try_open(&self, ticket: &[u8], bind: &[u8; 32]) -> Option<Vec<u8>> {
         if ticket.len() < OVERHEAD || ticket[0] != VERSION {
             return None;
         }
@@ -396,8 +400,11 @@ impl TicketKeyRing {
         } else {
             return None;
         };
+        let mut aad = [0u8; HEADER + 32];
+        aad[..HEADER].copy_from_slice(&ticket[..HEADER]);
+        aad[HEADER..].copy_from_slice(bind);
         Crypt::xchacha20_poly1305()
-            .decrypt_with_aad(key.as_slice(), &ticket[HEADER..], &ticket[..HEADER])
+            .decrypt_with_aad(key.as_slice(), &ticket[HEADER..], &aad)
             .ok()
     }
 }
@@ -598,23 +605,51 @@ impl TicketKeyRingHandle {
     }
 }
 
+/// One server group's view of the shared ring: tickets sealed with the
+/// group's client-authentication binding (D-125). The ring, its epochs, and
+/// its counters are shared; only the associated data differs.
+pub(crate) struct BoundTickets {
+    pub(crate) ring: Arc<TicketKeyRing>,
+    pub(crate) bind: [u8; 32],
+}
+
+impl fmt::Debug for BoundTickets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundTickets")
+            .field("ring", &self.ring)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The rustls side: decrypt input is fully attacker-controlled; every
 /// failure is `None` and nothing panics.
-impl ProducesTickets for TicketKeyRing {
+impl ProducesTickets for BoundTickets {
     fn enabled(&self) -> bool {
         true
     }
 
     fn lifetime(&self) -> u32 {
-        u32::try_from(self.period).unwrap_or(u32::MAX)
+        u32::try_from(self.ring.period).unwrap_or(u32::MAX)
     }
 
     fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
-        self.seal(plain)
+        self.ring.seal(plain, &self.bind)
     }
 
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
-        self.open(cipher)
+        self.ring.open(cipher, &self.bind)
+    }
+}
+
+/// Unbound sealing, for the unit tests and the fuzz target.
+#[cfg(any(test, fuzzing))]
+impl TicketKeyRing {
+    pub(crate) fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.seal(plain, &[0; 32])
+    }
+
+    pub(crate) fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        self.open(cipher, &[0; 32])
     }
 }
 

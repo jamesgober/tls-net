@@ -25,7 +25,7 @@ use crate::policy::{Policy, Preset};
 use crate::session::ServerSession;
 use crate::snapshot::{Reader, Snapshot};
 use crate::sni::{self, GroupResolver, SniTable};
-use crate::tickets::{TicketKeyRing, TicketKeyRingHandle, TicketMode};
+use crate::tickets::{BoundTickets, TicketKeyRing, TicketKeyRingHandle, TicketMode};
 use crate::verify::ClientAuth;
 
 /// An application protocol name for ALPN (RFC 7301): 1 to 255 bytes.
@@ -216,6 +216,8 @@ impl Capacity {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Group {
     pub(crate) alpn_required: bool,
+    /// The group requires a client certificate (checked again on resumption, D-125).
+    pub(crate) auth_required: bool,
     pub(crate) max_handshake_bytes: u32,
 }
 
@@ -233,6 +235,57 @@ pub(crate) struct ServerState {
     pub(crate) obs: Arc<Observation>,
     /// The server's handshake gate, the same in every snapshot.
     pub(crate) capacity: Arc<Capacity>,
+}
+
+/// The wall clock for the checks at completion. Unit tests move it forward
+/// to reach a client certificate's expiry on resumption (D-125).
+pub(crate) fn wall_clock() -> SystemTime {
+    #[cfg(test)]
+    let ahead = Duration::from_secs(tests::CLOCK_AHEAD.load(std::sync::atomic::Ordering::Relaxed));
+    #[cfg(not(test))]
+    let ahead = Duration::ZERO;
+    SystemTime::now() + ahead
+}
+
+/// One group's view of the shared session cache: every key is prefixed
+/// with the group's client-authentication binding (D-125), so a session
+/// stored under one set of rules is not found under another.
+struct BoundCache {
+    inner: Arc<dyn StoresServerSessions>,
+    bind: [u8; 32],
+}
+
+impl fmt::Debug for BoundCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundCache").finish_non_exhaustive()
+    }
+}
+
+impl BoundCache {
+    fn key(&self, key: &[u8]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(32 + key.len());
+        k.extend_from_slice(&self.bind);
+        k.extend_from_slice(key);
+        k
+    }
+}
+
+impl StoresServerSessions for BoundCache {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.inner.put(self.key(&key), value)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.get(&self.key(key))
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.take(&self.key(key))
+    }
+
+    fn can_cache(&self) -> bool {
+        self.inner.can_cache()
+    }
 }
 
 /// State that belongs to the server's lifetime, carried across reloads (FR-32).
@@ -1147,9 +1200,18 @@ impl ServerBuilder {
             config.ignore_client_order = policy.server_order_wins();
             config.max_fragment_size = policy.fragment().map(|f| f + 5);
             config.require_ems = policy.ems();
-            config.session_storage = Arc::clone(&shared.cache);
+            // Resumption is bound to the group's client-authentication rules
+            // (D-125): rustls does not ask for a certificate again on resume.
+            let bind = auth.binding();
+            config.session_storage = Arc::new(BoundCache {
+                inner: Arc::clone(&shared.cache),
+                bind,
+            });
             if let Some(ring) = &shared.tickets {
-                config.ticketer = Arc::clone(ring) as Arc<dyn rustls::server::ProducesTickets>;
+                config.ticketer = Arc::new(BoundTickets {
+                    ring: Arc::clone(ring),
+                    bind,
+                });
             }
             config.send_tls13_tickets = if policy.preset() == Preset::Internal {
                 0
@@ -1178,6 +1240,7 @@ impl ServerBuilder {
             configs.push(Arc::new(config));
             groups.push(Group {
                 alpn_required: alpn_policy == AlpnPolicy::Required,
+                auth_required: auth.is_required(),
                 max_handshake_bytes,
             });
         }
@@ -1256,6 +1319,95 @@ pub fn server_from_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ClientBuilder, Event, HandshakeKind, TrustAnchors};
+
+    pub(crate) static CLOCK_AHEAD: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn data(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// Runs a server and a client session against each other in memory.
+    fn handshake(server: &TlsServer, client: &crate::TlsClient) -> Result<HandshakeKind, TlsError> {
+        let mut s = server.accept()?;
+        let mut c = client.connect("localhost")?;
+        let (mut to_s, mut to_c) = (Vec::new(), Vec::new());
+        let mut out = vec![0u8; 64 * 1024];
+        for _ in 0..64 {
+            let mut moved = false;
+            loop {
+                let p = c.step(&mut to_c, &mut out)?;
+                let (n, w, need) = (p.consumed, p.written, p.event == Event::NeedInput);
+                to_s.extend_from_slice(&out[..w]);
+                to_c.drain(..n);
+                moved |= n > 0 || w > 0;
+                if need && n == 0 && w == 0 {
+                    break;
+                }
+            }
+            loop {
+                let p = s.step(&mut to_s, &mut out)?;
+                let (n, w, need) = (p.consumed, p.written, p.event == Event::NeedInput);
+                to_c.extend_from_slice(&out[..w]);
+                to_s.drain(..n);
+                moved |= n > 0 || w > 0;
+                if need && n == 0 && w == 0 {
+                    break;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        s.info().map(|i| i.kind).ok_or(TlsError::WrongState)
+    }
+
+    #[test]
+    fn test_resumed_client_certificate_checked_for_expiry() {
+        // rustls carries the client chain in the ticket and issues fresh
+        // tickets on every resumption, so without this check an identity
+        // would outlive its certificate (D-125).
+        let ca = TrustAnchors::from_pem(&data("ca.pem")).unwrap();
+        let server = ServerBuilder::new()
+            .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+            .unwrap()
+            .client_auth(ClientAuth::required(ca.clone()))
+            .build()
+            .unwrap();
+        let client = ClientBuilder::new()
+            .trust(ca)
+            .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
+            .unwrap()
+            .resumption(8)
+            .build()
+            .unwrap();
+        assert_eq!(handshake(&server, &client), Ok(HandshakeKind::Full));
+        assert_eq!(handshake(&server, &client), Ok(HandshakeKind::Resumed));
+        use rustls::pki_types::pem::PemObject;
+        let pem = data("client.pem");
+        let leaf = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+            .next()
+            .unwrap()
+            .unwrap();
+        let not_after = crate::der::parse_certificate(leaf.as_ref())
+            .unwrap()
+            .not_after;
+        let ahead = not_after
+            .duration_since(SystemTime::now())
+            .unwrap()
+            .as_secs()
+            + 1;
+        CLOCK_AHEAD.store(ahead, std::sync::atomic::Ordering::Relaxed);
+        let late = handshake(&server, &client);
+        CLOCK_AHEAD.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            late,
+            Err(TlsError::PeerCertificateInvalid(
+                crate::error::CertificateProblem::Expired
+            ))
+        );
+    }
 
     #[test]
     fn test_staple_checks() {
