@@ -51,7 +51,7 @@ Exit: smtp-net-shaped STARTTLS and implicit TLS flows against a scripted relay a
 - [x] Hand-off between two processes and the platform verifier on all three operating systems (D-093); STARTTLS against a scripted relay and a public relay.
 
 ## Standing: net-io releases
-When net-io publishes a release outside the seam range (`>= 0.4, < 0.8` today, D-036, D-121), read its changelog for seam changes and ship a tls-net patch release that widens the range (or adapts the seam) without waiting for the next milestone, so serve-net and smtp-net can move with net-io. The `net-io-range` CI job keeps checking the lowest release of the range.
+When net-io publishes a release outside the seam range (`>= 0.7, < 0.8` today, D-036, D-122), read its changelog for seam changes and ship a tls-net patch release that widens the range (or adapts the seam) without waiting for the next milestone, so serve-net and smtp-net can move with net-io. The `net-io-range` CI job keeps checking the lowest release of the range.
 
 ## v0.6.0 - Optimisation
 Exit: every bench of PLAN section 9 with committed baselines; the end-to-end comparison against tokio plus tokio-rustls published; the 20% target met, or the gap explained with a plan, and 0.6 does not close until it is met; per-signature custody cost measured; `docs/PERFORMANCE.md` written.
@@ -60,7 +60,7 @@ Exit: every bench of PLAN section 9 with committed baselines; the end-to-end com
 - [x] tls-net's own overhead within its targets: handshakes within 3% of rustls on Windows and Linux, `encrypt` within 50 ns, `step` within 100 ns plus the D-035 copy, no allocation per record, 257 bytes per idle connection (D-096, D-100, D-102, D-104).
 - [x] End-to-end bulk at least 1.2 times tokio-rustls in rate and in CPU per byte (D-105).
 - [ ] End-to-end handshakes at least 1.2 times tokio-rustls in CPU per handshake (rate already 1.45x). Waits on net-io 0.8: coalesced sends and accept in the worker (net-io D-180). Carried to the 1.0 gate (D-106).
-- [ ] Memory per idle connection at least 30% below tokio-rustls, and no TLS connection ceiling below `max_connections`. net-io 0.7.0 gives idle TLS buffers back to the pool (net-io D-181); measure on it. Carried to the 1.0 gate (D-106).
+- [x] Memory per idle connection at least 30% below tokio-rustls, and no TLS connection ceiling below `max_connections`. Met on net-io 0.7.1: 5,884 bytes after traffic against 11,680 (0.50x), 9,000 connections open (D-123).
 
 ## v0.7.0 - Hardening
 Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hours without an open finding; attack tests T-1 to T-28 green; tlsfuzzer server scripts and testssl.sh clean for the supported features (weekly CI job); soak of NFR-21 without memory growth; Miri and loom green; `docs/SECURITY.md` written.
@@ -72,9 +72,13 @@ Exit: every fuzz target seeded with real ClientHellos (D-060) and run for 24 hou
 - [x] NFR-21 soak (`perf/soak.sh`), 6 hours; 24 hours belongs to the 1.0 gate (D-108).
 - [x] `docs/SECURITY.md`.
 
-## v0.8.0 - Alpha
+## v0.8.0 - Alpha (DONE, 2026-11-08)
 Exit (D-039): the consumers' shapes run in this repository against real binaries: a serve-net-style net-io server in direct mode, a back-channel pair with mutual TLS, an smtp-net-style STARTTLS client against a local MTA; interop with curl, OpenSSL, and Go in CI; `docs/OPERATIONS.md` written; every finding fixed test-first.
-- [ ] API changes only from findings, each logged.
+- [x] Go interop both ways in CI (D-118).
+- [x] Consumer shapes in `tests/consumers.rs`: direct mode, a pinned back-channel, STARTTLS against a scripted server and Postfix in CI (D-119).
+- [x] `docs/OPERATIONS.md`.
+- [x] Finding D-120 fixed: net-io's `TlsInfo` carries the verified client key hash, so a back-channel server can tell its peers apart (D-122).
+- [x] API changes only from findings, each logged: none in tls-net's API; D-122 sets one more net-io field.
 
 ## v0.9.0 - Beta
 Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with exporters and channel binding (D-052); adversarial review in a dedicated session with every finding fixed test-first; API review against `docs/API.md`; `docs/OPERATIONS.md` and `docs/PLATFORM-NOTES.md` complete. API frozen at 0.9.0.
@@ -83,7 +87,7 @@ Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with ex
 Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by item, what is met and what still needs James.
 - [ ] Revisit every gap and every deferred item in this file and in `PLAN.md`; close each or record why it waits for after 1.0.
 - [ ] Re-tune handshake and throughput performance against the 0.6 baselines; no regression over 5%.
-- [ ] The two end-to-end items carried from 0.6 (D-106): CPU per handshake and idle memory against tokio-rustls, measured with `perf/` on the net-io release that ships coalesced sends, accept in the worker, and idle TLS buffer release.
+- [ ] The end-to-end item carried from 0.6 (D-106): CPU per handshake against tokio-rustls, measured with `perf/` on the net-io release that ships coalesced sends and accept in the worker. Idle memory is met on net-io 0.7.1 (D-123).
 - [ ] Re-run the security review (threat table, attack tests, dependency footprint, `cargo audit`, `cargo deny`).
 - [ ] Check webpki-roots, rustls, and the provider for newer releases.
 

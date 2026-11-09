@@ -1,7 +1,7 @@
 # tls-net &mdash; API Reference
 
 > Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.7.1`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0 and 0.7.x added no API). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: `0.8.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0, 0.7.x, and 0.8.0 added no API). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -1448,13 +1448,13 @@ impl net_io::TlsSession for ClientSession { /* same */ }
 impl From<&TlsError> for net_io::TlsError { /* kind, code, alert */ }
 ```
 
-Type conversions only: no extra state, no allocation. Works with net-io `>= 0.4, < 0.7` (D-036). Mapping:
+Type conversions only: no extra state, no allocation. Works with net-io `>= 0.7, < 0.8` (D-036, D-122; tls-net 0.7.x accepts `>= 0.4`). Mapping:
 
 | tls-net | net-io |
 |---|---|
 | `Event::NeedInput`, `Transmit`, `HandshakeComplete`, `Data`, `OutputFull`, `PeerClosed`, `Closed` | the `TlsEvent` of the same name |
 | `on_eof()` | `on_transport_closed()` |
-| `info()` | `TlsInfo::new(sni, alpn, version code, suite code)` (ALPN over 32 bytes is reported as absent) |
+| `info()` | `TlsInfo::new(sni, alpn, version code, suite code)` (ALPN over 32 bytes is reported as absent), with `with_peer_spki_sha256` when the peer sent a certificate tls-net verified (0.8.0) |
 | `Refused` | `TlsFailure::HelloRefused` |
 | `HandshakeCapacity` | `TlsFailure::Capacity` |
 | `OutputFull` | `TlsFailure::OutputFull` |

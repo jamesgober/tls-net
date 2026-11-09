@@ -20,6 +20,9 @@
 //! resumption, one request per connection (`handshakes`) or one stream per
 //! thread (`bulk`). `x25519` limits the client to X25519, the group every
 //! stack here supports (OpenSSL 3.0 has no ML-KEM).
+//! `PERF_EARLY_REQUEST=1` sends the request in the same flight as the
+//! client's Finished, as browsers and curl do, so a server can answer it in
+//! the send that carries its tickets.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -514,7 +517,15 @@ fn one_request(addr: &str, config: &Arc<rustls::ClientConfig>) -> Result<bool, s
     let conn = rustls::ClientConnection::new(Arc::clone(config), "localhost".try_into().unwrap())
         .map_err(std::io::Error::other)?;
     let mut s = rustls::StreamOwned::new(conn, tcp);
-    s.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")?;
+    if std::env::var_os("PERF_EARLY_REQUEST").is_some_and(|v| !v.is_empty()) {
+        // As browsers and curl do: the request leaves with Finished.
+        s.conn.writer().write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")?;
+        while s.conn.is_handshaking() || s.conn.wants_write() {
+            s.conn.complete_io(&mut s.sock)?;
+        }
+    } else {
+        s.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")?;
+    }
     let t = Instant::now();
     let mut got = Vec::with_capacity(RESPONSE.len());
     let mut buf = [0u8; 256];

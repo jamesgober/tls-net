@@ -13,6 +13,38 @@
 
 ---
 
+## [0.8.0] - 2026-11-08
+
+Alpha. No API change.
+
+### Added
+
+- The net-io seam sets `TlsInfo::peer_spki_sha256` to the SHA-256 of the
+  verified client certificate's public key, so an application on net-io can
+  map a mutual-TLS peer to a principal (D-120, D-122).
+- Go interop both ways (`tests/go.rs`, `tests/interop/go`), run in CI
+  (D-118).
+- The consumers' shapes end to end (`tests/consumers.rs`): a net-io server in
+  direct mode with two sites, ALPN, tickets, and reloads under traffic; a
+  pinned back-channel; STARTTLS against a scripted server, and against Postfix
+  in CI (D-119).
+- `docs/OPERATIONS.md`: certificates, reloads, expiry, tickets, policies,
+  turning TLS 1.2 off, and what to watch.
+
+### Changed
+
+- The `net-io` dependency requires net-io `>= 0.7, < 0.8` (was `>= 0.4`),
+  for the peer key hash (D-122). Applications on net-io 0.4 to 0.6 stay on
+  tls-net 0.7.
+
+### Documentation
+
+- `docs/PERFORMANCE.md`: on net-io 0.7.1 an idle connection costs half what
+  one on tokio-rustls does, cold or after traffic; the idle-memory target is
+  met (D-123).
+
+---
+
 ## [0.7.1] - 2026-11-08
 
 ### Changed
@@ -263,7 +295,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/tls-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/tls-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/tls-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/tls-net/compare/v0.5.0...v0.6.0
