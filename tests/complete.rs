@@ -496,11 +496,17 @@ fn test_t23_no_banned_crate_in_the_tree() {
         ])
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .output();
-    let Ok(out) = out else { return };
-    if !out.status.success() {
-        // Offline or a cargo without network: cargo deny covers this in CI.
+    // Offline, cargo cannot resolve the tree; on CI (where `CI` is set) that
+    // fails the test rather than passing it unchecked.
+    let ran = out.as_ref().is_ok_and(|o| o.status.success());
+    if !ran {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "cargo tree failed: {out:?}"
+        );
         return;
     }
+    let out = out.unwrap();
     let tree = String::from_utf8_lossy(&out.stdout);
     for banned in [
         "openssl ",
@@ -543,4 +549,42 @@ fn test_t27_half_open_handshakes_hold_no_rustls_state() {
     );
     drop(sessions);
     assert_eq!(server.handshakes_in_progress(), 0);
+}
+
+#[test]
+fn test_t8_no_ticket_key_bytes_in_debug() {
+    let secret = [0xa5u8; 32];
+    let seed = || TicketSeed::from_bytes(secret);
+    let ratchet = TicketMode::Ratchet {
+        seed: seed(),
+        period: Duration::from_secs(3600),
+    };
+    let derived = TicketMode::Derived {
+        root: seed(),
+        period: Duration::from_secs(3600),
+    };
+    let builder = site().tickets(ratchet.clone(), 2);
+    let server = builder.clone().build().unwrap();
+    let handle = server.ticket_keys().unwrap();
+    let sealed = handle.export_sealed(&[7; 32]).unwrap();
+    let outputs = [
+        format!("{ratchet:?}"),
+        format!("{derived:?}"),
+        format!("{builder:?}"),
+        format!("{server:?}"),
+        format!("{handle:?}"),
+        format!("{sealed:?}"),
+    ];
+    let hexed = secret.iter().fold(String::new(), |mut s, b| {
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+        s
+    });
+    for out in &outputs {
+        assert!(!out.contains(&hexed[..16]), "hex key bytes in {out}");
+        assert!(
+            !out.contains(&format!("{:?}", &secret[..8])[1..20]),
+            "listed key bytes in {out}"
+        );
+        assert!(!out.contains("165, 165, 165"), "listed key bytes in {out}");
+    }
 }

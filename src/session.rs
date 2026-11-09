@@ -404,6 +404,14 @@ impl<C: Engine> Core<C> {
                     None => Stop::Room,
                 };
             }
+            // After a failure rustls is called only while it holds queued
+            // records (the alert): it hands those out before reading input,
+            // whereas a call with nothing queued would parse the next record
+            // and, if that record is malformed too, queue a second fatal
+            // alert (D-111).
+            if failed.is_some() && !conn.common().wants_write() {
+                return Stop::Failed(failed.unwrap_or(TlsError::Other));
+            }
             let rest = &mut input[*consumed..];
             let rest_len = rest.len();
             let UnbufferedStatus { discard, state } = conn.process(rest);
@@ -423,6 +431,14 @@ impl<C: Engine> Core<C> {
                     continue;
                 }
             };
+            if failed.is_some()
+                && !matches!(
+                    state,
+                    ConnectionState::EncodeTlsData(_) | ConnectionState::TransmitTlsData(_)
+                )
+            {
+                return Stop::Failed(failed.unwrap_or(TlsError::Other));
+            }
             match state {
                 ConnectionState::EncodeTlsData(mut enc) => {
                     match enc.encode(&mut output[*written..]) {

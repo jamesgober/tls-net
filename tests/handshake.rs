@@ -505,3 +505,25 @@ fn test_data_in_the_finished_flight_comes_after_handshake_complete() {
     // The server can answer at once.
     assert!(srv.encrypt(b"HTTP/1.1 200 OK\r\n\r\n", &mut out).is_ok());
 }
+
+#[test]
+fn test_hello_record_version_0x0300_completes_d110() {
+    // Older stacks and tlsfuzzer send the first record as 0x0300; RFC 5246
+    // appendix E.1 requires the server to accept it.
+    let server = site().build().unwrap();
+    let client = client(Policy::client_default(), &[]);
+    let (mut ss, mut cs) = (
+        server.accept().unwrap(),
+        client.connect("localhost").unwrap(),
+    );
+    let mut out = vec![0u8; 64 * 1024];
+    let p = cs.step(&mut [], &mut out).unwrap();
+    let mut hello = out[..p.written].to_vec();
+    assert_eq!(&hello[..3], &[22, 3, 1]);
+    hello[2] = 0;
+    let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
+    s.inbox = hello;
+    pump(&mut ss, &mut s, &mut cs, &mut c);
+    assert!(c.complete && s.complete, "{:?} {:?}", s.error, c.error);
+    assert_eq!(ss.info().unwrap().version, Version::Tls13);
+}

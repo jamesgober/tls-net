@@ -1,7 +1,7 @@
 # tls-net &mdash; API Reference
 
 > Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.6.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0 added no API). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: `0.7.0`.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0 and 0.7.0 added no API). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 

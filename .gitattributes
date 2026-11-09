@@ -12,6 +12,7 @@
 /.gitignore       export-ignore
 /.editorconfig    export-ignore
 
-# Binary test fixtures.
+# Binary test fixtures and fuzz seeds.
 *.der             binary
 *.ocsp            binary
+*.bin             binary

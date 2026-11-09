@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: measured (<code>0.6.0</code>).</strong> Every planned feature before 1.0 is in and tested against OpenSSL and curl: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, and on net-io's reactor bulk transfer runs 1.23 times tokio-rustls; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Next: hardening in <code>0.7.0</code> (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: hardened (<code>0.7.0</code>).</strong> Every planned feature before 1.0 is in and tested against OpenSSL and curl: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, and on net-io's reactor bulk transfer runs 1.23 times tokio-rustls; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Every threat in the model has an attack test, and the fuzz campaign, soak, conformance runs, and Miri results are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. Next: the alpha in <code>0.8.0</code>, which runs the consumers' shapes against real binaries (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -55,7 +55,7 @@
 
 ```toml
 [dependencies]
-tls-net = "0.6"
+tls-net = "0.7"
 ```
 
 The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange. Build needs per platform, FIPS included, are in [`docs/PLATFORM-NOTES.md`](./docs/PLATFORM-NOTES.md).

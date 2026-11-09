@@ -148,3 +148,69 @@ fn test_net_io_request_in_the_finished_flight() {
     }
     let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
 }
+
+#[test]
+fn test_t13_stalled_handshake_releases_its_slot_at_the_deadline() {
+    // One handshake slot. A peer sends one byte of its hello and stalls;
+    // net-io's handshake deadline closes it, the session drops, and the
+    // slot is free for the next client (T-13).
+    use std::io::Write;
+    let tls = TlsServer::builder()
+        .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
+        .unwrap()
+        .limits(
+            tls_net::HandshakeLimits::server()
+                .max_in_progress(1)
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let limits = net_io::Limits::blocking_defaults()
+        .to_builder()
+        // Long enough that a loaded test machine still sees the slot held.
+        .handshake_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let server = ServerBuilder::new()
+        .handler(echo)
+        .listener(ListenerSpec::tcp("127.0.0.1:0").tls(true))
+        .workers(4)
+        .limits(limits)
+        .tls(tls.clone())
+        .gate(AllowAll)
+        .build()
+        .expect("build");
+    server.open_door().expect("open");
+    let addr = server.listeners()[0]
+        .local
+        .socket_addr()
+        .expect("ip listener");
+    let mut stalled = std::net::TcpStream::connect(addr).unwrap();
+    stalled.write_all(&[22]).unwrap();
+    // Wait until the stalled handshake holds the slot.
+    let start = Instant::now();
+    while tls.handshakes_in_progress() == 0 && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(tls.handshakes_in_progress(), 1);
+    // After the deadline the slot is back and a client completes.
+    let start = Instant::now();
+    while tls.handshakes_in_progress() != 0 && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        tls.handshakes_in_progress(),
+        0,
+        "the deadline released the slot"
+    );
+    assert!(start.elapsed() < Duration::from_secs(6));
+    // The client session is built before the socket connects: net-io's
+    // deadline counts from the accept, so building it after spent the
+    // handshake's time on a loaded machine (D-116).
+    let session = tls_client().connect("localhost").unwrap();
+    let sock = std::net::TcpStream::connect(addr).unwrap();
+    let mut c = TcpClient::new(sock, session);
+    c.handshake().unwrap();
+    drop((c, stalled));
+    let _ = server.shutdown(Instant::now() + Duration::from_secs(5));
+}

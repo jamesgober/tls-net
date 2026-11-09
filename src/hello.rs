@@ -252,9 +252,12 @@ fn check_type(t: u8) -> Result<(), TlsError> {
     }
 }
 
+/// Any `{03,XX}` record version: RFC 5246 appendix E.1 requires a server
+/// to accept them on a ClientHello, RFC 8446 section 5.1 says to ignore the
+/// field, and rustls does the same (D-110). It never selects the protocol.
 fn check_header(typ: u8, version: u16) -> Result<(), TlsError> {
     check_type(typ)?;
-    if !(0x0301..=0x0303).contains(&version) {
+    if version >> 8 != 3 {
         return Err(TlsError::BadRecord);
     }
     Ok(())
@@ -1072,6 +1075,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_any_03xx_record_version_accepted_d110() {
+        let hello = HelloBuilder::new().records(16_384);
+        for minor in [0u8, 1, 2, 3, 4, 0xff] {
+            let mut h = hello.clone();
+            h[2] = minor;
+            match HelloParser::parse(&h, &HelloLimits::new()) {
+                Ok(HelloParse::Complete { view, .. }) => {
+                    assert_eq!(view.record_version(), 0x0300 | u16::from(minor));
+                }
+                other => panic!("record version 0x03{minor:02x}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_refusals() {
         let l = HelloLimits::new();
         assert_eq!(
@@ -1086,10 +1104,14 @@ pub(crate) mod tests {
             HelloParser::parse(b"\x15\x03\x03\x00\x02\x02\x28", &l).unwrap_err(),
             TlsError::BadRecord
         );
-        assert_eq!(
-            HelloParser::parse(b"\x16\x03\x00\x00\x10", &l).unwrap_err(),
-            TlsError::BadRecord
-        );
+        for version in [[2u8, 0], [4, 1], [0, 0], [0xff, 0xff]] {
+            let header = [22, version[0], version[1], 0, 0x10];
+            assert_eq!(
+                HelloParser::parse(&header, &l).unwrap_err(),
+                TlsError::BadRecord,
+                "{version:?}"
+            );
+        }
         assert_eq!(
             HelloParser::parse(b"\x16\x03\x01\x00\x00", &l).unwrap_err(),
             TlsError::BadRecord
@@ -1168,6 +1190,59 @@ pub(crate) mod tests {
             HelloParser::parse(&many.records(16_384), &HelloLimits::new()).unwrap_err(),
             TlsError::HelloOverBudget { what: "extension" }
         );
+    }
+
+    #[test]
+    fn test_parse_budgets_at_n_minus_one_n_n_plus_one_t14() {
+        let parse = |b: &HelloBuilder, l: &HelloLimits| {
+            HelloParser::parse(&b.records(16_384), l).map(|_| ())
+        };
+        // Cipher suites, limit 4.
+        let l = HelloLimits::new().max_ciphers(4).unwrap();
+        for (n, ok) in [(3u16, true), (4, true), (5, false)] {
+            let mut b = HelloBuilder::new();
+            b.ciphers = (1..=n).collect();
+            assert_eq!(parse(&b, &l).is_ok(), ok, "{n} cipher suites");
+        }
+        // ALPN names, default limit 32.
+        for (n, ok) in [(31, true), (32, true), (33, false)] {
+            let names: Vec<&[u8]> = vec![b"x"; n];
+            let b = HelloBuilder::new().alpn(&names);
+            assert_eq!(parse(&b, &HelloLimits::new()).is_ok(), ok, "{n} ALPN names");
+        }
+        // Extensions, default limit 64.
+        for (n, ok) in [(63u16, true), (64, true), (65, false)] {
+            let mut b = HelloBuilder::new();
+            for t in 0..n {
+                b = b.ext(0x7000 + t, vec![]);
+            }
+            assert_eq!(parse(&b, &HelloLimits::new()).is_ok(), ok, "{n} extensions");
+        }
+        // The hello's length, default limit 16 KiB, padded with extension 21.
+        let max = HelloLimits::new().max_hello_bytes as usize;
+        let bare = HelloBuilder::new().ext(21, vec![]).body().len() - 4;
+        for (len, ok) in [(max - 1, true), (max, true), (max + 1, false)] {
+            let b = HelloBuilder::new().ext(21, vec![0; len - bare]);
+            assert_eq!(b.body().len() - 4, len);
+            let r = parse(&b, &HelloLimits::new());
+            assert_eq!(r.is_ok(), ok, "a {len}-byte hello: {r:?}");
+            if !ok {
+                assert_eq!(r.unwrap_err(), TlsError::HelloTooLarge);
+            }
+        }
+        // Records, default limit 4: a 400-byte hello in 3, 4, and 5 records.
+        let bare = HelloBuilder::new().ext(21, vec![]).body().len();
+        let b = HelloBuilder::new().ext(21, vec![0; 400 - bare]);
+        assert_eq!(b.body().len(), 400);
+        for (chunk, records, ok) in [(134, 3, true), (100, 4, true), (80, 5, false)] {
+            let wire = b.records(chunk);
+            assert_eq!(wire.len(), 400 + 5 * records);
+            let r = HelloParser::parse(&wire, &HelloLimits::new());
+            assert_eq!(r.is_ok(), ok, "{records} records: {r:?}");
+            if !ok {
+                assert_eq!(r.unwrap_err(), TlsError::HelloTooFragmented);
+            }
+        }
     }
 
     #[test]

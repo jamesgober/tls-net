@@ -141,17 +141,33 @@ Interleaved, 9 rounds of 3 seconds, net-io 0.6.1, load about 130.
 - Handshakes: 1.45x the rate, the reactor's shorter turnaround. CPU per handshake is 5% above tokio-rustls's, so at saturation the two would be about even. The same run at load 500 gave 0.88x the rate; the rate is a property of the client and the machine as much as of the server, which is why D-105 counts CPU too.
 - Both stacks send exactly four data segments per connection (flight, tickets, response, close_notify; counted from the client's `TCP_INFO`). Within the reactor's profile, send syscalls are about 25% of a handshake's CPU and accept, poll, and epoll about 8%.
 
+### net-io 0.6.2
+
+Same method, net-io 0.6.2, load about 530 (the soak and six fuzz targets had just ended; other work kept the machine busy). `tls-net-shared` is one listener shared by the workers with net-io's default linger, the setup 0.6.2's placement fix is for (net-io D-174, D-177); `tls-net` is the per-worker setup above.
+
+| Stack | Handshakes/s | Server CPU per handshake | Bulk MB/s (8 connections) | Server CPU per GB |
+|---|---|---|---|---|
+| tls-net, per-worker listeners | 506 | 1,099 µs | 265 | 3,422 ms |
+| tls-net, one shared listener | 503 | 1,051 µs | 287 | 3,434 ms |
+| tokio + tokio-rustls | 540 | 832 µs | 222 | 3,556 ms |
+| tokio + tokio-openssl | 353 | 1,774 µs | 204 | 4,179 ms |
+
+- The shared listener now matches the per-worker setup (rate within 1%, CPU within 5%, inside the run's spread): 0.6.2 no longer piles short connections onto one worker.
+- At this load tls-net's CPU per handshake is 0.76x to 0.79x tokio-rustls's, against 0.96x at load 130. Not profiled at this load; the likely cause is the reactor's per-connection syscalls (above), which a contended machine makes dearer. The 1.0 gate is judged at the lower load or on bare metal, and on net-io 0.8 (D-180).
+- Bulk holds its lead: 1.2x to 1.3x the rate, about the same CPU per byte.
+
 ### Idle connections
 
 `perf/idle.sh`: the client completes N handshakes and holds the connections; server RSS before and after. `WARM=1` fetches a 32 KiB page on each connection first.
 
 | Stack | Cold: open, bytes each | Warm: open, bytes each |
 |---|---|---|
-| tls-net on net-io reactor | 4,096, 25,792 | 3,288, 102,051 |
+| tls-net on net-io 0.6.1 | 4,096, 25,792 | 3,288, 102,051 |
+| tls-net on net-io 0.6.2 | 9,000, 9,991 | 9,000, 39,322 |
 | tokio + tokio-rustls | 9,000, 11,418 | 9,000, 11,651 |
 | tokio + tokio-openssl | 9,000, 15,816 | 9,000, 15,816 |
 
-net-io 0.6.1 keeps two 64 KiB buffers per TLS connection for its whole life, which also caps the reactor at 4,096 TLS connections under its default 512 MiB buffer budget (connection 4,097 closes with `Limit(Connections)`).
+net-io 0.6.1 keeps two 64 KiB buffers per TLS connection for its whole life, which also caps the reactor at 4,096 TLS connections under its default 512 MiB buffer budget (connection 4,097 closes with `Limit(Connections)`). On 0.6.2 all 9,000 connections open, and a connection that has never carried data costs 13% less than tokio-rustls's; one that has carried a page still keeps 3.4x as much, the buffers net-io 0.7.0 gives back while a connection is idle (net-io D-181). tokio-rustls's 0.6.2-run figures (11,447 cold, 11,563 warm) match the table's.
 
 ---
 
@@ -160,12 +176,12 @@ net-io 0.6.1 keeps two 64 KiB buffers per TLS connection for its whole life, whi
 | Gap | Where | Plan |
 |---|---|---|
 | CPU per handshake 0.96x tokio-rustls (target 1.2x) | net-io reactor | Send the tickets, the first response, and close_notify together when one turn produces them (four sends per connection to two), and accept on the worker when listeners are per worker. Reported to net-io with profiles; re-measured on each net-io release |
-| idle memory 2.3x tokio-rustls (target 0.7x) and the 4,096-connection ceiling | net-io reactor | Return TLS buffers to the pool while a connection is idle; tls-net keeps no state in them once input is consumed and output sent. Reported to net-io |
+| idle memory after traffic 3.4x tokio-rustls on net-io 0.6.2 (target 0.7x; the 4,096-connection ceiling of 0.6.1 is gone) | net-io reactor | net-io 0.7.0 gives TLS buffers back to the pool while a connection is idle (net-io D-181); tls-net keeps no state in them once input is consumed and output sent. Re-measured on 0.7.0 |
 | `ServerReader::accept` 37 ns (target 20 ns) | tls-net | Four atomic operations are left, the capacity gate's and the snapshot's reference count; going lower would give up the server-wide handshake bound (D-102). Accepted |
 | D-035 copy, one extra copy per received record | rustls 0.23 | rustls 0.24's in-place reads (0.9) |
 | bare-metal Linux numbers | hardware | Re-run `perf/` and the paired bench on bare-metal Linux when one is available |
 
-The first two rows are scheduled in net-io 0.8 (net-io D-180, and the idle buffer release reported with them). They are part of the 1.0 gate (D-106): 1.0 does not ship until both are met.
+The first row is scheduled in net-io 0.8 (net-io D-180); the second is fixed in net-io 0.7.0 (net-io D-181) and is re-measured there. They are part of the 1.0 gate (D-106): 1.0 does not ship until both are met.
 
 ---
 
