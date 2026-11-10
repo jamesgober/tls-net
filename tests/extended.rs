@@ -101,6 +101,9 @@ fn test_mtls_required_without_certificate_refused() {
         .unwrap();
     let p = connect(&server, &plain_client(), "localhost");
     assert_eq!(p.s.error, Some(TlsError::PeerCertificateRequired));
+    // The alert rustls sent is the one the session reports: certificate_required.
+    assert_eq!(p.server.alert(), Some(116));
+    assert_eq!(p.c.error, Some(TlsError::AlertReceived { alert: 116 }));
 }
 
 #[test]
@@ -130,6 +133,10 @@ fn test_mtls_pinned_client_key() {
         .unwrap();
     let p = connect(&wrong, &mtls_client(), "localhost");
     assert_eq!(p.s.error, Some(TlsError::PinMismatch));
+    // A refused key is answered with certificate_unknown, and the session
+    // (and its `HandshakeFailed` event) says so.
+    assert_eq!(p.server.alert(), Some(46));
+    assert_eq!(p.c.error, Some(TlsError::AlertReceived { alert: 46 }));
 }
 
 #[test]
@@ -156,6 +163,8 @@ fn test_pinned_server_identity_with_and_without_chain() {
         };
         let p = run(&server, client.connect_to(&bad).unwrap());
         assert_eq!(p.c.error, Some(TlsError::PinMismatch));
+        assert_eq!(p.client.alert(), Some(46), "require_chain {require_chain}");
+        assert_eq!(p.server.alert(), Some(46), "require_chain {require_chain}");
     }
     // A client without anchors can only use a pin without a chain.
     let bare = ClientBuilder::new().build().unwrap();

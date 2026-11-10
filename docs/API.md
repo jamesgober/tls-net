@@ -1168,7 +1168,7 @@ impl ServerSession {   // ClientSession has the same methods
     pub fn input_capacity_required(&self) -> usize;
     pub fn set_tag(&mut self, tag: u64);        // opaque id echoed in events (for example a connection id)
     pub fn error_code(&self) -> Option<u16>;    // the code that failed the session, once Failed
-    pub fn alert(&self) -> Option<u8>;          // the TLS alert sent or received when it failed (D-061)
+    pub fn alert(&self) -> Option<u8>;          // the alert received, or sent where known, when it failed (D-061, D-139)
 }
 impl ServerSession {
     pub fn fingerprint(&self) -> Option<&Fingerprint>;   // P1 0.4, once the ClientHello is parsed (D-079)
@@ -1464,7 +1464,7 @@ Type conversions only: no extra state, no allocation. Works with net-io `>= 0.7,
 | `PeerMisbehaved`, `DecryptFailed`, `HelloMalformed`, `NotTls`, `BadRecord`, `DuplicateExtension`, budgets | `TlsFailure::Protocol` |
 | everything else | `TlsFailure::Handshake` |
 
-`net_io::TlsError::code` is `TlsError::code()`; `alert` is the alert sent or received.
+`net_io::TlsError::code` is `TlsError::code()`; `alert` is the alert received, or the alert sent where tls-net knows which (`ServerSession::alert`, D-139).
 
 ---
 

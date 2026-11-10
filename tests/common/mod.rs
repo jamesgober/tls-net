@@ -171,6 +171,14 @@ pub struct TcpClient {
     out: Vec<u8>,
 }
 
+/// A socket error as the session sees it, with what the socket said kept
+/// on stderr: a reset, a timeout, and a refused write all end as
+/// `UncleanClose`, and a failing test should say which.
+fn socket_error(op: &str, e: &std::io::Error) -> TlsError {
+    eprintln!("socket {op}: {:?} {e}", e.kind());
+    TlsError::UncleanClose
+}
+
 impl TcpClient {
     pub fn new(sock: std::net::TcpStream, session: ClientSession) -> Self {
         sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -203,7 +211,7 @@ impl TcpClient {
         if written > 0 {
             self.sock
                 .write_all(&self.out[..written])
-                .map_err(|_| TlsError::UncleanClose)?;
+                .map_err(|e| socket_error("write", &e))?;
         }
         self.inbuf.copy_within(consumed..self.filled, 0);
         self.filled -= consumed;
@@ -215,9 +223,10 @@ impl TcpClient {
             let n = self
                 .sock
                 .read(&mut self.inbuf[self.filled..])
-                .map_err(|_| TlsError::UncleanClose)?;
+                .map_err(|e| socket_error("read", &e))?;
             if n == 0 {
-                let _ = self.session.on_eof();
+                let eof = self.session.on_eof();
+                eprintln!("socket closed by the peer: on_eof {eof:?}");
                 return Err(TlsError::UncleanClose);
             }
             self.filled += n;
@@ -249,11 +258,28 @@ impl TcpClient {
         use std::io::Write;
         for part in data.chunks(16_384) {
             let n = self.session.encrypt(part, &mut self.out)?;
-            self.sock
-                .write_all(&self.out[..n])
-                .map_err(|_| TlsError::UncleanClose)?;
+            if let Err(e) = self.sock.write_all(&self.out[..n]) {
+                let _ = socket_error("write", &e);
+                return Err(self.refusal());
+            }
         }
         Ok(())
+    }
+
+    /// Why the peer reset the connection, when it said so first. A TLS 1.3
+    /// client finishes its handshake before the server checks its
+    /// certificate, so a refused client learns it on its first write: the
+    /// server's alert came first and, on Linux, can still be read after the
+    /// reset (Windows discards it).
+    fn refusal(&mut self) -> TlsError {
+        for _ in 0..16 {
+            match self.turn() {
+                Err(e) => return e,
+                Ok(Some(d)) if d.is_empty() => break,
+                Ok(_) => {}
+            }
+        }
+        TlsError::UncleanClose
     }
 }
 

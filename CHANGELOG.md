@@ -13,6 +13,36 @@
 
 ---
 
+## [0.9.1] - 2026-11-09
+
+Polish. A fix to match the documentation, a missing fuzz target, and the 1.0
+readiness note. No API change.
+
+### Fixed
+
+- `ServerSession::alert`, `ClientSession::alert`, and `TlsEvent::HandshakeFailed`
+  now report the alert rustls sent for a refused certificate (for example
+  `certificate_unknown` for a client key that matches no pin) and for a
+  missing client certificate the server requires (`certificate_required`).
+  They reported `None`. Other alerts rustls sends are still `None`, as the
+  docs now say (D-139).
+
+### Tests
+
+- The back-channel tests print the server's events, the socket error behind
+  `UncleanClose`, and the peer's alert when it arrived before a reset, so the
+  one unexplained CI failure of 0.9.0 can be traced if it recurs.
+- A seventh fuzz target, `import_sealed`: arbitrary bytes as a ticket-key
+  hand-off never import, and sealed as an export's plaintext only the two
+  layouts an export writes import (D-140).
+
+### Documentation
+
+- `docs/STABILITY-1.0.md`: the 1.0 readiness note, a draft that lists every
+  gate item as met or open, with the evidence and the decisions left.
+
+---
+
 ## [0.9.0] - 2026-11-08
 
 Beta. The API is frozen: later changes are additive or fix a finding.
@@ -350,7 +380,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/jamesgober/tls-net/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/tls-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/tls-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/tls-net/compare/v0.7.0...v0.7.1

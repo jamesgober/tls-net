@@ -312,11 +312,23 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Prints the back-channel server's events, so a failing run shows what the
+/// server saw as well as what the client got.
+struct Log;
+
+impl tls_net::TlsObserver for Log {
+    fn on_event(&self, event: &tls_net::TlsEvent<'_>) {
+        eprintln!("server event: {event:?}");
+    }
+}
+
 /// Answers a line with the principal net-io reports for the connection: the
 /// SHA-256 of the verified client key, as the application maps it.
 fn echo_line(conn: &mut TcpConnection) -> Result<(), NetError> {
     let mut buf = [0u8; 256];
-    let n = conn.read(&mut buf)?;
+    let n = conn
+        .read(&mut buf)
+        .inspect_err(|e| eprintln!("server read: {e:?}"))?;
     let peer = conn
         .info()
         .tls
@@ -325,7 +337,8 @@ fn echo_line(conn: &mut TcpConnection) -> Result<(), NetError> {
         .map_or_else(|| "none".to_owned(), |h| hex(h));
     let mut reply = format!("{peer} ").into_bytes();
     reply.extend_from_slice(&buf[..n]);
-    conn.write_all(&reply)?;
+    conn.write_all(&reply)
+        .inspect_err(|e| eprintln!("server write: {e:?}"))?;
     Ok(())
 }
 
@@ -336,6 +349,7 @@ fn back_channel(pins: &[[u8; 32]]) -> (net_io::Server, SocketAddr) {
         .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
         .unwrap()
         .client_auth(ClientAuth::pinned(Some(trust()), pins))
+        .observer(Arc::new(Log))
         .build()
         .unwrap();
     let server = ServerBuilder::new()
