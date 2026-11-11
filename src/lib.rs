@@ -170,6 +170,14 @@ pub mod fuzz {
         ring.as_ref().is_some_and(|r| r.decrypt(data).is_some())
     }
 
+    /// A ticket-key hand-off import on arbitrary bytes: first as the sealed
+    /// export (never imports: the wrap key's tag fails), then as the
+    /// plaintext of an export sealed with the right key and header (imports
+    /// exactly the two layouts an export has). Never panics.
+    pub fn import_sealed(data: &[u8]) -> (bool, bool) {
+        crate::tickets::fuzz_import(data)
+    }
+
     /// PEM and DER intake on arbitrary bytes.
     pub fn pem_intake(data: &[u8]) {
         let _ = crate::pem::key_from_pem(data);

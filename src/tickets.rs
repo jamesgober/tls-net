@@ -460,6 +460,35 @@ impl fmt::Debug for TicketKeyRingHandle {
     }
 }
 
+/// The `import_sealed` fuzz target: `data` imported as a sealed export,
+/// then sealed as an export's plaintext under the right key and header and
+/// imported. Returns whether each import succeeded. A fresh ring per input,
+/// so a crash replays alone.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_import(data: &[u8]) -> (bool, bool) {
+    let mode = TicketMode::Ratchet {
+        seed: TicketSeed::from_bytes([5; 32]),
+        period: Duration::from_secs(3600),
+    };
+    let Ok(Some(ring)) = TicketKeyRing::new(&mode) else {
+        return (false, false);
+    };
+    let handle = TicketKeyRingHandle::new(Arc::new(ring));
+    let wrap = [9u8; 32];
+    let forged = handle.import_sealed(&wrap, data).is_ok();
+    let mut header = [0u8; EXPORT_HEADER];
+    header[0] = EXPORT_VERSION;
+    header[1] = MODE_RATCHET;
+    header[2..10].copy_from_slice(&handle.ring.epoch().to_be_bytes());
+    header[10..].copy_from_slice(&handle.ring.period.to_be_bytes());
+    let Ok(sealed) = Crypt::xchacha20_poly1305().encrypt_with_aad(&wrap, data, &header) else {
+        return (forged, false);
+    };
+    let mut whole = header.to_vec();
+    whole.extend_from_slice(&sealed);
+    (forged, handle.import_sealed(&wrap, &whole).is_ok())
+}
+
 impl TicketKeyRingHandle {
     pub(crate) fn new(ring: Arc<TicketKeyRing>) -> Self {
         TicketKeyRingHandle { ring }

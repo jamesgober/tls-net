@@ -108,12 +108,15 @@ pub enum SessionState {
 /// The two rustls connection types, behind one shape.
 pub(crate) trait Engine: Send {
     type Data;
+    /// Whether this is the server side.
+    const SERVER: bool;
     fn process<'c, 'i>(&'c mut self, input: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data>;
     fn common(&self) -> &rustls::CommonState;
 }
 
 impl Engine for UnbufferedServerConnection {
     type Data = ServerConnectionData;
+    const SERVER: bool = true;
     fn process<'c, 'i>(
         &'c mut self,
         input: &'i mut [u8],
@@ -127,6 +130,7 @@ impl Engine for UnbufferedServerConnection {
 
 impl Engine for UnbufferedClientConnection {
     type Data = ClientConnectionData;
+    const SERVER: bool = false;
     fn process<'c, 'i>(
         &'c mut self,
         input: &'i mut [u8],
@@ -152,6 +156,23 @@ enum Stop {
 /// Whether `bytes` starts with a whole TLS record (header and payload).
 fn complete_record_at(bytes: &[u8]) -> bool {
     bytes.len() >= 5 && bytes.len() - 5 >= usize::from(u16::from_be_bytes([bytes[3], bytes[4]]))
+}
+
+/// The alert rustls queues with `e`, where rustls defines which: a
+/// certificate a verifier refused goes through the public `CertificateError`
+/// mapping, and a server that requires a client certificate and got none
+/// sends `certificate_required`. Every other alert rustls picks internally
+/// and does not expose, so it is not guessed here.
+fn sent_alert(e: &rustls::Error, server: bool) -> Option<u8> {
+    match e {
+        rustls::Error::InvalidCertificate(c) => {
+            Some(u8::from(rustls::AlertDescription::from(c.clone())))
+        }
+        rustls::Error::NoCertificatesPresented if server => {
+            Some(u8::from(rustls::AlertDescription::CertificateRequired))
+        }
+        _ => None,
+    }
 }
 
 /// State shared by both session kinds.
@@ -447,6 +468,8 @@ impl<C: Engine> Core<C> {
                     }
                     let mapped = error::from_rustls(&e);
                     if let TlsError::AlertReceived { alert } = mapped {
+                        self.alert = Some(alert);
+                    } else if let Some(alert) = sent_alert(&e, C::SERVER) {
                         self.alert = Some(alert);
                     }
                     failed = Some(mapped);
@@ -1079,7 +1102,10 @@ impl ServerSession {
         self.core.error_code()
     }
 
-    /// The TLS alert sent or received when the session failed.
+    /// The TLS alert received, or sent, when the session failed. Sent alerts
+    /// are known for tls-net's own refusals, a refused certificate, and a
+    /// missing client certificate the server requires; for other failures
+    /// rustls picks the alert without exposing it, and this is `None` (D-139).
     #[must_use]
     pub fn alert(&self) -> Option<u8> {
         self.core.alert()
@@ -1246,7 +1272,10 @@ impl ClientSession {
         self.core.error_code()
     }
 
-    /// The TLS alert sent or received when the session failed.
+    /// The TLS alert received, or sent, when the session failed. Sent alerts
+    /// are known for tls-net's own refusals, a refused certificate, and a
+    /// missing client certificate the server requires; for other failures
+    /// rustls picks the alert without exposing it, and this is `None` (D-139).
     #[must_use]
     pub fn alert(&self) -> Option<u8> {
         self.core.alert()

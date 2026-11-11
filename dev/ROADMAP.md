@@ -90,10 +90,15 @@ Exit: rustls 0.24 (or the next stable line) adopted if released (D-007), with ex
 ## v0.9.x - Pre-1.0 polish
 Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by item, what is met and what still needs James.
 - [ ] Revisit every gap and every deferred item in this file and in `PLAN.md`; close each or record why it waits for after 1.0.
+- [ ] An unexplained failure: once in CI's interop job on PR 9 (run 42558963453), `test_back_channel_principal_per_peer` got `UncleanClose` on the first peer, 70 ms after the test started; it passed on the rerun, in every other job, and locally (170 runs on WSL; 600 more at 0.9.1 on two CPUs under load). What 0.9.1 found: a TLS 1.3 client completes before the server checks its certificate, so any server-side refusal reaches the client as a reset on its first write, which the test helper reported as `UncleanClose` (the refused-key case of `test_back_channel_pinned_client_key` does exactly this). So the failure is most likely the server refusing a valid peer, not a transport fault. Ruled out: the read timeout (70 ms), port sharing (net-io sets `SO_REUSEPORT` only for per-worker listeners), descriptors leaking into the spawned curl, OpenSSL and Go (close-on-exec), net-io releasing buffers with bytes in them (it waits until all ciphertext is consumed), the handshake capacity (1,024) and net-io's buffer budget (64 MiB). The test now prints the server's events and handler errors, the socket error behind `UncleanClose`, and the server's alert when one arrived before the reset (D-139); the next failure names the refusal. Not a release blocker: nothing yet points at tls-net's code; not closed until explained.
 - [ ] Re-tune handshake and throughput performance against the 0.6 baselines; no regression over 5%.
 - [ ] The end-to-end item carried from 0.6 (D-106): CPU per handshake against tokio-rustls, measured with `perf/` on the net-io release that ships coalesced sends and accept in the worker. Idle memory is met on net-io 0.7.1 (D-123).
 - [ ] Re-run the security review (threat table, attack tests, dependency footprint, `cargo audit`, `cargo deny`).
-- [ ] Check webpki-roots, rustls, and the provider for newer releases.
+- [x] Check webpki-roots, rustls, and the provider for newer releases: every dependency is on its newest stable release at 0.9.1 (rustls 0.23.46, aws-lc-rs 1.19.0, ring 0.17.14, webpki-roots 1.0.11, rustls-platform-verifier 0.7.1); rustls 0.24 is still 0.24.0-dev.2.
+- [x] The 1.0 readiness note: `docs/STABILITY-1.0.md` (draft, D-140).
+- [ ] The `import_sealed` fuzz target (added at 0.9.1, D-140): its 24-hour run.
+- [ ] The edge-case list of PLAN section 10 (59 groups) written out next to the tests and checked off against them.
+- [x] `alert()` and `HandshakeFailed::alert` report the alerts rustls sends for certificate refusals (D-139).
 
 ## v1.0.0 - Stable (James's explicit go)
 - [ ] Full audit recorded in `docs/STABILITY-1.0.md` (API, docs, tests, benchmarks, security).

@@ -85,7 +85,8 @@ pub enum TlsEvent<'a> {
         tag: u64,
         /// The error code (`TLS-nnnn`).
         code: u16,
-        /// The alert sent or received.
+        /// The alert received, or sent where tls-net knows which (as
+        /// `ServerSession::alert`).
         alert: Option<u8>,
         /// Where the session was.
         stage: SessionState,
