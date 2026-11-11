@@ -219,7 +219,7 @@ fn test_unknown_name_refused_with_unrecognized_name_t25() {
 #[test]
 fn test_capacity_gate_refuses_then_releases() {
     let server = site()
-        .limits(HandshakeLimits::server().max_in_progress(1).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(1))
         .build()
         .unwrap();
     let first = server.accept().unwrap();
@@ -231,7 +231,7 @@ fn test_capacity_gate_refuses_then_releases() {
     // A completed handshake released its slot.
     assert!(server.accept().is_ok());
     let zero = site()
-        .limits(HandshakeLimits::server().max_in_progress(0).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(0))
         .build()
         .unwrap();
     assert_eq!(zero.accept().unwrap_err(), TlsError::HandshakeCapacity);
@@ -533,19 +533,19 @@ fn test_publish_changes_the_handshake_limit() {
     // The gate is the server's, but its limit follows each publish: 0
     // drains, a higher limit lets a spike through (D-132).
     let server = site()
-        .limits(HandshakeLimits::server().max_in_progress(10).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(10))
         .build()
         .unwrap();
     let held = server.accept().unwrap();
     server
         .reload_handle()
-        .publish(site().limits(HandshakeLimits::server().max_in_progress(0).unwrap()))
+        .publish(site().limits(HandshakeLimits::server().max_in_progress(0)))
         .unwrap();
     assert_eq!(server.accept().unwrap_err(), TlsError::HandshakeCapacity);
     drop(held);
     server
         .reload_handle()
-        .publish(site().limits(HandshakeLimits::server().max_in_progress(2).unwrap()))
+        .publish(site().limits(HandshakeLimits::server().max_in_progress(2)))
         .unwrap();
     let (a, b) = (server.accept().unwrap(), server.accept().unwrap());
     assert_eq!(server.accept().unwrap_err(), TlsError::HandshakeCapacity);

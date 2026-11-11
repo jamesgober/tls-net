@@ -49,6 +49,7 @@ Every public item in `tls-net`: signature, behaviour, errors, cost, and examples
   - [`UnknownName`](#unknownname)
   - [`Alpn` and `AlpnPolicy`](#alpn-and-alpnpolicy)
   - [`HostPolicy`](#hostpolicy)
+  - [`HostScope`](#hostscope)
   - [`ClientAuth`](#clientauth)
   - [`HandshakeLimits`](#handshakelimits)
   - [`HelloLimits`](#hellolimits)
@@ -505,6 +506,7 @@ impl TlsServer {
     pub fn reload_from_pem(&self, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), TlsError>;                // P0 0.4
     pub fn reload_from_files(&self, chain: impl AsRef<Path>, key: impl AsRef<Path>) -> Result<(), TlsError>; // P0 0.4
     pub fn expiry_report(&self, now: SystemTime) -> ExpiryReport;  // P1 0.4
+    pub fn host_scope(&self, server_name: Option<&str>) -> HostScope; // P0 0.10
     pub fn ticket_keys(&self) -> Option<TicketKeyRingHandle>;      // P2 0.5
     pub fn stats(&self) -> ServerStats;                            // P1 0.5
     pub fn provider_name(&self) -> &'static str;                   // P1 0.3
@@ -550,7 +552,7 @@ impl ServerBuilder {
 }
 ```
 
-**Behaviour.** Methods that parse return `Result` at once, so an error points at the call that caused it. `certificate` registers the default entry (names from its SANs); the first `certificate` call is the default. `certificate_for` registers an entry for explicit names, each of which must be covered by the certificate. `build` checks the cross-field rules:
+**Behaviour.** Methods that parse return `Result` at once, so an error points at the call that caused it. Settings may come in any order: a certificate added before `load_limits`, `validity_skew`, or `allow_group_readable_key` changed is loaded again at `build` under the final values, as a reload loads it (D-148). `limits` and `load_limits` clamp fields set directly to the setters' ranges (D-147). `certificate` registers the default entry (names from its SANs); the first `certificate` call is the default. `certificate_for` registers an entry for explicit names, each of which must be covered by the certificate. `build` checks the cross-field rules:
 
 - at least one certificate;
 - names unique across entries, except one ECDSA plus one RSA entry per name (FR-19);
@@ -558,7 +560,7 @@ impl ServerBuilder {
 - the policy is consistent with the provider (FR-8);
 - ALPN names unique;
 - `ClientAuth::required` and `optional` anchors non-empty;
-- with feature `net-io`, `max_fragment_size` at least 512 (D-049);
+- with feature `net-io`, `max_fragment_size` at least 512 (D-049) and no ALPN name longer than 32 bytes, the most net-io carries (D-152);
 - `dangerous_key_log` together with a FIPS configuration is refused (D-040).
 
 With feature `dangerous-keylog`, `KeyLogSink` receives NSS key log lines (for Wireshark while debugging); never enable it in production:
@@ -690,19 +692,61 @@ impl HostPolicy {
 
 Overrides for the named hosts; unset fields inherit the server's. The session picks the host from its own parse of the SNI before the rustls connection exists, and each host group's certificate resolver only resolves names of that group (D-032). A host policy that names a group the provider lacks fails `build`.
 
-```rust,no_run
+**A host policy is applied by SNI, and holds only if the HTTP layer checks `Host`.** A client that sends another name the same certificate covers, or no SNI at all, gets the default group's rules: no client certificate, in the example below. It can then send `Host: admin.example.test` on that connection. Get a [`HostScope`](#hostscope) for each connection and refuse every request whose `Host` (or `:authority`) it does not permit, with `421 Misdirected Request` (T-31, D-143). A separate certificate for the admin host does not remove the need: the attacker is the client and does not have to verify the server.
+
+```rust
 # let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
 # let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
 # let (chain, key) = (read("site.pem"), read("site.key"));
-# let (wildcard_chain, wildcard_key) = (chain.clone(), key.clone());
 # let admin_ca = tls_net::TrustAnchors::from_pem(&read("ca.pem"))?;
 use tls_net::{Alpn, ClientAuth, HostPolicy, KeySource, TlsServer};
+// site.pem covers *.example.test.
 let server = TlsServer::builder()
-    .certificate(&wildcard_chain, KeySource::Pem(&wildcard_key))?
-    .host(&["admin.example.com"], HostPolicy::new()
+    .certificate(&chain, KeySource::Pem(&key))?
+    .alpn(&[Alpn::H2, Alpn::HTTP_1_1])
+    .host(&["admin.example.test"], HostPolicy::new()
         .alpn(&[Alpn::H2])
         .client_auth(ClientAuth::required(admin_ca)))?
     .build()?;
+// After each handshake, from HandshakeInfo::server_name (or net-io's TlsInfo::sni):
+let scope = server.host_scope(Some("www.example.test"));
+assert!(!scope.permits("admin.example.test")); // answer 421
+# Ok::<(), tls_net::TlsError>(())
+```
+
+### `HostScope`
+
+P0, `0.10.0`.
+
+```rust,ignore
+#[derive(Clone, Debug)]
+pub struct HostScope { /* the snapshot's names, and the connection's host group */ }
+impl HostScope {
+    pub fn permits(&self, host: &str) -> bool;
+}
+impl TlsServer {
+    pub fn host_scope(&self, server_name: Option<&str>) -> HostScope;
+}
+```
+
+The hosts one connection may serve: those in the host group its server name resolves to. `permits(host)` is `true` when `host` resolves, by the same rules as SNI (exact name, then wildcard, then the default when unknown names get it), to that group.
+
+- `host` is a `Host` or `:authority` value: a DNS name, IPv4 address, or bracketed IPv6 address, with an optional `:port`. Names are normalised as SNI is (case, one trailing dot).
+- An IP address resolves as a hello without SNI does.
+- Anything else (`a b`, `host:8o`, a name with control bytes) is `false`, as is every host when the connection's own name resolves to no host (unknown names refused).
+- Without host policies every name the server serves is in one scope, so `permits` only refuses names the server does not serve when unknown names are refused.
+- Connections in one group can be coalesced (HTTP/2 or HTTP/3 reuse for another host the certificate covers); a request for another group gets `false`, the `421` sends the client to a new connection.
+
+`host_scope` reads the current configuration: one lock and an `Arc` clone, as `accept`, so call it once per connection and keep the scope. `permits` is at most two hash lookups, without a lock or an allocation. After a reload, a scope taken before it keeps the old host groups; take a new one to follow the reload. The scope holds the snapshot's name table only, never a certificate or key.
+
+```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let server = tls_net::server_from_pem(&read("site.pem"), &read("site.key"))?;
+let scope = server.host_scope(None);
+assert!(scope.permits("localhost:8443"));
+assert!(scope.permits("[::1]:443"));
+assert!(!scope.permits("bad host"));
 # Ok::<(), tls_net::TlsError>(())
 ```
 
@@ -729,7 +773,8 @@ pub fn certificate_der_from_pem(pem: &[u8]) -> Result<Vec<Vec<u8>>, TlsError>;
 - `required` verifies the client chain against `anchors` (rustls-webpki), with optional CRLs; no certificate is `PeerCertificateRequired` (`TLS-0038`).
 - `optional` also allows a client without a certificate; `HandshakeInfo::peer` is then `None`, and upper layers must treat that as anonymous.
 - `pinned` requires the end-entity SPKI SHA-256 to equal one of the pins (constant-time compare). With `anchors`, the chain is verified first. Without anchors, a self-issued certificate is accepted only when its SPKI matches a pin, and the handshake signature and validity window are still verified (T-6b).
-- CRLs are checked against the anchors' chain, so `with_crls` on `none()` or on `pinned(None, ..)` is `PolicyInvalid` at `build` rather than accepted and never applied (D-131).
+- CRLs are checked against the anchors' chain, so `with_crls` on `none()` or on `pinned(None, ..)` is `PolicyInvalid` at `build` rather than accepted and never applied (D-131). The client side has the same rule (D-145).
+- `HandshakeInfo::peer_verified` is `true` for every completed handshake under `required`; `peer` can still be `None` when tls-net cannot read the verified certificate's identity (more than 1,024 SANs, for example), so authorise on what `peer` contains.
 - CA name hints are sent by default; `hide_ca_names()` clears them when the CA names are themselves sensitive.
 
 Peer chain budgets come from `HandshakeLimits` (default 5 certificates of at most 16 KiB).
@@ -742,7 +787,7 @@ P0, `0.3.0`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandshakeLimits {
-    pub max_in_progress: u32,       // server: 1,024
+    pub max_in_progress: u32,       // 1,024; read by servers only
     pub max_handshake_bytes: u32,   // server 32 KiB, 96 KiB with client auth; client 128 KiB
     pub max_peer_chain_len: u8,     // 5 for client certificates, 10 for server certificates
     pub max_peer_cert_bytes: u32,   // 16 KiB / 32 KiB
@@ -750,7 +795,7 @@ pub struct HandshakeLimits {
 impl HandshakeLimits {
     pub fn server() -> Self;
     pub fn client() -> Self;
-    pub fn max_in_progress(self, n: u32) -> Result<Self, TlsError>;      // 0 refuses every session (allowed, for drains)
+    pub const fn max_in_progress(self, n: u32) -> Self;                  // 0 refuses every session (for drains); infallible since 0.10
     pub fn max_handshake_bytes(self, n: u32) -> Result<Self, TlsError>;  // 4 KiB ..= 1 MiB
     pub fn max_peer_chain_len(self, n: u8) -> Result<Self, TlsError>;    // 1 ..= 16
     pub fn max_peer_cert_bytes(self, n: u32) -> Result<Self, TlsError>;  // 1 KiB ..= 64 KiB
@@ -758,7 +803,7 @@ impl HandshakeLimits {
 impl Default for HandshakeLimits { /* server() */ }
 ```
 
-When `max_handshake_bytes` is left at its default and the server has client authentication, the 96 KiB default applies. Out-of-range setters return `PolicyInvalid`.
+When `max_handshake_bytes` is left at its default and the server has client authentication, the 96 KiB default applies. Out-of-range setters return `PolicyInvalid`; a field set directly outside a setter's range is clamped to it when the limits reach a builder (D-147).
 
 ### `HelloLimits`
 
@@ -812,7 +857,7 @@ impl LoadLimits { pub fn new() -> Self; /* setters with ranges as above, each re
 impl Default for LoadLimits { /* new() */ }
 ```
 
-Budgets for certificate and key intake (PLAN 6.5, checks 1, 3, and 11).
+Budgets for certificate and key intake (PLAN 6.5, checks 1, 3, and 11). Ranges: chain input 1 KiB to 16 MiB, key input 256 bytes to 1 MiB, chain length 1 to 32. A field set directly outside its range is clamped to it by `ServerBuilder::load_limits` (D-147): the key reader sizes its buffer from `max_key_file_bytes`.
 
 ---
 
@@ -940,7 +985,7 @@ impl ClientBuilder {
     pub fn send_sni(self, on: bool) -> Self;                                                           // P2 0.3 (default on)
     pub fn limits(self, limits: HandshakeLimits) -> Self;                                              // P0 0.3
     pub fn client_certificate(self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError>;  // P0 0.4
-    pub fn crls(self, crls: Crls, policy: RevocationPolicy) -> Self;                                   // P2 0.4
+    pub fn crls(self, crls: Crls, policy: RevocationPolicy) -> Self;                                   // P2 0.4 (needs trust, 0.10)
     pub fn observer(self, observer: Arc<dyn TlsObserver>) -> Self;                                     // P1 0.5
     #[cfg(feature = "dangerous-keylog")]
     pub fn dangerous_key_log(self, sink: Arc<dyn KeyLogSink>) -> Self;                                 // P3 0.5
@@ -948,7 +993,7 @@ impl ClientBuilder {
 }
 ```
 
-A client without anchors can only connect to `ServerIdentity::Pinned { require_chain: false, .. }`; `connect` and other identities return `PolicyInvalid { reason: "no trust anchors" }`. There is no method that disables verification, in any feature (FR-25). Client certificates get the same load-time checks as server certificates, with `clientAuth` in place of `serverAuth`.
+A client without anchors can only connect to `ServerIdentity::Pinned { require_chain: false, .. }`; `connect` and other identities return `PolicyInvalid { reason: "no trust anchors" }`. CRLs are checked on the chain, so `crls` without `trust` fails `build`, and a client with CRLs refuses a pinned identity without `require_chain` at `connect_to` (D-145). There is no method that disables verification, in any feature (FR-25). Client certificates get the same load-time checks as server certificates, with `clientAuth` in place of `serverAuth`.
 
 ```rust
 use tls_net::{Alpn, TlsClient, TrustAnchors};
@@ -1106,7 +1151,7 @@ pub enum ExpiryState { Ok, Warn, Critical, Expired }
 pub enum KeyType { EcdsaP256, EcdsaP384, Ed25519, Rsa { bits: u16 } }
 ```
 
-Thresholds: `Warn` below max(7 days, lifetime / 3), `Critical` below max(2 days, lifetime / 10), `Expired` at or after `not_after`. Proportional thresholds keep short-lived certificates from warning right after issuance.
+Thresholds: `Warn` below the longer of 7 days and lifetime / 3, but at most lifetime / 2; `Critical` below the longer of 2 days and lifetime / 10, but at most lifetime / 5; `Expired` at or after `not_after` (D-144). A certificate is `Ok` when issued, however short its life: a 6-hour certificate warns at 3 hours and is critical at 72 minutes.
 
 ---
 
@@ -1137,7 +1182,7 @@ pub enum TicketSeed {
 impl TicketSeed { pub fn from_bytes(bytes: [u8; 32]) -> TicketSeed; }
 ```
 
-`period` from 1 minute to 24 hours, else `PolicyInvalid`. Default for Tier 1: `Ephemeral { period: 6 h }`. Recommended for a single host that restarts with a socket hand-off: `Ratchet` (D-010). `Derived` gives clusters shared tickets, and anyone with the root can derive every past key, so rotate the root. `tickets(mode, per_handshake)`: `per_handshake` 0 to 8 (default 2); 0 stops issuing tickets while still accepting valid ones until the ring advances. Ticket format, ring, and costs: PLAN 6.8.
+`period` from 1 minute to 24 hours, else `PolicyInvalid`. A ticket opens for one `period` after it was issued, its advertised lifetime; its issue time is in the authenticated header (D-151). Default for Tier 1: `Ephemeral { period: 6 h }`. Recommended for a single host that restarts with a socket hand-off: `Ratchet` (D-010). `Derived` gives clusters shared tickets, and anyone with the root can derive every past key, so rotate the root. `tickets(mode, per_handshake)`: `per_handshake` 0 to 8 (default 2); 0 stops issuing tickets while still accepting valid ones until the ring advances. Ticket format, ring, and costs: PLAN 6.8.
 
 ```rust
 # let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
@@ -1190,7 +1235,8 @@ pub struct HandshakeInfo<'s> {
     pub alpn: Option<&'s [u8]>,
     pub server_name: Option<&'s str>,            // normalised SNI (server side) or the name used (client side)
     pub kind: HandshakeKind,
-    pub peer: Option<&'s PeerIdentity>,
+    pub peer_verified: bool,                     // the peer's certificate was verified (always on a client); 0.10
+    pub peer: Option<&'s PeerIdentity>,          // built on the first info() call (D-104)
     pub fingerprint: Option<&'s Fingerprint>,    // server side, when enabled
     pub early_data_accepted: bool,               // always false before early data (P3) exists
 }
@@ -1200,7 +1246,7 @@ pub struct HandshakeInfo<'s> {
 pub enum HandshakeKind { Full, FullWithHelloRetry, Resumed }
 ```
 
-`ServerSession::info()` and `ClientSession::info()` return `None` before `HandshakeComplete`. The server's certificate resolver checks rustls's view of the SNI against the session's host group before a certificate is chosen; a disagreement refuses the handshake and is counted (D-064). `peer` and `fingerprint` arrive in `0.4.0`.
+`ServerSession::info()` and `ClientSession::info()` return `None` before `HandshakeComplete`. The server's certificate resolver checks rustls's view of the SNI against the session's host group before a certificate is chosen; a disagreement refuses the handshake and is counted (D-064). `peer` and `fingerprint` arrive in `0.4.0`. On a server, pass `server_name` to [`TlsServer::host_scope`](#hostscope) to check the requests the connection carries.
 
 ### `PeerIdentity`
 
@@ -1390,7 +1436,6 @@ pub enum Event<'i> {
     Transmit,           // `written` bytes at the start of `output` must be sent, all of them
     HandshakeComplete,  // once; info() is now Some
     Data(&'i [u8]),     // plaintext, a slice of `input`, valid while Progress lives; call step again
-    EarlyData(&'i [u8]),// P3, only with dangerous_enable_early_data
     OutputFull,         // fewer than MIN_OUTPUT_BUFFER bytes free in `output`; flush and call again
     PeerClosed,         // close_notify received; the plaintext stream ended cleanly
     Closed,             // both directions closed
@@ -1633,7 +1678,7 @@ Type conversions only: no extra state, no allocation. Works with net-io `>= 0.7,
 |---|---|
 | `Event::NeedInput`, `Transmit`, `HandshakeComplete`, `Data`, `OutputFull`, `PeerClosed`, `Closed` | the `TlsEvent` of the same name |
 | `on_eof()` | `on_transport_closed()` |
-| `info()` | `TlsInfo::new(sni, alpn, version code, suite code)` (ALPN over 32 bytes is reported as absent), with `with_peer_spki_sha256` when the peer sent a certificate tls-net verified (0.8.0) |
+| `info()` | `TlsInfo::new(sni, alpn, version code, suite code)` (a server refuses ALPN names over 32 bytes at build, D-152), with `with_peer_spki_sha256` when the peer sent a certificate tls-net verified (0.8.0) |
 | `Refused` | `TlsFailure::HelloRefused` |
 | `HandshakeCapacity` | `TlsFailure::Capacity` |
 | `OutputFull` | `TlsFailure::OutputFull` |

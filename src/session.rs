@@ -726,6 +726,7 @@ impl<C: Engine> Core<C> {
             common.alpn_protocol(),
             server_name,
             kind,
+            self.peer_chain().is_some_and(|c| !c.is_empty()),
         ))
     }
 
@@ -774,7 +775,9 @@ impl<C: Engine> Core<C> {
 /// `Send`, not `Sync`: one connection is driven by one thread at a time.
 pub struct ServerSession {
     core: Core<UnbufferedServerConnection>,
-    state: crate::sync::Shared<ServerState>,
+    /// The snapshot the session was accepted under; `None` once the
+    /// handshake has ended (D-146).
+    state: Option<crate::sync::Shared<ServerState>>,
     slot: Option<CapacitySlot>,
     /// Boxed so an idle session does not carry a 254-byte name buffer (D-096).
     sni: Option<Box<str>>,
@@ -808,7 +811,7 @@ impl ServerSession {
         let max = state.limits.max_handshake_bytes;
         ServerSession {
             core: Core::new(None, SessionState::Hello, max),
-            state,
+            state: Some(state),
             slot: Some(slot),
             sni: None,
             fingerprint: None,
@@ -842,11 +845,19 @@ impl ServerSession {
         r
     }
 
-    /// Counters and events after a step.
+    /// Counters and events after a step. Once the handshake has ended, the
+    /// session lets go of its configuration snapshot (D-146): nothing after
+    /// it reads the snapshot, and holding it would keep every certificate and
+    /// private key of an old configuration alive after a reload.
     fn observe(&mut self, before: SessionState, complete: bool) {
-        let obs = &self.state.obs;
+        let Some(state) = &self.state else {
+            return;
+        };
+        let obs = &state.obs;
         if complete {
-            if let Some(info) = self.info() {
+            // Without the peer identity, which is built on first use (D-104).
+            if let Some(mut info) = self.core.info(self.sni.as_deref()) {
+                info.fingerprint = self.fingerprint.as_ref();
                 record_completion(obs, &info, &self.core);
             }
         }
@@ -864,6 +875,13 @@ impl ServerSession {
                 record_failure(obs, &self.core, before);
             }
         }
+        let ended = !matches!(
+            self.core.state,
+            SessionState::Hello | SessionState::Handshake
+        );
+        if ended && self.slot.is_none() {
+            self.state = None;
+        }
     }
 
     fn step_inner<'i>(
@@ -878,7 +896,10 @@ impl ServerSession {
             return self.core.take_held(input);
         }
         if self.core.state == SessionState::Hello {
-            match parse_client_hello(input, &self.state.hello_limits) {
+            let Some(state) = self.state.as_ref() else {
+                return Err(self.core.fail(TlsError::Other));
+            };
+            match parse_client_hello(input, &state.hello_limits) {
                 Ok(HelloParse::Incomplete { needed }) => {
                     self.core.hello_needed = needed;
                     return Ok(Progress {
@@ -889,9 +910,9 @@ impl ServerSession {
                 }
                 Ok(HelloParse::Complete { view, .. }) => {
                     self.sni = view.normalized_server_name().map(|n| n.as_str().into());
-                    let kinds = self.state.fingerprints;
+                    let kinds = state.fingerprints;
                     let fingerprint = Fingerprint::compute(&view, kinds);
-                    if let Some(hook) = &self.state.hook {
+                    if let Some(hook) = &state.hook {
                         let ctx = HelloContext {
                             view: &view,
                             fingerprint: &fingerprint,
@@ -901,12 +922,12 @@ impl ServerSession {
                         if let HelloVerdict::Refuse(reason) = hook.on_client_hello(&ctx) {
                             // No alert: a scanner learns nothing (D-014).
                             self.refusal = Some(HelloRefusal::Hook(reason));
-                            self.release();
+                            release(&mut self.slot, Some(state));
                             return Err(self.core.fail(TlsError::Refused(reason)));
                         }
                     }
-                    if self.state.obs.sample() {
-                        self.state.obs.emit(&TlsEvent::HelloCaptured {
+                    if state.obs.sample() {
+                        state.obs.emit(&TlsEvent::HelloCaptured {
                             tag: self.core.tag,
                             view: &view,
                             fingerprint: &fingerprint,
@@ -915,13 +936,12 @@ impl ServerSession {
                     if kinds != crate::fingerprint::FingerprintKinds::NONE {
                         self.fingerprint = Some(fingerprint);
                     }
-                    let Some(slot) = self.state.table.lookup(self.sni.as_deref()) else {
+                    let Some(slot) = state.table.lookup(self.sni.as_deref()) else {
                         self.refusal = Some(HelloRefusal::UnknownName);
-                        self.release();
+                        release(&mut self.slot, Some(state));
                         return self.core.refuse_unknown_name(output);
                     };
-                    let group = self
-                        .state
+                    let group = state
                         .groups
                         .get(slot.group)
                         .copied()
@@ -929,12 +949,11 @@ impl ServerSession {
                     self.group = Some(group);
                     if group.alpn_required && !view.has_alpn() {
                         self.refusal = Some(HelloRefusal::AlpnRequired);
-                        self.release();
+                        release(&mut self.slot, Some(state));
                         return self.core.refuse_no_alpn(output);
                     }
                     self.core.set_max_handshake_bytes(group.max_handshake_bytes);
-                    let config = self
-                        .state
+                    let config = state
                         .configs
                         .get(slot.group)
                         .cloned()
@@ -942,18 +961,18 @@ impl ServerSession {
                     match UnbufferedServerConnection::new(config) {
                         Ok(conn) => self.core.set_conn(conn),
                         Err(e) => {
-                            self.release();
+                            release(&mut self.slot, Some(state));
                             return Err(self.core.fail(error::from_rustls(&e)));
                         }
                     }
                 }
-                Err(e) if self.state.hello_limits.refuse_malformed || is_not_tls(&e) => {
+                Err(e) if state.hello_limits.refuse_malformed || is_not_tls(&e) => {
                     self.refusal = Some(if e.code() == 32 {
                         HelloRefusal::OverBudget
                     } else {
                         HelloRefusal::Malformed
                     });
-                    self.release();
+                    release(&mut self.slot, Some(state));
                     return Err(self.core.fail(e));
                 }
                 Err(e) => {
@@ -961,17 +980,17 @@ impl ServerSession {
                     // fingerprint. Only where nothing else depends on the
                     // hello: with a hook, host groups, or a required ALPN the
                     // hello is refused as before (D-127).
-                    let first = self.state.groups.first().copied();
-                    let lenient = self.state.groups.len() == 1
-                        && self.state.hook.is_none()
+                    let first = state.groups.first().copied();
+                    let lenient = state.groups.len() == 1
+                        && state.hook.is_none()
                         && first.is_some_and(|g| !g.alpn_required);
                     if !lenient {
                         self.refusal = Some(HelloRefusal::Malformed);
-                        self.release();
+                        release(&mut self.slot, Some(state));
                         return Err(self.core.fail(e));
                     }
                     self.group = first;
-                    let config = self.state.configs.first().cloned().ok_or(TlsError::Other)?;
+                    let config = state.configs.first().cloned().ok_or(TlsError::Other)?;
                     let conn = UnbufferedServerConnection::new(config)
                         .map_err(|e| self.core.fail(error::from_rustls(&e)))?;
                     self.core.set_conn(conn);
@@ -1019,7 +1038,10 @@ impl ServerSession {
                 }
             }
         }
-        let limits = self.state.limits;
+        let Some(state) = &self.state else {
+            return Err(TlsError::Other);
+        };
+        let limits = state.limits;
         if let Some(chain) = self.core.peer_chain() {
             let too_large = chain.len() > usize::from(limits.max_peer_chain_len)
                 || chain
@@ -1033,9 +1055,7 @@ impl ServerSession {
     }
 
     fn release(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            self.state.capacity.release(slot);
-        }
+        release(&mut self.slot, self.state.as_ref());
     }
 
     /// Encrypts all of `plaintext` into `output`, or writes nothing.
@@ -1112,6 +1132,16 @@ impl ServerSession {
     }
 }
 
+/// Gives back the handshake slot, if the session still holds one. A free
+/// function, so the hello path can call it while it borrows the snapshot.
+fn release(slot: &mut Option<CapacitySlot>, state: Option<&crate::sync::Shared<ServerState>>) {
+    if let Some(state) = state {
+        if let Some(slot) = slot.take() {
+            state.capacity.release(slot);
+        }
+    }
+}
+
 fn is_not_tls(e: &TlsError) -> bool {
     matches!(
         e,
@@ -1180,7 +1210,8 @@ impl ClientSession {
         let before = self.core.state;
         let r = self.step_inner(input, output);
         if matches!(&r, Ok(p) if p.event == Event::HandshakeComplete) {
-            if let Some(info) = self.info() {
+            // Without the peer identity, which is built on first use (D-104).
+            if let Some(info) = self.core.info(Some(&self.server_name)) {
                 record_completion(&self.obs, &info, &self.core);
             }
         }
@@ -1308,7 +1339,7 @@ fn record_completion<C: Engine>(obs: &Observation, info: &HandshakeInfo<'_>, cor
         server_name: info.server_name,
         kind: info.kind,
         duration: core.started.map(|t| t.elapsed()).unwrap_or_default(),
-        peer_certificate: core.peer_chain().is_some_and(|c| !c.is_empty()),
+        peer_certificate: info.peer_verified,
         fingerprint: info.fingerprint,
     });
 }

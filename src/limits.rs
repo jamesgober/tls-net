@@ -7,7 +7,7 @@ use crate::error::TlsError;
 /// peer's certificate chain.
 ///
 /// ```
-/// let limits = tls_net::HandshakeLimits::server().max_in_progress(64)?;
+/// let limits = tls_net::HandshakeLimits::server().max_in_progress(64);
 /// assert_eq!(limits.max_in_progress, 64);
 /// assert!(tls_net::HandshakeLimits::server().max_handshake_bytes(10).is_err());
 /// # Ok::<(), tls_net::TlsError>(())
@@ -15,7 +15,7 @@ use crate::error::TlsError;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandshakeLimits {
-    /// Handshakes in progress per server (server default 1,024).
+    /// Handshakes in progress per server (default 1,024; a client ignores it).
     pub max_in_progress: u32,
     /// Inbound bytes before the handshake completes (server 32 KiB, client 128 KiB).
     pub max_handshake_bytes: u32,
@@ -54,14 +54,12 @@ impl HandshakeLimits {
         }
     }
 
-    /// Handshakes in progress; 0 refuses every new session (for a drain).
-    ///
-    /// # Errors
-    ///
-    /// Never; returns `Result` for symmetry with the other setters.
-    pub fn max_in_progress(mut self, n: u32) -> Result<Self, TlsError> {
+    /// Handshakes in progress per server; 0 refuses every new session (for
+    /// a drain). A client ignores it.
+    #[must_use]
+    pub const fn max_in_progress(mut self, n: u32) -> Self {
         self.max_in_progress = n;
-        Ok(self)
+        self
     }
 
     /// Inbound handshake bytes, 4 KiB to 1 MiB.
@@ -107,5 +105,16 @@ impl HandshakeLimits {
         }
         self.max_peer_cert_bytes = n;
         Ok(self)
+    }
+
+    /// The fields held to the setters' ranges: a field set directly takes
+    /// any value, and `max_handshake_bytes` is a DoS budget (D-147).
+    pub(crate) fn clamped(self) -> Self {
+        HandshakeLimits {
+            max_in_progress: self.max_in_progress,
+            max_handshake_bytes: self.max_handshake_bytes.clamp(4 << 10, 1 << 20),
+            max_peer_chain_len: self.max_peer_chain_len.clamp(1, 16),
+            max_peer_cert_bytes: self.max_peer_cert_bytes.clamp(1 << 10, 64 << 10),
+        }
     }
 }

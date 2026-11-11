@@ -15,8 +15,32 @@
 
 ## [0.10.0] - 2026-11-11
 
-Simplicity. An audit of the API against how it is used, and a fix for every
-finding, renames included. Migration: `docs/MIGRATION-0.10.md`.
+Simplicity, and the fixes from a review of 0.9.1. An audit of the API
+against how it is used, and a fix for every finding, renames included; and
+a fix with a regression test for every finding of the review. Migration:
+`docs/MIGRATION-0.10.md`.
+
+### Security
+
+- Host policies: a client that sent no SNI, or another name the same
+  certificate covers, got the default group's rules (for example no client
+  certificate) and could then send a request for the protected host.
+  `TlsServer::host_scope(server_name)` gives each connection a `HostScope`,
+  and `HostScope::permits(host)` tells the HTTP layer whether a request's
+  `Host` belongs to the connection's host group; answer `421` when it does
+  not. `HostPolicy` documents the check as required (D-143, T-31).
+- An established session no longer keeps the configuration it was accepted
+  under, private keys included, alive after a reload (D-146).
+- A client's CRLs need trust anchors, and a client with CRLs refuses a
+  pinned identity without `require_chain`; before, the CRLs could be
+  accepted and never applied (D-145).
+- Tickets carry their issue time and open for one period, their advertised
+  lifetime, instead of up to two (D-151). Tickets issued by 0.9 are refused
+  once after the upgrade: those clients do one full handshake.
+- `LoadLimits` and `HandshakeLimits` fields set directly are clamped to the
+  setters' ranges (D-147).
+- With feature `net-io`, an ALPN name longer than 32 bytes is refused at
+  `build`; net-io would have reported it as no ALPN (D-152).
 
 ### Added
 
@@ -28,6 +52,11 @@ finding, renames included. Migration: `docs/MIGRATION-0.10.md`.
   `UnexpectedEof` error carrying `UncleanClose` (D-141).
 - `TlsError::Transport { kind }` (`TLS-0047`): the transport under a
   `TlsStream` failed.
+- `HostScope` and `TlsServer::host_scope` (D-143).
+- `HandshakeInfo::peer_verified`: whether the peer's certificate was
+  verified. `peer` can be `None` when a verified certificate cannot be read,
+  so authorise on `peer`, not on this alone.
+- A fuzz target for `Host` values, `host_value`.
 
 ### Changed
 
@@ -39,6 +68,18 @@ finding, renames included. Migration: `docs/MIGRATION-0.10.md`.
 - `ServerStats::snapshot_version` is `config_version`.
 - `docs/API.md` follows the house format, and every example in it and in the
   README is compiled as a doctest (D-142).
+- `HandshakeLimits::max_in_progress` returns `Self`; it could not fail.
+- Expiry thresholds never put a certificate in `Warn` or `Critical` when it
+  is issued: a certificate under 2 days was `Critical` for its whole life
+  (D-144).
+- Builder settings may come in any order: a certificate added before
+  `load_limits`, `validity_skew`, or `allow_group_readable_key` changed is
+  loaded again at `build`, so startup and reload check the same files the
+  same way (D-148).
+- `Policy::versions` on a preset follows with the preset's suites, so
+  `Policy::modern().versions(&[Tls13, Tls12])` builds (D-150).
+- The peer identity is built on the first `info()` call, as D-104 meant; the
+  completion counters had built it on every handshake (D-149).
 
 ### Removed
 
@@ -47,6 +88,13 @@ finding, renames included. Migration: `docs/MIGRATION-0.10.md`.
   `stats().config_version`.
 - `ServerBuilder::new`, `ClientBuilder::new`, and their `Default` impls:
   `TlsServer::builder()` and `TlsClient::builder()` are the way in (D-142).
+
+### Documentation
+
+- `docs/OPERATIONS.md`: a root certificate in the chain file is sent, not
+  ignored; the expiry thresholds; the ticket lifetime.
+- `docs/API.md`: `Event::EarlyData` does not exist and is gone from the
+  listing; the `HostPolicy` example now shows the `Host` check.
 
 ---
 

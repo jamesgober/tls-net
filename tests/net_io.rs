@@ -158,11 +158,7 @@ fn test_t13_stalled_handshake_releases_its_slot_at_the_deadline() {
     let tls = TlsServer::builder()
         .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
         .unwrap()
-        .limits(
-            tls_net::HandshakeLimits::server()
-                .max_in_progress(1)
-                .unwrap(),
-        )
+        .limits(tls_net::HandshakeLimits::server().max_in_progress(1))
         .build()
         .unwrap();
     let limits = net_io::Limits::blocking_defaults()

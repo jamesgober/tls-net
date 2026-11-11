@@ -126,11 +126,7 @@ fn test_t13_capacity_refuses_before_any_parse() {
     let server = TlsServer::builder()
         .certificate(&data("site.pem"), KeySource::Pem(&data("site.key")))
         .unwrap()
-        .limits(
-            tls_net::HandshakeLimits::server()
-                .max_in_progress(10)
-                .unwrap(),
-        )
+        .limits(tls_net::HandshakeLimits::server().max_in_progress(10))
         .build()
         .unwrap();
     let held: Vec<_> = (0..10).map(|_| server.accept().unwrap()).collect();

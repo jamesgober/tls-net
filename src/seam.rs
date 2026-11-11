@@ -59,7 +59,8 @@ fn progress(p: Progress<'_>) -> TlsProgress<'_> {
 fn info(i: Option<HandshakeInfo<'_>>) -> Option<TlsInfo> {
     let i = i?;
     let (version, suite) = (i.version.wire(), i.cipher_suite.wire());
-    // net-io keeps at most 32 bytes of ALPN; a longer name is reported as absent.
+    // net-io keeps at most 32 bytes of ALPN; a longer name is reported as
+    // absent. A server refuses such names at build (D-152).
     let t = TlsInfo::new(i.server_name, i.alpn, version, suite)
         .or_else(|| TlsInfo::new(i.server_name, None, version, suite))?;
     // A peer identity exists only for a certificate rustls verified (the chain,

@@ -63,3 +63,9 @@ path = "fuzz_targets/import_sealed.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "host_value"
+path = "fuzz_targets/host_value.rs"
+test = false
+doc = false

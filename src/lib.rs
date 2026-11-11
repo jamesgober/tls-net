@@ -179,6 +179,13 @@ pub mod fuzz {
         crate::tickets::fuzz_import(data)
     }
 
+    /// `HostScope::permits` on an arbitrary `Host` value: never panics, and
+    /// permits only a value that is a host name, IPv4, or bracketed IPv6
+    /// address, in the scope's own group.
+    pub fn host_value(data: &[u8]) -> bool {
+        std::str::from_utf8(data).is_ok_and(crate::sni::fuzz_host)
+    }
+
     /// PEM and DER intake on arbitrary bytes.
     pub fn pem_intake(data: &[u8]) {
         let _ = crate::pem::key_from_pem(data);
@@ -221,7 +228,7 @@ pub use session::{
     ClientSession, CloseKind, Event, MAX_RECORD_PAYLOAD, MIN_INPUT_BUFFER, MIN_OUTPUT_BUFFER,
     Progress, ServerSession, SessionState,
 };
-pub use sni::{NormalizedName, normalize_server_name};
+pub use sni::{HostScope, NormalizedName, normalize_server_name};
 pub use stream::TlsStream;
 pub use tickets::{SealedTicketKeys, TicketKeyRingHandle, TicketMode, TicketSeed};
 pub use verify::{ClientAuth, Crls, RevocationPolicy};

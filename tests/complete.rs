@@ -77,7 +77,7 @@ fn test_events_and_stats_server() {
         .observer(Arc::clone(&rec) as Arc<dyn TlsObserver>)
         .hello_sampling(1)
         .unknown_name(UnknownName::Refuse)
-        .limits(HandshakeLimits::server().max_in_progress(4).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(4))
         .build()
         .unwrap();
     let c = client();
@@ -528,7 +528,7 @@ fn test_t27_half_open_handshakes_hold_no_rustls_state() {
     // Sessions that have sent one byte of a ClientHello hold only tls-net's
     // session struct: the rustls connection is created after the hello.
     let server = site()
-        .limits(HandshakeLimits::server().max_in_progress(10_000).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(10_000))
         .build()
         .unwrap();
     let mut sessions = Vec::with_capacity(10_000);
