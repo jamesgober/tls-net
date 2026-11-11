@@ -64,7 +64,7 @@ fn test_t7_tls12_client_without_ems_refused() {
 
 #[test]
 fn test_t5_starttls_injection_refused() {
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();
@@ -137,9 +137,9 @@ fn test_t13_capacity_refuses_before_any_parse() {
     for _ in 0..1000 {
         assert_eq!(server.accept().unwrap_err(), TlsError::HandshakeCapacity);
     }
-    assert_eq!(server.handshakes_in_progress(), 10);
+    assert_eq!(server.stats().in_progress, 10);
     drop(held);
-    assert_eq!(server.handshakes_in_progress(), 0);
+    assert_eq!(server.stats().in_progress, 0);
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn test_t25_every_unknown_name_gets_identical_alert() {
 }
 
 fn test_ca_client() -> ClientBuilder {
-    ClientBuilder::new().trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
+    TlsClient::builder().trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
 }
 
 /// The handshake between a tls-net client and a plain rustls server that
@@ -368,7 +368,7 @@ fn test_t18_reload_with_expired_certificate_refused_old_one_kept() {
         .allow_group_readable_key(true)
         .build()
         .unwrap();
-    let before = server.stats().snapshot_version;
+    let before = server.stats().config_version;
     let refused =
         server.reload_from_files(format!("{dir}expired.pem"), format!("{dir}expired.key"));
     let cause = match &refused {
@@ -380,7 +380,7 @@ fn test_t18_reload_with_expired_certificate_refused_old_one_kept() {
         matches!(cause, TlsError::CertificateExpired { .. }),
         "{refused:?}"
     );
-    assert_eq!(server.stats().snapshot_version, before);
+    assert_eq!(server.stats().config_version, before);
     let client = test_ca_client().build().unwrap();
     let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
     let (mut ss, mut cs) = (

@@ -29,7 +29,8 @@ fn failure(e: &TlsError) -> TlsFailure {
         | E::HelloOverBudget { .. }
         | E::HandshakeTooLarge
         | E::PeerChainTooLarge
-        | E::UncleanClose => TlsFailure::Protocol,
+        | E::UncleanClose
+        | E::Transport { .. } => TlsFailure::Protocol,
         _ => TlsFailure::Handshake,
     }
 }

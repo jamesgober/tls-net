@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use common::{End, TcpClient, data, pump};
 use tls_net::{
-    ClientBuilder, HandshakeLimits, KeySource, Policy, ServerBuilder, TicketMode, TicketSeed,
-    TlsClient, TlsError, TlsEvent, TlsObserver, TlsServer, TrustAnchors, UnknownName,
+    HandshakeLimits, KeySource, Policy, ServerBuilder, TicketMode, TicketSeed, TlsClient, TlsError,
+    TlsEvent, TlsObserver, TlsServer, TrustAnchors, UnknownName,
 };
 
 fn ca() -> TrustAnchors {
@@ -25,7 +25,7 @@ fn site() -> ServerBuilder {
 }
 
 fn client() -> TlsClient {
-    ClientBuilder::new().trust(ca()).build().unwrap()
+    TlsClient::builder().trust(ca()).build().unwrap()
 }
 
 fn connect(
@@ -139,7 +139,7 @@ fn test_events_and_stats_server() {
     assert_eq!(stats.handshakes_resumed, 1);
     assert_eq!(stats.hello_refusals, 1);
     assert_eq!(stats.capacity_refusals, 2);
-    assert_eq!(stats.snapshot_version, 2);
+    assert_eq!(stats.config_version, 2);
     assert!(stats.tickets_issued >= 2);
     #[cfg(feature = "aws-lc")]
     assert_eq!(
@@ -152,7 +152,7 @@ fn test_events_and_stats_server() {
 fn test_events_client_failure() {
     let rec = Arc::new(Recorder::default());
     let server = site().build().unwrap();
-    let c = ClientBuilder::new()
+    let c = TlsClient::builder()
         .trust(ca())
         .observer(Arc::clone(&rec) as Arc<dyn TlsObserver>)
         .build()
@@ -241,7 +241,7 @@ fn test_t24_sealed_keys_refused_when_wrong() {
     let (mut s, mut se, mut cl, mut ce) = connect(&old, &c, "localhost");
     pump(&mut s, &mut se, &mut cl, &mut ce);
     old.ticket_keys().unwrap().rotate_now().unwrap();
-    let c2 = ClientBuilder::new().trust(ca()).build().unwrap();
+    let c2 = TlsClient::builder().trust(ca()).build().unwrap();
     let _ = c2;
     let (s3, ..) = connect(&old, &c, "localhost");
     assert_ne!(
@@ -540,7 +540,7 @@ fn test_t27_half_open_handshakes_hold_no_rustls_state() {
         assert_eq!(p.event, tls_net::Event::NeedInput);
         sessions.push(s);
     }
-    assert_eq!(server.handshakes_in_progress(), 10_000);
+    assert_eq!(server.stats().in_progress, 10_000);
     assert!(server.accept().is_err(), "the cap holds");
     assert!(
         std::mem::size_of::<tls_net::ServerSession>() < 2048,
@@ -548,7 +548,7 @@ fn test_t27_half_open_handshakes_hold_no_rustls_state() {
         std::mem::size_of::<tls_net::ServerSession>()
     );
     drop(sessions);
-    assert_eq!(server.handshakes_in_progress(), 0);
+    assert_eq!(server.stats().in_progress, 0);
 }
 
 #[test]

@@ -1,7 +1,24 @@
-# tls-net &mdash; API Reference
+<h1 align="center">
+    <img width="90px" height="auto" src="https://raw.githubusercontent.com/jamesgober/jamesgober/main/media/icons/hexagon-3.svg" alt="Triple Hexagon">
+    <br><b>tls-net</b><br>
+    <sub><sup>API REFERENCE</sup></sub>
+</h1>
+<div align="center">
+    <sup>
+        <a href="../README.md" title="Project Home"><b>HOME</b></a>
+        <span>&nbsp;│&nbsp;</span>
+        <span>API</span>
+        <span>&nbsp;│&nbsp;</span>
+        <a href="./OPERATIONS.md" title="Operations"><b>OPERATIONS</b></a>
+        <span>&nbsp;│&nbsp;</span>
+        <a href="./SECURITY.md" title="Security"><b>SECURITY</b></a>
+        <span>&nbsp;│&nbsp;</span>
+        <a href="./PERFORMANCE.md" title="Performance"><b>PERFORMANCE</b></a>
+    </sup>
+</div>
+<br>
 
-> Every public item in `tls-net`, with signatures, behaviour, errors, cost, and examples.
-> **Status: `0.9.0`, frozen.** This document is the binding API for `0.3.0` to `1.0.0`. Each item shows the version that ships it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). Items marked `0.5.0` or earlier are in the current release (0.6.0, 0.7.x, and 0.8.0 added no API; 0.9.0 added `server_name_raw` and renamed `Ja4::from_str` to `Ja4::parse`). Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md); schedule: [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+Every public item in `tls-net`: signature, behaviour, errors, cost, and examples. **Status: `0.10.0`.** Each item shows the version that shipped it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). 0.10.0 simplified the API (the simplicity audit in [`STABILITY-1.0.md`](./STABILITY-1.0.md)): `TlsStream` is new, and some names changed ([`MIGRATION-0.10.md`](./MIGRATION-0.10.md)). Every example is compiled as a doctest with the default features; those that need a network or files outside the repository are compiled but not run. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -22,6 +39,9 @@
   - [`TlsServer::expiry_report`](#tlsserverexpiry_report)
   - [`TlsClient::connect`](#tlsclientconnect)
   - [`TlsClient::start_after_plaintext`](#tlsclientstart_after_plaintext)
+  - [`TlsClient::connect_stream`](#tlsclientconnect_stream)
+  - [`TlsServer::accept_stream`](#tlsserveraccept_stream)
+  - [`TlsStream`](#tlsstream)
 - [Server configuration](#server-configuration)
   - [`TlsServer`](#tlsserver)
   - [`ServerBuilder`](#serverbuilder)
@@ -62,9 +82,9 @@
   - [`ServerSession` and `ClientSession`](#serversession-and-clientsession)
   - [`Progress`, `Event`, `CloseKind`, `SessionState`](#progress-event-closekind-sessionstate)
   - [Driving a session](#driving-a-session)
-  - [`ServerReader`](#serverreader)
+  - [`WorkerAcceptor`](#serverreader)
 - [ClientHello and fingerprints (Tier 3)](#clienthello-and-fingerprints-tier-3)
-  - [`HelloParser` and `HelloParse`](#helloparser-and-helloparse)
+  - [`parse_client_hello` and `HelloParse`](#parse_client_hello-and-helloparse)
   - [`ClientHelloView`](#clienthelloview)
   - [`Ja4`, `ja4_raw`, `ja4_original`](#ja4-ja4_raw-ja4_original)
   - [`ja3_string` and `ja3_md5`](#ja3_string-and-ja3_md5)
@@ -98,9 +118,9 @@ tls-net is a thin adapter over rustls. It never opens or reads a socket: a sessi
 
 | Tier | For | Items |
 |---|---|---|
-| 1 | about 80% of uses: one call, no builder | `server_from_pem`, `server_from_files`, `client`, `client_with_ca_pem`, `accept`, `connect`, `start_after_plaintext`, `reload_from_*`, `expiry_report` |
+| 1 | about 80% of uses: one call, no builder | `server_from_pem`, `server_from_files`, `client`, `client_with_ca_pem`, `connect_stream`, `accept_stream`, `TlsStream`, `accept`, `connect`, `start_after_plaintext`, `reload_from_*`, `expiry_report` |
 | 2 | the next 15%: builders and configuration | `ServerBuilder`, `ClientBuilder`, `Policy`, `ClientAuth`, `HostPolicy`, `TrustAnchors`, `ServerIdentity`, `ReloadHandle`, `TicketMode`, observers |
-| 3 | drivers and other libraries | sessions and their events, `ServerReader`, the ClientHello parser, fingerprints, the hook, the net-io seam |
+| 3 | drivers and other libraries | sessions and their events (`step`), `WorkerAcceptor`, the ClientHello parser, fingerprints, the hook, the net-io seam |
 
 ### Conventions
 
@@ -114,27 +134,44 @@ tls-net is a thin adapter over rustls. It never opens or reads a socket: a sessi
 
 ### Quick start
 
-```rust
-// Server: certificate files from the operator, default policy, ALPN http/1.1.
-let server = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
-let mut session = server.accept()?;          // one per accepted connection
+A client over a `TcpStream`, in two lines: Mozilla's roots, server verification always on.
 
-// Client: Mozilla roots, server verification always on.
-let client = tls_net::client()?;
-let mut session = client.connect("example.com")?;
-# Ok::<(), tls_net::TlsError>(())
+```rust,no_run
+use std::io::{Read, Write};
+let tcp = std::net::TcpStream::connect("example.com:443")?;
+let mut tls = tls_net::client()?.connect_stream("example.com", tcp)?;
+tls.write_all(b"GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n")?;
+let mut page = Vec::new();
+tls.read_to_end(&mut page)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-With net-io (feature `net-io`), a `TlsServer` is the listener's TLS acceptor:
+A server from the operator's certificate files, one connection:
 
-```rust
+```rust,no_run
+use std::io::{Read, Write};
+let tls = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
+let listener = std::net::TcpListener::bind("0.0.0.0:8443")?;
+let mut conn = tls.accept_stream(listener.accept()?.0)?;
+let mut request = [0u8; 4096];
+let n = conn.read(&mut request)?;
+conn.write_all(&request[..n])?;
+conn.close()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+With net-io (feature `net-io`), a `TlsServer` is the listener's TLS acceptor and net-io drives the sessions:
+
+```rust,no_run
 let tls = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
 let server = net_io::ServerBuilder::new()
     .listener(net_io::ListenerSpec::tcp("0.0.0.0:443").tls(true))
     .tls(tls)
-    .handler(|conn| { /* plaintext in, plaintext out */ Ok(()) })
+    .handler(|_conn: &mut net_io::TcpConnection| Ok(()))
     .gate(net_io::AllowAll)
     .build()?;
+server.open_door()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ---
@@ -145,7 +182,7 @@ let server = net_io::ServerBuilder::new()
 
 P0, `0.1.0`.
 
-```rust
+```rust,ignore
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ```
 
@@ -159,7 +196,7 @@ println!("tls-net {}", tls_net::VERSION);
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 pub fn server_from_pem(chain_pem: &[u8], key_pem: &[u8]) -> Result<TlsServer, TlsError>;
 ```
 
@@ -172,8 +209,9 @@ A server with `Policy::compatible()`, the chain and key as the default certifica
 **Cost.** Dominated by key parsing in the provider [est. under 1 ms for ECDSA P-256, a few ms for RSA-2048]; tls-net's own work under 50 µs for a 3-certificate chain [target]. Build time only.
 
 ```rust
-let chain = std::fs::read("site.pem")?;
-let key = std::fs::read("site.key")?;
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
 let server = tls_net::server_from_pem(&chain, &key)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -182,7 +220,7 @@ let server = tls_net::server_from_pem(&chain, &key)?;
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 pub fn server_from_files(chain: impl AsRef<Path>, key: impl AsRef<Path>) -> Result<TlsServer, TlsError>;
 ```
 
@@ -190,7 +228,7 @@ As `server_from_pem`, reading the files first. The size of each file is checked 
 
 **Errors.** As `server_from_pem`, plus `TLS-0010` (file cannot be read), `TLS-0012` (key file permissions; the error names the file and the mode).
 
-```rust
+```rust,no_run
 let server = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
 # Ok::<(), tls_net::TlsError>(())
 ```
@@ -199,7 +237,7 @@ let server = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key"
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 pub fn client() -> Result<TlsClient, TlsError>;
 ```
 
@@ -218,7 +256,7 @@ let client = tls_net::client()?;
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 pub fn client_with_ca_pem(ca_pem: &[u8]) -> Result<TlsClient, TlsError>;
 ```
 
@@ -226,7 +264,7 @@ A client that trusts only the given CA certificates (a private CA, an internal r
 
 **Errors.** `TLS-0001`, `TLS-0013` (malformed PEM), `TLS-0014` (`NoCertificate`), `TLS-0015` (a CA certificate rustls-webpki cannot use as an anchor).
 
-```rust
+```rust,no_run
 let client = tls_net::client_with_ca_pem(&std::fs::read("internal-ca.pem")?)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -235,7 +273,7 @@ let client = tls_net::client_with_ca_pem(&std::fs::read("internal-ca.pem")?)?;
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 impl TlsServer {
     pub fn accept(&self) -> Result<ServerSession, TlsError>;
 }
@@ -248,6 +286,11 @@ A session in state `Hello`, bound to the current configuration snapshot. It take
 **Cost.** One atomic increment and one snapshot read [target under 60 ns]; no allocation in tls-net.
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let server = tls_net::server_from_pem(&chain, &key)?;
+# let connection_id = 7;
 let mut session = server.accept()?;
 session.set_tag(connection_id);   // echoed in events
 # Ok::<(), tls_net::TlsError>(())
@@ -257,7 +300,7 @@ session.set_tag(connection_id);   // echoed in events
 
 P0, `0.4.0`.
 
-```rust
+```rust,ignore
 impl TlsServer {
     pub fn reload_from_pem(&self, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), TlsError>;
     pub fn reload_from_files(&self, chain: impl AsRef<Path>, key: impl AsRef<Path>) -> Result<(), TlsError>;
@@ -270,7 +313,11 @@ For servers built with Tier 1: replaces the single certificate, keeping policy, 
 
 **Cost.** As building, plus the swap [target under 1 µs].
 
-```rust
+```rust,no_run
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let server = tls_net::server_from_pem(&chain, &key)?;
 server.reload_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
 # Ok::<(), tls_net::TlsError>(())
 ```
@@ -279,7 +326,7 @@ server.reload_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
 
 P1, `0.4.0`.
 
-```rust
+```rust,ignore
 impl TlsServer {
     pub fn expiry_report(&self, now: SystemTime) -> ExpiryReport;
 }
@@ -290,15 +337,20 @@ Every loaded certificate with its days remaining and an `ExpiryState`. Never fai
 **Cost.** Linear in entries; one `Vec` for the report [target under 1 µs per entry].
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let server = tls_net::server_from_pem(&chain, &key)?;
 let report = server.expiry_report(std::time::SystemTime::now());
 if report.worst >= tls_net::ExpiryState::Warn { /* raise a health warning */ }
+# Ok::<(), tls_net::TlsError>(())
 ```
 
 ### `TlsClient::connect`
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 impl TlsClient {
     pub fn connect(&self, server_name: &str) -> Result<ClientSession, TlsError>;
 }
@@ -311,6 +363,10 @@ A client session for `server_name`: a DNS name in A-label form or an IP address 
 **Cost.** rustls client connection creation [est. a few µs].
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let client = tls_net::client_with_ca_pem(&read("ca.pem"))?;
 let mut session = client.connect("smtp.example.com")?;
 # Ok::<(), tls_net::TlsError>(())
 ```
@@ -319,7 +375,7 @@ let mut session = client.connect("smtp.example.com")?;
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 impl TlsClient {
     pub fn start_after_plaintext(&self, server_name: &str, leftover: &[u8]) -> Result<ClientSession, TlsError>;
 }
@@ -330,9 +386,102 @@ STARTTLS upgrade. `leftover` is every byte the protocol parser received after th
 **Errors.** `TLS-0045` (`StartTlsInjection`), `TLS-0018`.
 
 ```rust
-// After reading "220 2.0.0 Ready to start TLS\r\n" with the SMTP parser:
-let mut session = client.start_after_plaintext("smtp.example.com", parser.leftover())?;
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let client = tls_net::client_with_ca_pem(&read("ca.pem"))?;
+# let leftover: &[u8] = b"";
+// After reading "220 2.0.0 Ready to start TLS\r\n" with the SMTP parser,
+// `leftover` is whatever followed that line: it must be empty.
+let mut session = client.start_after_plaintext("smtp.example.com", leftover)?;
 # Ok::<(), tls_net::TlsError>(())
+```
+
+### `TlsClient::connect_stream`
+
+P0, `0.10.0`.
+
+```rust,ignore
+impl TlsClient {
+    pub fn connect_stream<S: Read + Write>(&self, server_name: &str, io: S) -> Result<TlsStream<S>, TlsError>;
+}
+```
+
+Connects over a blocking transport and runs the handshake. The result reads and writes plaintext. Errors: as `connect`; then the handshake's error, `Transport` (`TLS-0047`) when the transport fails, `UncleanClose` (`TLS-0043`) when it ends first.
+
+```rust,no_run
+use std::io::Write;
+let tcp = std::net::TcpStream::connect("api.example.com:443")?;
+let mut tls = tls_net::client()?.connect_stream("api.example.com", tcp)?;
+tls.write_all(b"GET /health HTTP/1.1\r\nhost: api.example.com\r\n\r\n")?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### `TlsServer::accept_stream`
+
+P0, `0.10.0`.
+
+```rust,ignore
+impl TlsServer {
+    pub fn accept_stream<S: Read + Write>(&self, io: S) -> Result<TlsStream<S>, TlsError>;
+}
+```
+
+Runs the handshake for one accepted connection over a blocking transport. Errors: as `accept` (`HandshakeCapacity`); then as `connect_stream`. On net-io, net-io drives the session instead and this is not used.
+
+### `TlsStream`
+
+P0, `0.10.0`.
+
+```rust,ignore
+pub struct TlsStream<S> { /* private */ }
+
+impl<S: Read + Write> TlsStream<S> {
+    pub fn client(session: ClientSession, io: S) -> Result<TlsStream<S>, TlsError>;   // a session from connect_to or STARTTLS
+    pub fn server(session: ServerSession, io: S) -> Result<TlsStream<S>, TlsError>;   // a session from WorkerAcceptor
+    pub fn info(&self) -> Option<HandshakeInfo<'_>>;
+    pub fn close(&mut self) -> Result<(), TlsError>;   // sends close_notify; twice is a no-op
+    pub fn get_ref(&self) -> &S;
+    pub fn get_mut(&mut self) -> &mut S;
+    pub fn into_inner(self) -> S;                      // ends without close_notify
+}
+impl<S: Read + Write> Read for TlsStream<S> {}
+impl<S: Read + Write> Write for TlsStream<S> {}        // one record per write call at most
+```
+
+The session loop every blocking caller would otherwise write around `step` (D-141). `read` returns `Ok(0)` only after the peer's `close_notify`; a transport that ends without one is an `UnexpectedEof` error carrying `TlsError::UncleanClose`, so a truncated response never looks complete (T-17). Errors through `Read` and `Write` are `io::Error`s whose inner error is the `TlsError`. For blocking transports, with or without timeouts; a write that fails part way leaves the stream unusable, and every later call fails.
+
+Cost: an input buffer of `MIN_INPUT_BUFFER` (it grows for a hello or a chain larger than one record), an output buffer of `MIN_OUTPUT_BUFFER`, and one copy of a record's plaintext when the caller's buffer is smaller than the record.
+
+```rust
+use std::io::{Read, Write};
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+let server = tls_net::server_from_pem(&read("site.pem"), &read("site.key"))?;
+let client = tls_net::client_with_ca_pem(&read("ca.pem"))?;
+let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+let addr = listener.local_addr()?;
+let served = std::thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = server.accept_stream(listener.accept()?.0)?;
+    conn.write_all(b"hello")?;
+    conn.close()?;
+    Ok(())
+});
+let mut tls = client.connect_stream("localhost", std::net::TcpStream::connect(addr)?)?;
+let mut got = String::new();
+tls.read_to_string(&mut got)?;
+assert_eq!(got, "hello");
+served.join().unwrap().unwrap();
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+STARTTLS: the session comes from `start_after_plaintext`, and the stream takes over the same socket.
+
+```rust,no_run
+# fn after_220(client: &tls_net::TlsClient, tcp: std::net::TcpStream, leftover: &[u8]) -> Result<(), tls_net::TlsError> {
+let session = client.start_after_plaintext("smtp.example.com", leftover)?;
+let tls = tls_net::TlsStream::client(session, tcp)?;
+# let _ = tls; Ok(()) }
 ```
 
 ---
@@ -343,35 +492,33 @@ let mut session = client.start_after_plaintext("smtp.example.com", parser.leftov
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone)]
 pub struct TlsServer { /* one Arc */ }
 
 impl TlsServer {
     pub fn builder() -> ServerBuilder;                       // P0 0.3
     pub fn accept(&self) -> Result<ServerSession, TlsError>; // P0 0.3
-    pub fn reader(&self) -> ServerReader;                    // P1 0.4
+    pub fn accept_stream<S: Read + Write>(&self, io: S) -> Result<TlsStream<S>, TlsError>; // P0 0.10
+    pub fn worker_acceptor(&self) -> WorkerAcceptor;        // P1 0.4 (named `reader` before 0.10)
     pub fn reload_handle(&self) -> ReloadHandle;             // P0 0.4
     pub fn reload_from_pem(&self, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), TlsError>;                // P0 0.4
     pub fn reload_from_files(&self, chain: impl AsRef<Path>, key: impl AsRef<Path>) -> Result<(), TlsError>; // P0 0.4
     pub fn expiry_report(&self, now: SystemTime) -> ExpiryReport;  // P1 0.4
-    pub fn version(&self) -> u64;                                  // P1 0.4 (D-079)
-    pub fn sni_disagreements(&self) -> u64;                        // P2 0.4 (D-079)
     pub fn ticket_keys(&self) -> Option<TicketKeyRingHandle>;      // P2 0.5
     pub fn stats(&self) -> ServerStats;                            // P1 0.5
     pub fn provider_name(&self) -> &'static str;                   // P1 0.3
-    pub fn handshakes_in_progress(&self) -> u32;                   // P1 0.3 (D-065)
     pub fn is_fips(&self) -> bool;                                 // P2 0.5
 }
 ```
 
-Cloning is one `Arc` increment; clones share the snapshot, capacity gate, ticket ring, and statistics. `Debug` prints the snapshot version, entry count, and provider, never key material.
+Cloning is one `Arc` increment; clones share the snapshot, capacity gate, ticket ring, and statistics. Handshakes in progress, the configuration version, and SNI disagreements are fields of `stats()` (one way to read them, 0.10). `Debug` prints the snapshot version, entry count, and provider, never key material.
 
 ### `ServerBuilder`
 
 P0, `0.3.0` (methods marked otherwise ship later).
 
-```rust
+```rust,ignore
 #[must_use]
 pub struct ServerBuilder { /* private */ }
 
@@ -416,7 +563,7 @@ impl ServerBuilder {
 
 With feature `dangerous-keylog`, `KeyLogSink` receives NSS key log lines (for Wireshark while debugging); never enable it in production:
 
-```rust
+```rust,ignore
 #[cfg(feature = "dangerous-keylog")]
 pub trait KeyLogSink: Send + Sync + 'static {
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]);
@@ -428,6 +575,9 @@ pub trait KeyLogSink: Send + Sync + 'static {
 **Cost.** Build time only.
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
 use tls_net::{Alpn, KeySource, Policy, TlsServer};
 
 let server = TlsServer::builder()
@@ -442,7 +592,7 @@ let server = TlsServer::builder()
 
 `Pem`, `Der`, `File` P0 `0.3.0`; `Vault` and `Resident` P1 `0.4.0`; `PerSignature` P2 `0.4.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum KeySource<'a> {
@@ -466,17 +616,20 @@ pub enum KeyCustody { #[default] Resident, PerSignature }
 - `Vault`: the key bytes exist only inside key-vault's scoped callback. The vault must be built with `normalize_with_blake3(false)`; if the bytes do not parse as a key the error is `VaultKeyUnusable` with that help text.
 - `KeyCustody::Resident` parses the key once into the provider. `PerSignature` fetches and parses it for every signature [est. 10 to 30 µs for ECDSA P-256, 50 to 150 µs for RSA-2048 per full handshake].
 
-```rust
+```rust,no_run
+use std::path::Path;
+use tls_net::{KeySource, TlsServer};
+# let chain = std::fs::read("/etc/tls/site.pem")?;
 let builder = TlsServer::builder()
     .certificate(&chain, KeySource::File(Path::new("/etc/tls/site.key")))?;
-# Ok::<(), tls_net::TlsError>(())
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### `UnknownName`
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnknownName { UseDefault, Refuse }
@@ -488,7 +641,7 @@ What a ClientHello without SNI, or with a name no entry covers, gets. `UseDefaul
 
 `Alpn` P0 `0.3.0`; `AlpnPolicy` P1 `0.4.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Alpn { /* 1..=255 bytes */ }
 
@@ -507,6 +660,7 @@ pub enum AlpnPolicy { #[default] Optional, Required }
 The server picks the first protocol in its own list that the client offered (server preference). A client that offered ALPN with no overlap is refused with `no_application_protocol` (`TLS-0036`). With `AlpnPolicy::Required`, a ClientHello without ALPN is refused too (T-15, cross-protocol attacks). A server with no ALPN list ignores the extension.
 
 ```rust
+use tls_net::Alpn;
 let smtp_only = Alpn::new(b"smtp")?;
 let back_channel = Alpn::new(b"svc-bc/1")?;
 # Ok::<(), tls_net::TlsError>(())
@@ -516,7 +670,7 @@ let back_channel = Alpn::new(b"svc-bc/1")?;
 
 P2, `0.4.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct HostPolicy {
@@ -536,7 +690,13 @@ impl HostPolicy {
 
 Overrides for the named hosts; unset fields inherit the server's. The session picks the host from its own parse of the SNI before the rustls connection exists, and each host group's certificate resolver only resolves names of that group (D-032). A host policy that names a group the provider lacks fails `build`.
 
-```rust
+```rust,no_run
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let (wildcard_chain, wildcard_key) = (chain.clone(), key.clone());
+# let admin_ca = tls_net::TrustAnchors::from_pem(&read("ca.pem"))?;
+use tls_net::{Alpn, ClientAuth, HostPolicy, KeySource, TlsServer};
 let server = TlsServer::builder()
     .certificate(&wildcard_chain, KeySource::Pem(&wildcard_key))?
     .host(&["admin.example.com"], HostPolicy::new()
@@ -550,7 +710,7 @@ let server = TlsServer::builder()
 
 `None` P0 `0.3.0`; `Required` P0, `Optional` and `Pinned` P1, `hide_ca_names` P2, all `0.4.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone, Debug, Default)]
 pub struct ClientAuth { /* private (D-067) */ }
 impl ClientAuth {
@@ -578,7 +738,7 @@ Peer chain budgets come from `HandshakeLimits` (default 5 certificates of at mos
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandshakeLimits {
@@ -604,7 +764,7 @@ When `max_handshake_bytes` is left at its default and the server has client auth
 
 P1, `0.4.0` (the parser runs with the defaults from `0.3.0`).
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HelloLimits {
@@ -639,7 +799,7 @@ impl Default for HelloLimits { /* new() */ }
 
 P1, `0.3.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadLimits {
@@ -662,7 +822,7 @@ Budgets for certificate and key intake (PLAN 6.5, checks 1, 3, and 11).
 
 P0, `0.3.0` (methods marked otherwise ship later).
 
-```rust
+```rust,ignore
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy { /* private */ }
 
@@ -700,7 +860,7 @@ let policy = tls_net::Policy::modern().cipher_suites(&[
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Version { Tls12, Tls13 }
 
@@ -722,13 +882,13 @@ pub enum SignatureScheme {
 }
 ```
 
-Each has `wire(self) -> u16` (the IANA code point) and `from_wire(u16) -> Option<Self>`, and `CipherSuite::version(self) -> Version`. `Secp256r1MlKem768` exists on aws-lc-rs and is in no preset. RSA PKCS#1 v1.5 schemes are used only for TLS 1.2 and certificate signatures; rustls refuses them for TLS 1.3 handshake signatures (D-033).
+Each has `wire(self) -> u16` (the IANA code point) and `from_wire(u16) -> Option<Self>`; `CipherSuite::version(self) -> Version` and `Group::is_post_quantum(self) -> bool` (true for the ML-KEM hybrids). `Secp256r1MlKem768` exists on aws-lc-rs and is in no preset. RSA PKCS#1 v1.5 schemes are used only for TLS 1.2 and certificate signatures; rustls refuses them for TLS 1.3 handshake signatures (D-033).
 
 ### `PolicySummary`
 
 P2, `0.5.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicySummary {
@@ -747,7 +907,7 @@ impl fmt::Display for PolicySummary { /* one line for logs and audits */ }
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone)]
 pub struct TlsClient { /* one Arc */ }
 
@@ -756,6 +916,7 @@ impl TlsClient {
     pub fn connect(&self, server_name: &str) -> Result<ClientSession, TlsError>;              // P0 0.3
     pub fn connect_to(&self, identity: &ServerIdentity) -> Result<ClientSession, TlsError>;   // P0 0.3
     pub fn start_after_plaintext(&self, server_name: &str, leftover: &[u8]) -> Result<ClientSession, TlsError>; // P0 0.3
+    pub fn connect_stream<S: Read + Write>(&self, server_name: &str, io: S) -> Result<TlsStream<S>, TlsError>; // P0 0.10
     pub fn provider_name(&self) -> &'static str;                                              // P1 0.3
     pub fn is_fips(&self) -> bool;                                                            // P2 0.5
 }
@@ -767,7 +928,7 @@ Clones share the resumption store. Separate `TlsClient` values (built separately
 
 P0, `0.3.0` (methods marked otherwise ship later).
 
-```rust
+```rust,ignore
 #[must_use]
 pub struct ClientBuilder { /* private */ }
 
@@ -790,6 +951,7 @@ impl ClientBuilder {
 A client without anchors can only connect to `ServerIdentity::Pinned { require_chain: false, .. }`; `connect` and other identities return `PolicyInvalid { reason: "no trust anchors" }`. There is no method that disables verification, in any feature (FR-25). Client certificates get the same load-time checks as server certificates, with `clientAuth` in place of `serverAuth`.
 
 ```rust
+use tls_net::{Alpn, TlsClient, TrustAnchors};
 let client = TlsClient::builder()
     .trust(TrustAnchors::mozilla())
     .alpn(&[Alpn::H2, Alpn::HTTP_1_1])
@@ -801,7 +963,7 @@ let client = TlsClient::builder()
 
 P0, `0.3.0` (`platform` P2 `0.5.0`).
 
-```rust
+```rust,ignore
 #[derive(Clone)]
 pub struct TrustAnchors { /* private, shared */ }
 
@@ -823,7 +985,7 @@ impl TrustAnchors {
 
 `Dns`, `Ip` P0 `0.3.0`; `Pinned` P1 `0.4.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerIdentity {
@@ -849,7 +1011,7 @@ impl DnsName {
 
 P2, `0.4.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone)]
 pub struct Crls { /* private */ }
 impl Crls {
@@ -879,7 +1041,7 @@ The default (empty set) checks the whole chain, refuses unknown status, and does
 
 P0, `0.4.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone)]
 pub struct ReloadHandle { /* private */ }
 impl ReloadHandle {
@@ -899,6 +1061,15 @@ pub struct ReloadOutcome { pub version: u64, pub entries: usize, pub expiring: u
 **Cost.** The build [target under 10 ms for 100 ECDSA certificates] plus the swap [target under 1 µs].
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let server = tls_net::server_from_pem(&chain, &key)?;
+# let build_from_config = |_: &()| -> Result<tls_net::ServerBuilder, tls_net::TlsError> {
+#     tls_net::TlsServer::builder().certificate(&chain, tls_net::KeySource::Pem(&key))
+# };
+# let new_config = ();
+# let log_reload = |_: u64, _: usize| {};
 let handle = server.reload_handle();
 let outcome = handle.publish(build_from_config(&new_config)?)?;
 log_reload(outcome.version, outcome.entries);
@@ -909,7 +1080,7 @@ log_reload(outcome.version, outcome.entries);
 
 P1, `0.4.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ExpiryReport { pub entries: Vec<CertificateInfo>, pub worst: ExpiryState }
@@ -945,7 +1116,7 @@ Thresholds: `Warn` below max(7 days, lifetime / 3), `Critical` below max(2 days,
 
 P1, `0.4.0` (`Derived` P2).
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum TicketMode {
@@ -969,6 +1140,11 @@ impl TicketSeed { pub fn from_bytes(bytes: [u8; 32]) -> TicketSeed; }
 `period` from 1 minute to 24 hours, else `PolicyInvalid`. Default for Tier 1: `Ephemeral { period: 6 h }`. Recommended for a single host that restarts with a socket hand-off: `Ratchet` (D-010). `Derived` gives clusters shared tickets, and anyone with the root can derive every past key, so rotate the root. `tickets(mode, per_handshake)`: `per_handshake` 0 to 8 (default 2); 0 stops issuing tickets while still accepting valid ones until the ring advances. Ticket format, ring, and costs: PLAN 6.8.
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+use std::time::Duration;
+use tls_net::{KeySource, TicketMode, TicketSeed, TlsServer};
 let server = TlsServer::builder()
     .certificate(&chain, KeySource::Pem(&key))?
     .tickets(TicketMode::Ratchet { seed: TicketSeed::Random, period: Duration::from_secs(6 * 3600) }, 2)
@@ -980,7 +1156,7 @@ let server = TlsServer::builder()
 
 P2, `0.5.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone)]
 pub struct TicketKeyRingHandle { /* private */ }
 impl TicketKeyRingHandle {
@@ -1004,7 +1180,7 @@ For restarts that hand the listening sockets to a new process: the old process e
 
 P0, `0.3.0` (`peer` and `fingerprint` P1, `0.4.0`).
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct HandshakeInfo<'s> {
@@ -1030,7 +1206,7 @@ pub enum HandshakeKind { Full, FullWithHelloRetry, Resumed }
 
 P1, `0.4.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerIdentity {
@@ -1051,7 +1227,7 @@ Built once when the handshake completes, only when the peer sent a certificate (
 
 P2, with the rustls 0.24 adoption (at the latest `0.9.0`): rustls 0.23's unbuffered connections expose no exporter (D-052).
 
-```rust
+```rust,ignore
 impl ServerSession {   // and ClientSession
     pub fn export_keying_material(&self, out: &mut [u8], label: &[u8], context: Option<&[u8]>) -> Result<(), TlsError>;
     pub fn channel_binding(&self) -> Result<[u8; 32], TlsError>;
@@ -1068,7 +1244,7 @@ impl ServerSession {   // and ClientSession
 
 P1, `0.5.0`.
 
-```rust
+```rust,ignore
 pub trait TlsObserver: Send + Sync + 'static {
     fn on_event(&self, event: &TlsEvent<'_>) { let _ = event; }
 }
@@ -1111,13 +1287,13 @@ impl tls_net::TlsObserver for Log {
 
 P1, `0.5.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ServerStats {
     pub handshakes_full: u64, pub handshakes_resumed: u64, pub handshakes_failed: u64,
     pub in_progress: u32, pub capacity_refusals: u64, pub hello_refusals: u64,
-    pub tickets_issued: u64, pub tickets_rejected: u64, pub snapshot_version: u64,
+    pub tickets_issued: u64, pub tickets_rejected: u64, pub config_version: u64,
     pub tls12_handshakes: u64, pub post_quantum_handshakes: u64, pub sni_disagreements: u64,
 }
 ```
@@ -1128,7 +1304,7 @@ Relaxed atomic counters, padded so counter groups sit on separate cache lines; `
 
 `provider_name` P1 `0.3.0`; `is_fips` P2 `0.5.0`.
 
-```rust
+```rust,ignore
 impl TlsServer { pub fn provider_name(&self) -> &'static str; pub fn is_fips(&self) -> bool; }
 impl TlsClient { pub fn provider_name(&self) -> &'static str; pub fn is_fips(&self) -> bool; }
 pub fn default_provider_name() -> Option<&'static str>;      // P1 0.3: the provider this build uses
@@ -1144,17 +1320,17 @@ pub fn default_provider_name() -> Option<&'static str>;      // P1 0.3: the prov
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 pub const MAX_RECORD_PAYLOAD: usize = 16_384;   // TLS plaintext record maximum
-pub const OUTGOING_MIN: usize = 18_437;         // one maximum wire record (rustls MAX_WIRE_SIZE)
-pub const INCOMING_MIN: usize = 18_437;         // one maximum wire record
+pub const MIN_OUTPUT_BUFFER: usize = 18_437;    // step's and encrypt's output: one maximum wire record (`OUTGOING_MIN` before 0.10)
+pub const MIN_INPUT_BUFFER: usize = 18_437;     // step's input: one maximum wire record (`INCOMING_MIN` before 0.10)
 ```
 
 ### `ServerSession` and `ClientSession`
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 pub struct ServerSession { /* private */ }   // Send, not Sync
 pub struct ClientSession { /* private */ }   // Send, not Sync
 
@@ -1178,7 +1354,7 @@ impl ServerSession {
 **`step`.** `input` holds ciphertext received and not yet consumed; `output` is free space for records to send.
 
 1. In `Failed`: `Err(SessionFailed)`; in `Closed`: `Ok(Closed)`; nothing is touched.
-2. If `output.len() < OUTGOING_MIN`: `Ok(OutputFull)` with nothing consumed, before any rustls call (FR-3).
+2. If `output.len() < MIN_OUTPUT_BUFFER`: `Ok(OutputFull)` with nothing consumed, before any rustls call (FR-3).
 3. Server in `Hello`: parse the ClientHello from `input`. `Incomplete`: `NeedInput`, nothing consumed. Malformed or over budget: the session fails (`TLS-0031` / `TLS-0032`). Complete: hook, host group, then the rustls connection is created and rustls reads the same bytes (the parser consumes nothing).
 4. Run rustls until a state that needs the caller. At most one `Data` per call, so the borrow of `input` stays simple; call again for more.
 5. `consumed` counts every byte rustls discarded; the handshake byte budget is checked before returning.
@@ -1191,7 +1367,7 @@ A failure with an alert to send (rustls's alert, or tls-net's `unrecognized_name
 
 **`on_eof`.** The transport ended. `Clean` if `close_notify` was received; otherwise `Unclean`, and the session becomes `Failed` with `UncleanClose` (`TLS-0043`, T-17).
 
-**`input_capacity_required`.** `INCOMING_MIN` once established; during the handshake, `max(INCOMING_MIN, held + 1)` where `held` is what rustls kept unconsumed at the last `NeedInput` (a handshake message being assembled in place, D-029).
+**`input_capacity_required`.** `MIN_INPUT_BUFFER` once established; during the handshake, `max(MIN_INPUT_BUFFER, held + 1)` where `held` is what rustls kept unconsumed at the last `NeedInput` (a handshake message being assembled in place, D-029).
 
 **Errors.** Every code from `TLS-0030` to `TLS-0050` can end a session; see [Error codes](#error-codes).
 
@@ -1201,7 +1377,7 @@ A failure with an alert to send (rustls's alert, or tls-net's `unrecognized_name
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 #[must_use]
 #[non_exhaustive]
 #[derive(Debug)]
@@ -1215,7 +1391,7 @@ pub enum Event<'i> {
     HandshakeComplete,  // once; info() is now Some
     Data(&'i [u8]),     // plaintext, a slice of `input`, valid while Progress lives; call step again
     EarlyData(&'i [u8]),// P3, only with dangerous_enable_early_data
-    OutputFull,         // fewer than OUTGOING_MIN bytes free in `output`; flush and call again
+    OutputFull,         // fewer than MIN_OUTPUT_BUFFER bytes free in `output`; flush and call again
     PeerClosed,         // close_notify received; the plaintext stream ended cleanly
     Closed,             // both directions closed
 }
@@ -1235,7 +1411,7 @@ The loop a blocking driver runs (net-io does the same inside its adapter):
 
 ```rust
 use std::io::{Read, Write};
-use tls_net::{Event, OUTGOING_MIN};
+use tls_net::{Event, MIN_OUTPUT_BUFFER};
 
 fn serve(mut sock: std::net::TcpStream, mut session: tls_net::ServerSession) -> Result<(), Box<dyn std::error::Error>> {
     let mut inbuf = vec![0u8; 64 * 1024];
@@ -1266,31 +1442,28 @@ fn serve(mut sock: std::net::TcpStream, mut session: tls_net::ServerSession) -> 
 # fn handle_plaintext(_: &[u8]) {}
 ```
 
-### `ServerReader`
+### `WorkerAcceptor`
 
 P1, `0.4.0`.
 
-```rust
-impl TlsServer { pub fn reader(&self) -> ServerReader; }
-pub struct ServerReader { /* private */ }   // Send, not Sync
-impl ServerReader { pub fn accept(&mut self) -> Result<ServerSession, TlsError>; }
+```rust,ignore
+impl TlsServer { pub fn worker_acceptor(&self) -> WorkerAcceptor; }
+pub struct WorkerAcceptor { /* private */ }   // Send, not Sync
+impl WorkerAcceptor { pub fn accept(&mut self) -> Result<ServerSession, TlsError>; }
 ```
 
-A per-worker handle: one atomic load per `accept`, and a lock only after a reload [target under 20 ns]. Semantics as `TlsServer::accept`.
+A per-worker accept handle for a driver that accepts on many threads: one atomic load per `accept`, and a lock only after a reload (37 ns measured, D-102). Semantics as `TlsServer::accept`, which costs one more atomic operation.
 
 ---
 
 ## ClientHello and fingerprints (Tier 3)
 
-### `HelloParser` and `HelloParse`
+### `parse_client_hello` and `HelloParse`
 
 P1, `0.4.0` (used inside server sessions from `0.3.0`).
 
-```rust
-pub struct HelloParser;
-impl HelloParser {
-    pub fn parse<'a>(input: &'a [u8], limits: &HelloLimits) -> Result<HelloParse<'a>, TlsError>;
-}
+```rust,ignore
+pub fn parse_client_hello<'a>(input: &'a [u8], limits: &HelloLimits) -> Result<HelloParse<'a>, TlsError>;   // `HelloParser::parse` before 0.10
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum HelloParse<'a> {
@@ -1304,7 +1477,9 @@ Bounded, zero-copy, linear in the hello length; every budget checked before the 
 **Cost.** Under 1 µs for a 2 KiB hello [target]; no allocation.
 
 ```rust
-match tls_net::HelloParser::parse(&buf[..filled], &tls_net::HelloLimits::default())? {
+# let buf = [0x16u8, 0x03, 0x01];
+# let filled = buf.len();
+match tls_net::parse_client_hello(&buf[..filled], &tls_net::HelloLimits::default())? {
     tls_net::HelloParse::Incomplete { needed } => { /* read until `needed` bytes */ }
     tls_net::HelloParse::Complete { view, .. } => println!("sni {:?}", view.server_name()),
     _ => {}
@@ -1316,7 +1491,7 @@ match tls_net::HelloParser::parse(&buf[..filled], &tls_net::HelloLimits::default
 
 P1, `0.4.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone, Copy)]
 pub struct ClientHelloView<'a> { /* borrowed ranges */ }
 impl<'a> ClientHelloView<'a> {
@@ -1354,7 +1529,7 @@ pub fn normalize_server_name(name: &str) -> Option<NormalizedName>;   // the FR-
 
 `Ja4` P1, the others P2; all `0.4.0`.
 
-```rust
+```rust,ignore
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ja4([u8; 36]);
 impl Ja4 {
@@ -1372,15 +1547,17 @@ Follows the FoxIO JA4 definition (PLAN 6.10). `compute` never fails: missing pie
 **Cost.** Under 600 ns [target]: two SHA-256 over short strings and two sorts in stack arrays.
 
 ```rust
+# fn fingerprint(view: &tls_net::ClientHelloView<'_>) {
 let ja4 = tls_net::Ja4::compute(&view);
 assert_eq!(ja4.as_str().len(), 36);
+# }
 ```
 
 ### `ja3_string` and `ja3_md5`
 
 `ja3_string` P2 `0.4.0`; `ja3_md5` P3 `0.5.0` behind `ja3-md5`.
 
-```rust
+```rust,ignore
 pub fn ja3_string(view: &ClientHelloView<'_>, out: &mut String);
 #[cfg(feature = "ja3-md5")] pub fn ja3_md5(view: &ClientHelloView<'_>) -> [u8; 32];   // lowercase hex
 ```
@@ -1391,7 +1568,7 @@ The Salesforce JA3 string (decimal values, `-` joined, GREASE ignored). JA3 chan
 
 P1, `0.4.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Fingerprint { pub ja4: Option<Ja4>, pub ja3_md5: Option<[u8; 32]> }
@@ -1413,7 +1590,7 @@ impl FingerprintKinds {
 
 P1, `0.4.0`.
 
-```rust
+```rust,ignore
 pub trait HelloHook: Send + Sync + 'static {
     fn on_client_hello(&self, ctx: &HelloContext<'_>) -> HelloVerdict;
 }
@@ -1443,7 +1620,7 @@ Runs synchronously inside `step`, after the parse and before the rustls connecti
 
 P0, `0.3.0`, feature `net-io`.
 
-```rust
+```rust,ignore
 impl net_io::TlsAcceptor for TlsServer { type Session = ServerSession; }   // session() = accept()
 impl net_io::TlsSession for ServerSession { /* step, encrypt, close, on_transport_closed, info, input_capacity_required */ }
 impl net_io::TlsSession for ClientSession { /* same */ }
@@ -1472,7 +1649,7 @@ Type conversions only: no extra state, no allocation. Works with net-io `>= 0.7,
 
 P2, `0.5.0`, feature `rustls-escape-hatch`. **Outside semver**: may change in any release.
 
-```rust
+```rust,ignore
 impl TlsServer { pub fn as_rustls_configs(&self) -> Vec<Arc<rustls::ServerConfig>>; }
 impl TlsClient { pub fn as_rustls_config(&self) -> Arc<rustls::ClientConfig>; }
 ```
@@ -1487,7 +1664,7 @@ Read-only access to the built configurations, for debugging and for wiring rustl
 
 P0, `0.3.0`.
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TlsError { /* one variant per row of the table below */ }
@@ -1507,7 +1684,7 @@ impl std::error::Error for TlsError { /* source() for ReloadRefused */ }
 
 ### `ErrorCategory` and `Action`
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorCategory {
@@ -1524,7 +1701,7 @@ pub enum Action { None, FixConfig, Retry, RetryIdempotent, RetryWithoutEarlyData
 
 ### `CertificateProblem`
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CertificateProblem {
@@ -1570,6 +1747,7 @@ Carried by `PeerCertificateInvalid`.
 | TLS-0041 | `AlertReceived { alert }` | Aborted | Retry | Secure connection failed |
 | TLS-0042 | `DecryptFailed`, `PeerMisbehaved` | Aborted | None | Secure connection failed |
 | TLS-0043 | `UncleanClose` | Unavailable | RetryIdempotent | Connection closed early |
+| TLS-0047 | `Transport { kind }` | Unavailable | RetryIdempotent | Connection failed |
 | TLS-0044 | `KeyUsageExhausted` | Aborted | Retry | Connection closed early |
 | TLS-0045 | `StartTlsInjection` | PermissionDenied | Operator | Mail server sent unexpected data |
 | TLS-0046 | `EarlyDataRefused` | FailedPrecondition | RetryWithoutEarlyData | Secure connection failed |
@@ -1620,7 +1798,7 @@ Designed for, not scheduled before 1.0 (P3):
 
 ### Public HTTPS server on net-io
 
-```rust
+```rust,no_run
 use tls_net::{Alpn, KeySource, Policy, TlsServer};
 
 let tls = TlsServer::builder()
@@ -1632,15 +1810,27 @@ let tls = TlsServer::builder()
 let server = net_io::ServerBuilder::new()
     .listener(net_io::ListenerSpec::tcp("0.0.0.0:443").tls(true))
     .tls(tls.clone())
-    .sessions(my_http_factory)      // the protocol engine is chosen by ConnectionInfo::tls ALPN
-    .gate(my_gate)
+    .handler(|conn: &mut net_io::TcpConnection| {
+        // conn.info().tls carries the ALPN that picks the protocol engine
+        Ok(())
+    })
+    .gate(net_io::AllowAll)
     .build()?;
+server.open_door()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### SNI with several certificates
 
-```rust
+```rust,no_run
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let (main_chain, main_key) = (chain.clone(), key.clone());
+# let (api_chain, api_key) = (read("api.pem"), read("api.key"));
+# let (shop_chain, shop_key) = (read("api.pem"), read("api.key"));
+# let (api_rsa_chain, api_rsa_key) = (read("site-rsa.pem"), read("site-rsa.key"));
+use tls_net::{KeySource, TlsServer, UnknownName};
 let server = TlsServer::builder()
     .certificate(&main_chain, KeySource::Pem(&main_key))?                         // default: SANs of main_chain
     .certificate_for(&["api.example.com"], &api_chain, KeySource::Pem(&api_key))?
@@ -1656,6 +1846,16 @@ let server = TlsServer::builder()
 tls-net runs no timer and watches no file. The service kernel turns a signal (or cert-net's renewal) into a call:
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let server = tls_net::server_from_pem(&chain, &key)?;
+# let config = ();
+# let builder_from_config = |_: &()| -> Result<tls_net::ServerBuilder, tls_net::TlsError> {
+#     tls_net::TlsServer::builder().certificate(&chain, tls_net::KeySource::Pem(&key))
+# };
+# let notify_reloaded = |_: u64| {};
+# let report = |_: tls_net::TlsError| {};
 let handle = server.reload_handle();
 // on SIGHUP, in the control thread:
 match handle.publish(builder_from_config(&config)?) {
@@ -1667,7 +1867,15 @@ match handle.publish(builder_from_config(&config)?) {
 
 ### Back-channel with mutual TLS
 
-```rust
+```rust,no_run
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+# let platform_ca_pem = read("ca.pem");
+# let node_chain = read("client.pem");
+# let vault = std::sync::Arc::new(key_vault::KeyVaultBuilder::new().normalize_with_blake3(false).build());
+# let node_key = vault.register("node", key_vault::RawKey::new(read("client.key"))).unwrap();
+use tls_net::{Alpn, AlpnPolicy, ClientAuth, KeyCustody, KeySource, Policy, TicketMode, TlsClient, TlsServer, TrustAnchors};
 let ca = TrustAnchors::from_pem(&platform_ca_pem)?;
 let back_channel = Alpn::new(b"svc-bc/1")?;
 
@@ -1694,9 +1902,10 @@ let session = client.connect("node-2.internal")?;
 ### SMTP submission with STARTTLS
 
 ```rust
+# let smtp_leftover: &[u8] = b"";
 let client = tls_net::client()?;                      // Mozilla roots, verification on
 // EHLO, STARTTLS, read "220 Ready" with the SMTP parser, then:
-let mut session = client.start_after_plaintext("smtp.example.com", smtp.leftover())?;
+let mut session = client.start_after_plaintext("smtp.example.com", smtp_leftover)?;
 // any byte after the 220 line was refused above (StartTlsInjection)
 # Ok::<(), tls_net::TlsError>(())
 ```
@@ -1704,6 +1913,7 @@ let mut session = client.start_after_plaintext("smtp.example.com", smtp.leftover
 ### Outbound HTTPS client
 
 ```rust
+use tls_net::{Alpn, TlsClient, TrustAnchors};
 let client = TlsClient::builder()
     .trust(TrustAnchors::mozilla())
     .alpn(&[Alpn::H2, Alpn::HTTP_1_1])
@@ -1717,6 +1927,11 @@ let mut session = client.connect("api.example.com")?;
 ### Fingerprint hook
 
 ```rust
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |name: &str| std::fs::read(format!("{dir}{name}")).unwrap();
+# let (chain, key) = (read("site.pem"), read("site.key"));
+use tls_net::{FingerprintKinds, KeySource, TlsServer};
+# let banned = std::collections::HashSet::new();
 struct Door { banned: std::collections::HashSet<tls_net::Ja4> }
 impl tls_net::HelloHook for Door {
     fn on_client_hello(&self, ctx: &tls_net::HelloContext<'_>) -> tls_net::HelloVerdict {

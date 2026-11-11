@@ -73,6 +73,7 @@ mod server;
 mod session;
 mod snapshot;
 mod sni;
+mod stream;
 mod sync;
 mod tickets;
 mod verify;
@@ -201,7 +202,7 @@ pub use expiry::{CertificateInfo, ExpiryReport, ExpiryState, KeyType};
 #[cfg(feature = "ja3-md5")]
 pub use fingerprint::ja3_md5;
 pub use fingerprint::{Fingerprint, FingerprintKinds, Ja4, ja3_string, ja4_original, ja4_raw};
-pub use hello::{ClientHelloView, HelloLimits, HelloParse, HelloParser, is_grease};
+pub use hello::{ClientHelloView, HelloLimits, HelloParse, is_grease, parse_client_hello};
 pub use hook::{HelloContext, HelloHook, HelloVerdict};
 pub use identity::{
     HandshakeInfo, HandshakeKind, PeerIdentity, certificate_der_from_pem, spki_sha256,
@@ -213,14 +214,15 @@ pub use provider::default_provider_name;
 #[cfg(feature = "dangerous-keylog")]
 pub use server::KeyLogSink;
 pub use server::{
-    Alpn, AlpnPolicy, HostPolicy, ReloadHandle, ReloadOutcome, ServerBuilder, ServerReader,
-    TlsServer, UnknownName, server_from_files, server_from_pem,
+    Alpn, AlpnPolicy, HostPolicy, ReloadHandle, ReloadOutcome, ServerBuilder, TlsServer,
+    UnknownName, WorkerAcceptor, server_from_files, server_from_pem,
 };
 pub use session::{
-    ClientSession, CloseKind, Event, INCOMING_MIN, MAX_RECORD_PAYLOAD, OUTGOING_MIN, Progress,
-    ServerSession, SessionState,
+    ClientSession, CloseKind, Event, MAX_RECORD_PAYLOAD, MIN_INPUT_BUFFER, MIN_OUTPUT_BUFFER,
+    Progress, ServerSession, SessionState,
 };
 pub use sni::{NormalizedName, normalize_server_name};
+pub use stream::TlsStream;
 pub use tickets::{SealedTicketKeys, TicketKeyRingHandle, TicketMode, TicketSeed};
 pub use verify::{ClientAuth, Crls, RevocationPolicy};
 
@@ -230,6 +232,23 @@ pub use verify::{ClientAuth, Crls, RevocationPolicy};
 /// assert_eq!(tls_net::VERSION, env!("CARGO_PKG_VERSION"));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Every Rust block in the README and in `docs/API.md` is compiled as a
+/// doctest (with the default features), so the documentation cannot drift
+/// from the API (S-7).
+#[cfg(all(
+    doctest,
+    feature = "aws-lc",
+    feature = "webpki-roots",
+    feature = "net-io",
+    feature = "key-vault"
+))]
+mod doc_tests {
+    #[doc = include_str!("../README.md")]
+    struct Readme;
+    #[doc = include_str!("../docs/API.md")]
+    struct ApiReference;
+}
 
 #[cfg(test)]
 mod tests {

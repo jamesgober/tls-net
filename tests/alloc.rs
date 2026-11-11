@@ -14,7 +14,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use common::{End, data, pump};
-use tls_net::{ClientBuilder, Event, KeySource, TlsServer, TrustAnchors};
+use tls_net::{Event, KeySource, TlsClient, TlsServer, TrustAnchors};
 
 struct Counting;
 
@@ -56,7 +56,7 @@ fn test_established_path_allocates_only_rustls_record_buffers() {
         .unwrap()
         .build()
         .unwrap();
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();
@@ -128,7 +128,7 @@ fn test_accept_and_hello_parse_do_not_allocate_in_tls_net() {
     let (session, n) = counting(|| server.accept().unwrap());
     assert_eq!(n, 0);
     drop(session);
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();
@@ -138,7 +138,7 @@ fn test_accept_and_hello_parse_do_not_allocate_in_tls_net() {
     let hello = out[..p.written].to_vec();
     let limits = tls_net::HelloLimits::new();
     let (parsed, n) = counting(|| {
-        let r = tls_net::HelloParser::parse(&hello, &limits).unwrap();
+        let r = tls_net::parse_client_hello(&hello, &limits).unwrap();
         matches!(r, tls_net::HelloParse::Complete { .. })
     });
     assert!(parsed);

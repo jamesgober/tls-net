@@ -13,6 +13,43 @@
 
 ---
 
+## [0.10.0] - 2026-11-11
+
+Simplicity. An audit of the API against how it is used, and a fix for every
+finding, renames included. Migration: `docs/MIGRATION-0.10.md`.
+
+### Added
+
+- `TlsStream`: a client or server over any blocking `Read + Write`, in one
+  call: `client.connect_stream("example.com", tcp)?` and
+  `server.accept_stream(tcp)?`. `TlsStream::client` and `TlsStream::server`
+  take a session made another way (STARTTLS, a pinned identity). `read`
+  returns `Ok(0)` only after `close_notify`; an EOF without it is an
+  `UnexpectedEof` error carrying `UncleanClose` (D-141).
+- `TlsError::Transport { kind }` (`TLS-0047`): the transport under a
+  `TlsStream` failed.
+
+### Changed
+
+- `ServerReader` and `TlsServer::reader()` are `WorkerAcceptor` and
+  `TlsServer::worker_acceptor()`.
+- `HelloParser::parse` is the function `parse_client_hello`.
+- `INCOMING_MIN` and `OUTGOING_MIN` are `MIN_INPUT_BUFFER` and
+  `MIN_OUTPUT_BUFFER` (same values).
+- `ServerStats::snapshot_version` is `config_version`.
+- `docs/API.md` follows the house format, and every example in it and in the
+  README is compiled as a doctest (D-142).
+
+### Removed
+
+- `TlsServer::handshakes_in_progress`, `sni_disagreements`, and `version`:
+  read `stats().in_progress`, `stats().sni_disagreements`, and
+  `stats().config_version`.
+- `ServerBuilder::new`, `ClientBuilder::new`, and their `Default` impls:
+  `TlsServer::builder()` and `TlsClient::builder()` are the way in (D-142).
+
+---
+
 ## [0.9.1] - 2026-11-09
 
 Polish. A fix to match the documentation, a missing fuzz target, and the 1.0
@@ -380,7 +417,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jamesgober/tls-net/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/jamesgober/tls-net/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/tls-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/tls-net/compare/v0.7.1...v0.8.0

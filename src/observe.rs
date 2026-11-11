@@ -175,7 +175,7 @@ pub struct ServerStats {
     /// Tickets that did not open (forged, old, or from another ring).
     pub tickets_rejected: u64,
     /// The configuration version.
-    pub snapshot_version: u64,
+    pub config_version: u64,
     /// Completed handshakes over TLS 1.2.
     pub tls12_handshakes: u64,
     /// Completed handshakes with a post-quantum key exchange.

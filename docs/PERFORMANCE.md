@@ -31,7 +31,7 @@ What tls-net costs on top of rustls, how the end-to-end path (net-io's reactor p
 | memory per idle connection, end to end | 30% below tokio-rustls | 0.50x, cold and after traffic (net-io 0.7.1) | met |
 | ClientHello parse plus JA4 (1.5 KiB hello) | under 1.5 µs | 0.82 µs | met |
 | SNI lookup, 10,000 names | under 100 ns | 75 ns exact, 101 ns wildcard, 90 ns miss | met (wildcard at the limit) |
-| `accept()` / `ServerReader::accept` | under 60 ns / under 20 ns | 61 ns / 37 ns | at target / missed (D-102) |
+| `accept()` / `WorkerAcceptor::accept` | under 60 ns / under 20 ns | 61 ns / 37 ns | at target / missed (D-102) |
 | reload build of 100 certificates / swap | under 10 ms / under 1 µs | 1.74 ms / 25 ns | met |
 | ticket seal / open | under 2 µs each | 1.6 µs / 1.5 µs | met |
 | per-signature custody | at least 70% of resident | about 100% | met |
@@ -111,7 +111,7 @@ Linux: WSL2, one core (`taskset -c 6`), 3,000 rounds, load about 120. Windows: 4
 | ticket seal / open, ephemeral ring | 1.89 / 1.52 µs |
 | ticket seal / open, ratchet ring | 1.63 / 1.46 µs |
 | ticket seal / open, rustls `Ticketer` (aws-lc) | 0.71 / 0.32 µs |
-| `TlsServer::accept` / `ServerReader::accept` | 61 / 37 ns |
+| `TlsServer::accept` / `WorkerAcceptor::accept` | 61 / 37 ns |
 | `custody` resident / per-signature (full handshake) | 301 / 292 µs |
 
 Tickets: 1.4 to 1.5 µs of each operation is crypt-io's XChaCha20-Poly1305; the rest is the ring and the header (D-100). A full handshake seals two tickets, about 1 µs more than rustls's `Ticketer`, or 0.3% of a handshake.
@@ -178,7 +178,7 @@ net-io 0.6.1 keeps two 64 KiB buffers per TLS connection for its whole life, whi
 | Gap | Where | Plan |
 |---|---|---|
 | CPU per handshake 0.96x tokio-rustls (target 1.2x) | net-io reactor | Send the tickets, the first response, and close_notify together when one turn produces them (four sends per connection to two), and accept on the worker when listeners are per worker. Reported to net-io with profiles; re-measured on each net-io release |
-| `ServerReader::accept` 37 ns (target 20 ns) | tls-net | Four atomic operations are left, the capacity gate's and the snapshot's reference count; going lower would give up the server-wide handshake bound (D-102). Accepted |
+| `WorkerAcceptor::accept` 37 ns (target 20 ns) | tls-net | Four atomic operations are left, the capacity gate's and the snapshot's reference count; going lower would give up the server-wide handshake bound (D-102). Accepted |
 | D-035 copy, one extra copy per received record | rustls 0.23 | rustls 0.24's in-place reads (0.9) |
 | bare-metal Linux numbers | hardware | Re-run `perf/` and the paired bench on bare-metal Linux when one is available |
 

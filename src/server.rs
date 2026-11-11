@@ -369,6 +369,34 @@ impl TlsServer {
         Ok(ServerSession::new(self.inner.snapshot.load(), slot))
     }
 
+    /// Runs the handshake for one accepted connection over a blocking
+    /// transport: a [`TlsStream`](crate::TlsStream) that reads and writes
+    /// plaintext. On net-io, net-io drives the session instead.
+    ///
+    /// ```no_run
+    /// use std::io::{Read, Write};
+    /// let tls = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
+    /// let listener = std::net::TcpListener::bind("0.0.0.0:8443")?;
+    /// let (tcp, _) = listener.accept()?;
+    /// let mut conn = tls.accept_stream(tcp)?;
+    /// let mut request = [0u8; 1024];
+    /// let n = conn.read(&mut request)?;
+    /// conn.write_all(&request[..n])?;
+    /// conn.close()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As `accept`; then the handshake's error, `Transport` when the
+    /// transport fails, or `UncleanClose` when it ends first.
+    pub fn accept_stream<S: std::io::Read + std::io::Write>(
+        &self,
+        io: S,
+    ) -> Result<crate::TlsStream<S>, TlsError> {
+        crate::TlsStream::server(self.accept()?, io)
+    }
+
     /// The server's counters, read without locking.
     #[must_use]
     pub fn stats(&self) -> ServerStats {
@@ -382,15 +410,15 @@ impl TlsServer {
             handshakes_full: h.full.load(Relaxed),
             handshakes_resumed: h.resumed.load(Relaxed),
             handshakes_failed: h.failed.load(Relaxed),
-            in_progress: self.handshakes_in_progress(),
+            in_progress: self.inner.shared.capacity.in_progress.load(Relaxed),
             capacity_refusals: obs.refusals.capacity.load(Relaxed),
             hello_refusals: obs.refusals.hello.load(Relaxed),
             tickets_issued: issued,
             tickets_rejected: rejected,
-            snapshot_version: self.version(),
+            config_version: self.inner.snapshot.version(),
             tls12_handshakes: h.tls12.load(Relaxed),
             post_quantum_handshakes: h.post_quantum.load(Relaxed),
-            sni_disagreements: self.sni_disagreements(),
+            sni_disagreements: self.inner.shared.sni_mismatches.load(Relaxed),
         }
     }
 
@@ -405,10 +433,12 @@ impl TlsServer {
             .map(|r| TicketKeyRingHandle::new(Arc::clone(r)))
     }
 
-    /// A per-worker handle: one atomic load per `accept`, a lock only after a reload.
+    /// A per-worker accept handle: one atomic load per `accept`, a lock only
+    /// after a reload. For a driver that accepts on many threads; `accept`
+    /// is the same with one more atomic operation per call (D-102).
     #[must_use]
-    pub fn reader(&self) -> ServerReader {
-        ServerReader {
+    pub fn worker_acceptor(&self) -> WorkerAcceptor {
+        WorkerAcceptor {
             inner: Arc::clone(&self.inner),
             reader: Reader::new(Arc::clone(&self.inner.snapshot)),
         }
@@ -519,35 +549,10 @@ impl TlsServer {
     pub fn as_rustls_configs(&self) -> Vec<Arc<rustls::ServerConfig>> {
         self.inner.snapshot.load().configs.clone()
     }
-
-    /// Handshakes in progress now.
-    #[must_use]
-    pub fn handshakes_in_progress(&self) -> u32 {
-        self.inner
-            .shared
-            .capacity
-            .in_progress
-            .load(Ordering::Relaxed)
-    }
-
-    /// The current configuration version (1 at build, +1 per reload).
-    #[must_use]
-    pub fn version(&self) -> u64 {
-        self.inner.snapshot.version()
-    }
-
-    /// Times rustls's view of the SNI fell outside the session's host group (D-064).
-    #[must_use]
-    pub fn sni_disagreements(&self) -> u64 {
-        self.inner
-            .shared
-            .sni_mismatches
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 /// A per-worker accept handle (`Send`, not `Sync`).
-pub struct ServerReader {
+pub struct WorkerAcceptor {
     inner: Arc<Inner>,
     reader: Reader<ServerState>,
 }
@@ -581,15 +586,15 @@ impl fmt::Debug for Inner {
     }
 }
 
-impl fmt::Debug for ServerReader {
+impl fmt::Debug for WorkerAcceptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ServerReader")
+        f.debug_struct("WorkerAcceptor")
             .field("server", &self.inner)
             .finish()
     }
 }
 
-impl ServerReader {
+impl WorkerAcceptor {
     /// As [`TlsServer::accept`], reading the snapshot without a lock in the
     /// steady state.
     ///
@@ -779,18 +784,13 @@ impl fmt::Debug for ServerBuilder {
     }
 }
 
-impl Default for ServerBuilder {
-    fn default() -> Self {
-        ServerBuilder::new()
-    }
-}
-
 /// The largest OCSP staple accepted.
 const MAX_STAPLE: usize = 16 << 10;
 
 impl ServerBuilder {
     /// An empty builder with the `compatible` policy and default budgets.
-    pub fn new() -> Self {
+    /// `TlsServer::builder()` is the public way in (one way to start, S-6).
+    pub(crate) fn new() -> Self {
         ServerBuilder {
             pending: Vec::new(),
             reload_names: None,
@@ -1395,7 +1395,7 @@ pub fn server_from_files(
 mod tests {
     use super::*;
     #[cfg(any(feature = "aws-lc", feature = "ring"))]
-    use crate::{ClientBuilder, Event, HandshakeKind, TrustAnchors};
+    use crate::{Event, HandshakeKind, TlsClient, TrustAnchors};
 
     pub(crate) static CLOCK_AHEAD: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
@@ -1454,7 +1454,7 @@ mod tests {
             .client_auth(ClientAuth::required(ca.clone()))
             .build()
             .unwrap();
-        let client = ClientBuilder::new()
+        let client = TlsClient::builder()
             .trust(ca)
             .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
             .unwrap()

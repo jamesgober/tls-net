@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: beta (<code>0.9.1</code>), API frozen.</strong> Every planned feature before 1.0 is in and tested against OpenSSL, curl, and Go: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, on net-io's reactor bulk transfer runs 1.23 times tokio-rustls, and an idle connection costs half as much memory; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Every threat in the model has an attack test, and the fuzz campaign, soak, conformance runs, and Miri results are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. The consumers' shapes (a net-io server in direct mode, a mutual-TLS back-channel, STARTTLS against Postfix) run end to end in CI; running a server is in <a href="./docs/OPERATIONS.md"><code>docs/OPERATIONS.md</code></a>. An adversarial review of the whole crate found and fixed two high and two medium findings, each with a test (<code>docs/SECURITY.md</code>). What 1.0 still needs, item by item, is in <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>. Next: the rest of the <code>0.9.x</code> polish; rustls 0.24 and its exporters when 0.24 is released (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: beta (<code>0.10.0</code>).</strong> Every planned feature before 1.0 is in and tested against OpenSSL, curl, and Go: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, on net-io's reactor bulk transfer runs 1.23 times tokio-rustls, and an idle connection costs half as much memory; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Every threat in the model has an attack test, and the fuzz campaign, soak, conformance runs, and Miri results are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. The consumers' shapes (a net-io server in direct mode, a mutual-TLS back-channel, STARTTLS against Postfix) run end to end in CI; running a server is in <a href="./docs/OPERATIONS.md"><code>docs/OPERATIONS.md</code></a>. An adversarial review of the whole crate found and fixed two high and two medium findings, each with a test (<code>docs/SECURITY.md</code>). What 1.0 still needs, item by item, is in <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>. 0.10 simplified the API after an audit of how it is used (<a href="./docs/MIGRATION-0.10.md"><code>docs/MIGRATION-0.10.md</code></a>). Next: the rest of the pre-1.0 polish; rustls 0.24 and its exporters when 0.24 is released (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -55,24 +55,40 @@
 
 ```toml
 [dependencies]
-tls-net = "0.9"
+tls-net = "0.10"
 ```
 
 The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange. Build needs per platform, FIPS included, are in [`docs/PLATFORM-NOTES.md`](./docs/PLATFORM-NOTES.md).
 
 ## Quick start
 
-Tier 1: one call each. The full API, including the session loop a driver runs, is in [`docs/API.md`](./docs/API.md).
+Tier 1: one call each, with plain `?`. A client over a `TcpStream`, Mozilla's roots, server verification always on:
 
-```rust
-// Server: certificate files from the operator, default policy, ALPN http/1.1.
-let server = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
-let mut session = server.accept()?;     // one per accepted connection; drive with step()
-
-// Client: Mozilla roots, server verification always on.
-let client = tls_net::client()?;
-let mut session = client.connect("example.com")?;
+```rust,no_run
+use std::io::{Read, Write};
+let tcp = std::net::TcpStream::connect("example.com:443")?;
+let mut tls = tls_net::client()?.connect_stream("example.com", tcp)?;
+tls.write_all(b"GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n")?;
+let mut page = Vec::new();
+tls.read_to_end(&mut page)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+A server from the operator's certificate files; on net-io it is one more line, `.tls(tls)` on the listener:
+
+```rust,no_run
+use std::io::{Read, Write};
+let tls = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
+let listener = std::net::TcpListener::bind("0.0.0.0:8443")?;
+let mut conn = tls.accept_stream(listener.accept()?.0)?;
+let mut request = [0u8; 4096];
+let n = conn.read(&mut request)?;
+conn.write_all(&request[..n])?;
+conn.close()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The full API, the builders, and the session loop a driver runs are in [`docs/API.md`](./docs/API.md).
 
 ## Documentation
 

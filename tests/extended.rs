@@ -10,10 +10,10 @@ use std::time::{Duration, SystemTime};
 use common::{End, data, pump, send};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tls_net::{
-    Alpn, AlpnPolicy, CipherSuite, ClientAuth, ClientBuilder, DnsName, ExpiryState, HandshakeKind,
-    HelloContext, HelloHook, HelloVerdict, HostPolicy, KeySource, Policy, RefuseReason,
-    ServerBuilder, ServerIdentity, SessionState, TicketMode, TicketSeed, TlsClient, TlsError,
-    TlsServer, TrustAnchors, Version,
+    Alpn, AlpnPolicy, CipherSuite, ClientAuth, DnsName, ExpiryState, HandshakeKind, HelloContext,
+    HelloHook, HelloVerdict, HostPolicy, KeySource, Policy, RefuseReason, ServerBuilder,
+    ServerIdentity, SessionState, TicketMode, TicketSeed, TlsClient, TlsError, TlsServer,
+    TrustAnchors, Version,
 };
 
 fn ca() -> TrustAnchors {
@@ -27,11 +27,11 @@ fn site() -> ServerBuilder {
 }
 
 fn plain_client() -> TlsClient {
-    ClientBuilder::new().trust(ca()).build().unwrap()
+    TlsClient::builder().trust(ca()).build().unwrap()
 }
 
 fn mtls_client() -> TlsClient {
-    ClientBuilder::new()
+    TlsClient::builder()
         .trust(ca())
         .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
         .unwrap()
@@ -167,7 +167,7 @@ fn test_pinned_server_identity_with_and_without_chain() {
         assert_eq!(p.server.alert(), Some(46), "require_chain {require_chain}");
     }
     // A client without anchors can only use a pin without a chain.
-    let bare = ClientBuilder::new().build().unwrap();
+    let bare = TlsClient::builder().build().unwrap();
     assert!(bare.connect("localhost").is_err());
     let id = ServerIdentity::Pinned {
         name,
@@ -211,7 +211,7 @@ fn test_t6b_pinned_certificate_with_wrong_key_refused() {
     .with_no_client_auth()
     .with_cert_resolver(Arc::new(Forged(Arc::new(forged))));
     let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
-    let bare = ClientBuilder::new().build().unwrap();
+    let bare = TlsClient::builder().build().unwrap();
     let id = ServerIdentity::Pinned {
         name: DnsName::new("localhost").unwrap(),
         spki_sha256: vec![spki("site.pem")],
@@ -267,7 +267,7 @@ fn test_host_policy_admin_requires_cert_and_alpn_t15() {
         .build()
         .unwrap();
     // www: no client certificate, http/1.1.
-    let http1 = ClientBuilder::new()
+    let http1 = TlsClient::builder()
         .trust(ca())
         .alpn(&[Alpn::HTTP_1_1])
         .build()
@@ -283,7 +283,7 @@ fn test_host_policy_admin_requires_cert_and_alpn_t15() {
     assert_eq!(p.s.error, Some(TlsError::NoApplicationProtocol));
     assert_eq!(p.c.error, Some(TlsError::AlertReceived { alert: 120 }));
     // admin with h2 but no certificate: refused.
-    let h2 = ClientBuilder::new()
+    let h2 = TlsClient::builder()
         .trust(ca())
         .alpn(&[Alpn::H2])
         .build()
@@ -291,7 +291,7 @@ fn test_host_policy_admin_requires_cert_and_alpn_t15() {
     let p = connect(&server, &h2, "admin.example.test");
     assert_eq!(p.s.error, Some(TlsError::PeerCertificateRequired));
     // admin with both: served with h2 and an identity.
-    let both = ClientBuilder::new()
+    let both = TlsClient::builder()
         .trust(ca())
         .alpn(&[Alpn::H2])
         .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
@@ -303,7 +303,7 @@ fn test_host_policy_admin_requires_cert_and_alpn_t15() {
     let info = p.server.info().unwrap();
     assert_eq!(info.alpn, Some(b"h2".as_slice()));
     assert!(info.peer.is_some());
-    assert_eq!(server.sni_disagreements(), 0);
+    assert_eq!(server.stats().sni_disagreements, 0);
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn test_host_policy_name_must_be_covered() {
 #[test]
 fn test_reload_keeps_handshakes_in_progress_t19() {
     let server = site().build().unwrap();
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(ca())
         .policy(
             Policy::client_default()
@@ -349,7 +349,7 @@ fn test_reload_keeps_handshakes_in_progress_t19() {
     server
         .reload_from_pem(&data("site-rsa.pem"), &data("site-rsa.key"))
         .unwrap();
-    assert_eq!(server.version(), 2);
+    assert_eq!(server.stats().config_version, 2);
     pump(
         &mut before.server,
         &mut before.s,
@@ -381,7 +381,7 @@ fn test_reload_keeps_handshakes_in_progress_t19() {
         .reload_from_pem(&data("site.pem"), &data("site-rsa.key"))
         .unwrap_err();
     assert!(matches!(e, TlsError::ReloadRefused { .. }), "{e}");
-    assert_eq!(server.version(), 2);
+    assert_eq!(server.stats().config_version, 2);
     pump(
         &mut during.server,
         &mut during.s,
@@ -451,7 +451,7 @@ fn test_reload_handle_publish_and_resumption_across_reload_fr32() {
 
 #[test]
 fn test_tickets_tls12_stateless_and_off() {
-    let tls12 = ClientBuilder::new()
+    let tls12 = TlsClient::builder()
         .trust(ca())
         .policy(
             Policy::client_default()
@@ -527,7 +527,7 @@ fn test_hook_refuses_by_fingerprint_without_alert() {
     // Learn the client's JA4 from one handshake, then refuse it.
     let open = site().build().unwrap();
     // No resumption: a resumed hello carries other extensions and so another JA4.
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(ca())
         .resumption(0)
         .build()
@@ -547,7 +547,7 @@ fn test_hook_refuses_by_fingerprint_without_alert() {
         TlsError::Refused(RefuseReason::Fingerprint)
     );
     assert_eq!(s.state(), SessionState::Failed);
-    assert_eq!(guarded.handshakes_in_progress(), 0);
+    assert_eq!(guarded.stats().in_progress, 0);
 }
 
 #[test]
@@ -563,7 +563,7 @@ fn test_internal_preset_back_channel_t2_t4() {
     #[cfg(feature = "aws-lc")]
     {
         let server = server.unwrap();
-        let peer = ClientBuilder::new()
+        let peer = TlsClient::builder()
             .trust(ca())
             .policy(Policy::internal())
             .alpn(&[Alpn::new(b"svc-bc/1").unwrap()])
@@ -578,7 +578,7 @@ fn test_internal_preset_back_channel_t2_t4() {
         assert_eq!(info.group, Some(tls_net::Group::X25519MlKem768));
         // A peer with only a classical group is refused (post-quantum
         // stripping, T-4). P-256, so the test also runs in FIPS builds.
-        let classical = ClientBuilder::new()
+        let classical = TlsClient::builder()
             .trust(ca())
             .policy(
                 Policy::client_default()
@@ -625,8 +625,8 @@ fn test_max_fragment_size_limits_records() {
 #[test]
 fn test_server_reader_follows_reloads() {
     let server = site().build().unwrap();
-    let mut reader = server.reader();
-    let client = ClientBuilder::new()
+    let mut reader = server.worker_acceptor();
+    let client = TlsClient::builder()
         .trust(ca())
         .policy(
             Policy::client_default()
@@ -935,7 +935,7 @@ fn test_t2_t4_internal_listener_refuses_tls12_and_x25519_only_peers() {
         .build()
         .unwrap();
     let peer = |policy: Policy| {
-        ClientBuilder::new()
+        TlsClient::builder()
             .trust(ca())
             .policy(policy)
             .alpn(&[Alpn::new(b"svc-bc/1").unwrap()])
@@ -1017,7 +1017,7 @@ fn test_pinned_identity_resumes() {
         )
         .build()
         .unwrap();
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(ca())
         .resumption(8)
         .build()
@@ -1057,7 +1057,7 @@ fn test_pinned_identity_with_platform_anchors() {
     // A chain-checked pin uses the verifier the client was built with, the
     // platform's included; it was refused as "anchors could not be used"
     // (D-133).
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::platform())
         .build()
         .unwrap();
@@ -1083,7 +1083,7 @@ fn test_reload_keeps_the_names_a_certificate_was_configured_for() {
         .unwrap()
         .build()
         .unwrap();
-    let client = ClientBuilder::new().trust(ca()).build().unwrap();
+    let client = TlsClient::builder().trust(ca()).build().unwrap();
     let served = |name: &str| {
         let (mut s, mut c) = (End::new(usize::MAX), End::new(usize::MAX));
         let (mut ss, mut cs) = (server.accept().unwrap(), client.connect(name).unwrap());

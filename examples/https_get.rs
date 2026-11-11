@@ -8,13 +8,13 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use tls_net::{Alpn, ClientBuilder, Event, TrustAnchors};
+use tls_net::{Alpn, Event, TlsClient, TrustAnchors};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "www.rust-lang.org".into());
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::mozilla())
         .alpn(&[Alpn::HTTP_1_1])
         .build()?;

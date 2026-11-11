@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use common::{TcpClient, data};
 use net_io::{AllowAll, ListenerSpec, NetError, ServerBuilder, TcpConnection};
-use tls_net::{Alpn, ClientBuilder, KeySource, TlsServer, TrustAnchors};
+use tls_net::{Alpn, KeySource, TlsClient, TlsServer, TrustAnchors};
 
 fn echo(conn: &mut TcpConnection) -> Result<(), NetError> {
     let tls = conn.info().tls.as_ref().map(|t| {
@@ -53,7 +53,7 @@ fn start() -> (net_io::Server, std::net::SocketAddr) {
 }
 
 fn tls_client() -> tls_net::TlsClient {
-    ClientBuilder::new()
+    TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .alpn(&[Alpn::HTTP_1_1])
         .build()
@@ -189,20 +189,16 @@ fn test_t13_stalled_handshake_releases_its_slot_at_the_deadline() {
     stalled.write_all(&[22]).unwrap();
     // Wait until the stalled handshake holds the slot.
     let start = Instant::now();
-    while tls.handshakes_in_progress() == 0 && start.elapsed() < Duration::from_secs(5) {
+    while tls.stats().in_progress == 0 && start.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(tls.handshakes_in_progress(), 1);
+    assert_eq!(tls.stats().in_progress, 1);
     // After the deadline the slot is back and a client completes.
     let start = Instant::now();
-    while tls.handshakes_in_progress() != 0 && start.elapsed() < Duration::from_secs(10) {
+    while tls.stats().in_progress != 0 && start.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(
-        tls.handshakes_in_progress(),
-        0,
-        "the deadline released the slot"
-    );
+    assert_eq!(tls.stats().in_progress, 0, "the deadline released the slot");
     assert!(start.elapsed() < Duration::from_secs(6));
     // The client session is built before the socket connects: net-io's
     // deadline counts from the accept, so building it after spent the

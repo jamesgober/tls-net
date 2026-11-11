@@ -100,6 +100,13 @@ Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by i
 - [ ] The edge-case list of PLAN section 10 (59 groups) written out next to the tests and checked off against them.
 - [x] `alert()` and `HandshakeFailed::alert` report the alerts rustls sends for certificate refusals (D-139).
 
+## v0.10.0 - Simplicity (DONE, 2026-11-11)
+Exit: the API checked against the simplicity bar (Tier 1 covers about 80% of uses with plain `?`, names readable without the docs, one way to do each thing, `docs/API.md` in the house format with compiled examples); every finding fixed, breaking changes included (James, 2026-11-11), with a migration note.
+- [x] Audit written down: `docs/STABILITY-1.0.md`, "Simplicity audit (0.10)", findings S-1 to S-7.
+- [x] `TlsStream` with `connect_stream` and `accept_stream` (S-1, D-141).
+- [x] Renames and removals S-2 to S-6 (D-142); `docs/MIGRATION-0.10.md`.
+- [x] `docs/API.md` in the house format; every example in it and in the README compiled as a doctest (S-7).
+
 ## v1.0.0 - Stable (James's explicit go)
 - [ ] Full audit recorded in `docs/STABILITY-1.0.md` (API, docs, tests, benchmarks, security).
 - [ ] Every end-to-end target of PLAN section 9 met, including the two carried from 0.6 (D-106).

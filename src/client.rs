@@ -338,6 +338,31 @@ impl TlsClient {
         self.connect_to(&ServerIdentity::parse(server_name)?)
     }
 
+    /// Connects over a blocking transport and runs the handshake: a
+    /// [`TlsStream`](crate::TlsStream) that reads and writes plaintext.
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "webpki-roots")] {
+    /// use std::io::Write;
+    /// let tcp = std::net::TcpStream::connect("example.com:443")?;
+    /// let mut tls = tls_net::client()?.connect_stream("example.com", tcp)?;
+    /// tls.write_all(b"GET / HTTP/1.1\r\nhost: example.com\r\n\r\n")?;
+    /// # }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As `connect`; then the handshake's error, `Transport` when the
+    /// transport fails, or `UncleanClose` when it ends first.
+    pub fn connect_stream<S: std::io::Read + std::io::Write>(
+        &self,
+        server_name: &str,
+        io: S,
+    ) -> Result<crate::TlsStream<S>, TlsError> {
+        crate::TlsStream::client(self.connect(server_name)?, io)
+    }
+
     /// A session for an identity.
     ///
     /// # Errors
@@ -490,15 +515,10 @@ impl fmt::Debug for ClientBuilder {
     }
 }
 
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        ClientBuilder::new()
-    }
-}
-
 impl ClientBuilder {
     /// No anchors yet, the client default policy, resumption for 256 sessions.
-    pub fn new() -> Self {
+    /// `TlsClient::builder()` is the public way in (one way to start, S-6).
+    pub(crate) fn new() -> Self {
         ClientBuilder {
             trust: None,
             policy: Policy::client_default(),
@@ -681,7 +701,7 @@ impl ClientBuilder {
 pub fn client() -> Result<TlsClient, TlsError> {
     #[cfg(feature = "webpki-roots")]
     {
-        ClientBuilder::new().trust(TrustAnchors::mozilla()).build()
+        TlsClient::builder().trust(TrustAnchors::mozilla()).build()
     }
     #[cfg(not(feature = "webpki-roots"))]
     {
@@ -698,7 +718,7 @@ pub fn client() -> Result<TlsClient, TlsError> {
 ///
 /// `NoProvider`, `PemInvalid`, `NoCertificate`, `BadAnchor`.
 pub fn client_with_ca_pem(ca_pem: &[u8]) -> Result<TlsClient, TlsError> {
-    ClientBuilder::new()
+    TlsClient::builder()
         .trust(TrustAnchors::from_pem(ca_pem)?)
         .build()
 }

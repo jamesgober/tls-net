@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::{TcpClient, data, spawn_https};
 use tls_net::{
-    ClientBuilder, HandshakeKind, KeySource, TicketMode, TicketSeed, TlsServer, TrustAnchors,
+    HandshakeKind, KeySource, TicketMode, TicketSeed, TlsClient, TlsServer, TrustAnchors,
 };
 
 const WRAP: [u8; 32] = [0x5a; 32];
@@ -71,7 +71,7 @@ fn test_handoff_child() {
 fn test_handoff_across_processes_keeps_resumption() {
     let old = server();
     let addr = spawn_https(old.clone());
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();

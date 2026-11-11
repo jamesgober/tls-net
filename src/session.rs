@@ -11,7 +11,7 @@ use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedS
 
 use crate::error::{self, TlsError};
 use crate::fingerprint::Fingerprint;
-use crate::hello::{HelloParse, HelloParser};
+use crate::hello::{HelloParse, parse_client_hello};
 use crate::hook::{HelloContext, HelloVerdict};
 use crate::identity::{HandshakeInfo, HandshakeKind, PeerIdentity};
 use crate::observe::{HelloRefusal, Observation, TlsEvent};
@@ -22,12 +22,12 @@ use crate::server::{CapacitySlot, Group as HostGroup, ServerState};
 pub const MAX_RECORD_PAYLOAD: usize = 16_384;
 /// The free output space `step` needs: one maximum wire record (rustls's
 /// `MAX_WIRE_SIZE`: 16,384 + 2,048 + 5).
-pub const OUTGOING_MIN: usize = 18_437;
+pub const MIN_OUTPUT_BUFFER: usize = 18_437;
 /// Room `close` asks for: a close_notify record is at most 31 bytes
 /// (TLS 1.2 with AES-GCM's explicit nonce), with margin.
 const CLOSE_NOTIFY_MAX: usize = 64;
 /// The input buffer a session needs once established: one maximum wire record.
-pub const INCOMING_MIN: usize = 18_437;
+pub const MIN_INPUT_BUFFER: usize = 18_437;
 
 /// The fatal `unrecognized_name` alert in a plaintext record (D-031).
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
@@ -63,7 +63,7 @@ pub enum Event<'i> {
     HandshakeComplete,
     /// Plaintext, a slice of the input; use it, then call `step` again.
     Data(&'i [u8]),
-    /// Fewer than `OUTGOING_MIN` bytes free in the output; flush and call again.
+    /// Fewer than `MIN_OUTPUT_BUFFER` bytes free in the output; flush and call again.
     OutputFull,
     /// `close_notify` received; the plaintext stream ended cleanly.
     PeerClosed,
@@ -272,7 +272,7 @@ impl<C: Engine> Core<C> {
             }
             _ => {}
         }
-        if output.len() < OUTGOING_MIN {
+        if output.len() < MIN_OUTPUT_BUFFER {
             return Some(Ok(Progress {
                 consumed: 0,
                 written: 0,
@@ -441,7 +441,7 @@ impl<C: Engine> Core<C> {
         };
         let mut failed: Option<TlsError> = None;
         loop {
-            if output.len() - *written < OUTGOING_MIN {
+            if output.len() - *written < MIN_OUTPUT_BUFFER {
                 return match failed.take() {
                     Some(e) => Stop::Failed(e),
                     None => Stop::Room,
@@ -523,7 +523,7 @@ impl<C: Engine> Core<C> {
                 }
                 ConnectionState::ReadTraffic(mut read) => {
                     // rustls 0.23 hands out an owned copy (D-035). Bounce it
-                    // through the spare output (at least OUTGOING_MIN bytes,
+                    // through the spare output (at least MIN_OUTPUT_BUFFER bytes,
                     // more than any record) so it can land at the end of the
                     // input bytes this call discards.
                     let (len, extra) = match read.next_record() {
@@ -682,9 +682,9 @@ impl<C: Engine> Core<C> {
         match self.state {
             // A hello may span up to 16 records of up to 65,535 bytes in
             // all (`HelloLimits`): ask for what the parser said it needs.
-            SessionState::Hello => INCOMING_MIN.max(self.hello_needed),
-            SessionState::Handshake => INCOMING_MIN.max(self.held.saturating_add(1)),
-            _ => INCOMING_MIN,
+            SessionState::Hello => MIN_INPUT_BUFFER.max(self.hello_needed),
+            SessionState::Handshake => MIN_INPUT_BUFFER.max(self.held.saturating_add(1)),
+            _ => MIN_INPUT_BUFFER,
         }
     }
 
@@ -878,7 +878,7 @@ impl ServerSession {
             return self.core.take_held(input);
         }
         if self.core.state == SessionState::Hello {
-            match HelloParser::parse(input, &self.state.hello_limits) {
+            match parse_client_hello(input, &self.state.hello_limits) {
                 Ok(HelloParse::Incomplete { needed }) => {
                     self.core.hello_needed = needed;
                     return Ok(Progress {
