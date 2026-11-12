@@ -1,6 +1,6 @@
 # tls-net - Migrating to 0.10
 
-> 0.10.0 simplified the API after an audit of how it is used (the simplicity audit in [`STABILITY-1.0.md`](./STABILITY-1.0.md), D-141, D-142), and fixed the findings of a review of 0.9.1 (D-143 to D-152). Most code needs no change: Tier 1, the builders, policies, sessions, and errors are as they were. This page lists every rename and removal, every behaviour that changed, and what is new. A server with host policies needs the `Host` check below.
+> 0.10.0 simplifies the API, with a few renames, and fixes a host policy bypass and several smaller bugs. Most code needs no change: Tier 1, the builders, policies, sessions, and errors are as they were. This page lists every rename and removal, every behaviour that changed, and what is new. A server with host policies needs the `Host` check below.
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -30,7 +30,7 @@ The values are unchanged: both buffer minimums are still 18,437 bytes.
 
 ## Servers with host policies: check `Host`
 
-A `HostPolicy` applies its rules by the SNI the client sends. A client that sends another name the certificate covers, or none, gets the default group's rules and can then ask for the protected host. The HTTP layer must check every request (D-143, T-31):
+A `HostPolicy` applies its rules by the SNI the client sends. A client that sends another name the certificate covers, or none, gets the default group's rules and can then ask for the protected host. The HTTP layer must check every request:
 
 ```rust,ignore
 // Once per connection, after the handshake:
@@ -47,14 +47,14 @@ A server without host policies can make the same call; `permits` is then `true` 
 
 | What | 0.9 | 0.10 |
 |---|---|---|
-| Expiry state of a short-lived certificate | under 2 days: `Critical` from issue; under 7 days: `Warn` from issue | `Ok` at issue; `Warn` below half to a third of the lifetime, `Critical` below a fifth to a tenth (D-144) |
-| `crls` on a client without `trust` | accepted, never applied | `build` fails with `PolicyInvalid` (D-145) |
-| A pinned identity without `require_chain` on a client with CRLs | connected without a CRL check | `connect_to` fails with `PolicyInvalid`; set `require_chain: true` (D-145) |
-| `load_limits`, `validity_skew`, `allow_group_readable_key` after `certificate` | ignored at startup, applied at reload | applied at `build` too (D-148) |
-| A `LoadLimits` or `HandshakeLimits` field set outside the setter's range | used as set | clamped to the range (D-147) |
-| `Policy::modern().versions(&[Tls13, Tls12])` | failed at `build` | builds with the TLS 1.2 suites (D-150) |
-| Session tickets | opened for up to two periods | open for one period after issue; 0.9 tickets are refused once after the upgrade (D-151) |
-| An ALPN name over 32 bytes with feature `net-io` | reported to net-io as no ALPN | refused at `build` (D-152) |
+| Expiry state of a short-lived certificate | under 2 days: `Critical` from issue; under 7 days: `Warn` from issue | `Ok` at issue; `Warn` below half to a third of the lifetime, `Critical` below a fifth to a tenth |
+| `crls` on a client without `trust` | accepted, never applied | `build` fails with `PolicyInvalid` |
+| A pinned identity without `require_chain` on a client with CRLs | connected without a CRL check | `connect_to` fails with `PolicyInvalid`; set `require_chain: true` |
+| `load_limits`, `validity_skew`, `allow_group_readable_key` after `certificate` | ignored at startup, applied at reload | applied at `build` too |
+| A `LoadLimits` or `HandshakeLimits` field set outside the setter's range | used as set | clamped to the range |
+| `Policy::modern().versions(&[Tls13, Tls12])` | failed at `build` | builds with the TLS 1.2 suites |
+| Session tickets | opened for up to two periods | open for one period after issue; 0.9 tickets are refused once after the upgrade |
+| An ALPN name over 32 bytes with feature `net-io` | reported to net-io as no ALPN | refused at `build` |
 | `HandshakeInfo` | | new field `peer_verified` (the struct is `#[non_exhaustive]`, so nothing breaks) |
 
 ## Replacing a hand-written session loop

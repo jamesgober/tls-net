@@ -242,7 +242,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every Rust block in the README and in `docs/API.md` is compiled as a
 /// doctest (with the default features), so the documentation cannot drift
-/// from the API (S-7).
+/// from the API.
 #[cfg(all(
     doctest,
     feature = "aws-lc",

@@ -527,7 +527,7 @@ impl fmt::Debug for ClientBuilder {
 
 impl ClientBuilder {
     /// No anchors yet, the client default policy, resumption for 256 sessions.
-    /// `TlsClient::builder()` is the public way in (one way to start, S-6).
+    /// `TlsClient::builder()` is the public way in (one way to start).
     pub(crate) fn new() -> Self {
         ClientBuilder {
             trust: None,

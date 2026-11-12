@@ -13,7 +13,7 @@
 - [Threats, defences, tests, costs](#threats-defences-tests-costs)
 - [Hardening record (0.7)](#hardening-record-07)
 - [Adversarial review (0.9)](#adversarial-review-09)
-- [Independent review (0.9.1)](#independent-review-091)
+- [Fixed in 0.10](#fixed-in-010)
 - [Where tls-net is stricter than the RFCs](#where-tls-net-is-stricter-than-the-rfcs)
 - [What tls-net does not defend against](#what-tls-net-does-not-defend-against)
 
@@ -163,20 +163,18 @@ What held, in the reviewers' words condensed: offsets and budgets in the session
 
 ---
 
-## Independent review (0.9.1)
+## Fixed in 0.10
 
-One reviewer read 0.9.1 (`5e31545`) end to end, with reproductions for each finding, and found no critical issue. Every finding is fixed in 0.10.0, each with a regression test.
+Each fix has a regression test.
 
-| Finding | Severity | Fix |
-|---|---|---|
-| A host policy's client authentication was skipped by a client that sent no SNI, or another name the same certificate covers: the handshake ran under the default group's rules, and nothing let the HTTP layer see that the session had not met the protected host's rules | high | D-143, T-31 |
-| A certificate living under 2 days was `Critical` from issue (and one under 7 days `Warn`), the opposite of OPERATIONS.md | medium | D-144 |
-| A client's CRLs were accepted without anchors and never applied on a pinned connection without a chain check | low | D-145 |
-| An established session kept the configuration it was accepted under, private keys included, alive after a reload | low | D-146 |
-| `LoadLimits` and `HandshakeLimits` fields assigned directly bypassed their ranges (a 256 MiB buffer for a 241-byte key; no handshake budget) | low | D-147 |
-| Load settings given after `certificate` were skipped at startup and applied at reload, so a renewal of the same files could be refused | low | D-148 |
-| The peer identity made lazy in D-104 was built at every completion by the completion counters | low | D-149 |
-| Notes: `Policy::versions` on a preset kept its suites (D-150); a ticket opened for up to two periods against an advertised one (D-151); an ALPN name over 32 bytes reached net-io as no ALPN (D-152); `peer` can be `None` under `ClientAuth::required` when the verified certificate cannot be read (documented, and `peer_verified` added, D-143); four documentation errors | note | as listed |
+- **Host policies.** A client that sent no SNI, or another name the same certificate covers, ran its handshake under the default group's rules, and nothing let the HTTP layer see that the session had not met the protected host's rules. `HostScope::permits` is that check (T-31).
+- **Expiry thresholds.** A certificate living under 2 days was `Critical` from issue, and one under 7 days `Warn`, the opposite of `docs/OPERATIONS.md`.
+- **Client CRLs** were accepted without anchors, and never applied on a pinned connection without a chain check.
+- **Reload.** An established session kept the configuration it was accepted under, private keys included, alive after a reload.
+- **Limits.** `LoadLimits` and `HandshakeLimits` fields assigned directly bypassed their ranges: a 256 MiB buffer for a 241-byte key, or no handshake budget.
+- **Builder order.** Load settings given after `certificate` were skipped at startup and applied at reload, so a renewal of the same files could be refused.
+- **Peer identity.** The completion counters built it at every handshake, read or not.
+- **Smaller fixes.** `Policy::versions` on a preset kept the preset's suites; a ticket opened for up to two periods against an advertised one; an ALPN name over 32 bytes reached net-io as no ALPN; `peer` can be `None` under `ClientAuth::required` when the verified certificate cannot be read (now documented, with `peer_verified` added); four documentation errors.
 
 Recorded, not changed: `TlsServer::accept`, the only accept net-io can call, takes one uncontended lock per connection (about 60 ns against a handshake of 300 to 450 µs); a lock-free cell without `unsafe` is an open item in `dev/ROADMAP.md`.
 

@@ -911,7 +911,7 @@ const MAX_STAPLE: usize = 16 << 10;
 
 impl ServerBuilder {
     /// An empty builder with the `compatible` policy and default budgets.
-    /// `TlsServer::builder()` is the public way in (one way to start, S-6).
+    /// `TlsServer::builder()` is the public way in (one way to start).
     pub(crate) fn new() -> Self {
         ServerBuilder {
             pending: Vec::new(),

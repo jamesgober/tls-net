@@ -85,7 +85,7 @@ All numbers were measured on Windows and on WSL2. There are no bare-metal Linux 
 - **Fuzzing:** six targets ran 24 hours each at 0.7 with one finding, fixed (D-111). The seventh (`import_sealed`, 0.9.1) is open.
 - **Conformance:** testssl.sh and tlsfuzzer run weekly in CI. One finding was fixed (D-110).
 - **Miri and loom:** both run in CI.
-- **Adversarial review:** done at 0.9.0 with three independent reviewers, and every finding was fixed test-first. A further review of 0.9.1 found one high, one medium, and five low findings; all are fixed in 0.10.0 with regression tests (D-143 to D-152).
+- **Adversarial review:** done at 0.9.0 with three independent reviewers, and every finding was fixed test-first. 0.10.0 fixed a host policy bypass, expiry thresholds for short-lived certificates, and five smaller bugs, each with a regression test (D-143 to D-152).
 - **Dependencies:** rustls is the only third-party runtime dependency. Cryptography goes through crypt-io. At 0.9.1 every dependency is on its newest stable release: rustls 0.23.46, aws-lc-rs 1.19.0, ring 0.17.14, webpki-roots 1.0.11, rustls-platform-verifier 0.7.1, crypt-io 1.5.0, key-vault 1.1.0, net-io 0.7.1.
 - **Unsafe code:** `#![forbid(unsafe_code)]`.
 - **Still to do before 1.0:** re-run the security review over the 0.9.x changes (threat table, attack tests, footprint, audit, deny). This is a 0.9.x item.
