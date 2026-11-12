@@ -109,8 +109,11 @@ pub(crate) fn state_at(
         return (ExpiryState::Expired, 0);
     }
     let lifetime = not_after.duration_since(not_before).map(secs).unwrap_or(0);
-    let warn = (7 * DAY).max(lifetime / 3);
-    let critical = (2 * DAY).max(lifetime / 10);
+    // A third and a tenth of the lifetime, raised to 7 and 2 days where those
+    // fit: a floor never passes half (warn) or a fifth (critical) of the
+    // lifetime, so a short-lived certificate is `Ok` when issued (D-144).
+    let warn = (lifetime / 3).max((7 * DAY).min(lifetime / 2));
+    let critical = (lifetime / 10).max((2 * DAY).min(lifetime / 5));
     let state = if left < critical {
         ExpiryState::Critical
     } else if left < warn {
@@ -184,5 +187,49 @@ mod tests {
             ExpiryState::Critical,
             "2-day floor"
         );
+    }
+
+    #[test]
+    fn test_thresholds_short_certificates_ok_when_issued() {
+        const HOUR: u64 = 3600;
+        let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        // 6 hours: warn below 3 hours, critical below 72 minutes.
+        let (nb, na) = (t(0), t(6 * HOUR));
+        assert_eq!(state_at(nb, na, t(60)).0, ExpiryState::Ok, "just issued");
+        assert_eq!(state_at(nb, na, t(3 * HOUR - 1)).0, ExpiryState::Ok);
+        assert_eq!(state_at(nb, na, t(3 * HOUR + 1)).0, ExpiryState::Warn);
+        assert_eq!(
+            state_at(nb, na, t(6 * HOUR - 72 * 60 - 1)).0,
+            ExpiryState::Warn
+        );
+        assert_eq!(
+            state_at(nb, na, t(6 * HOUR - 72 * 60 + 1)).0,
+            ExpiryState::Critical
+        );
+        // 1 hour: warn below 30 minutes, critical below 12.
+        let (nb, na) = (t(0), t(HOUR));
+        assert_eq!(state_at(nb, na, t(1)).0, ExpiryState::Ok, "just issued");
+        assert_eq!(state_at(nb, na, t(31 * 60)).0, ExpiryState::Warn);
+        assert_eq!(state_at(nb, na, t(49 * 60)).0, ExpiryState::Critical);
+        // 2 days, the old critical floor: no longer critical from issue.
+        let (nb, na) = (at(0), at(2));
+        assert_eq!(state_at(nb, na, t(60)).0, ExpiryState::Ok);
+        // Warn always comes before critical, and neither at issue.
+        for lifetime in [
+            60,
+            HOUR,
+            6 * HOUR,
+            DAY,
+            2 * DAY,
+            10 * DAY,
+            21 * DAY,
+            90 * DAY,
+        ] {
+            let (nb, na) = (t(0), t(lifetime));
+            assert_eq!(state_at(nb, na, t(1)).0, ExpiryState::Ok, "{lifetime}");
+            let warn = (lifetime / 3).max((7 * DAY).min(lifetime / 2));
+            let critical = (lifetime / 10).max((2 * DAY).min(lifetime / 5));
+            assert!(critical < warn && warn < lifetime, "{lifetime}");
+        }
     }
 }

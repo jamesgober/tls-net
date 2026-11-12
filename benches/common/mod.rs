@@ -10,10 +10,7 @@ use std::sync::Arc;
 use rustls::client::UnbufferedClientConnection;
 use rustls::server::UnbufferedServerConnection;
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
-use tls_net::{
-    ClientBuilder, ClientSession, Event, KeySource, ServerSession, TlsClient, TlsServer,
-    TrustAnchors,
-};
+use tls_net::{ClientSession, Event, KeySource, ServerSession, TlsClient, TlsServer, TrustAnchors};
 
 /// A fixture from `tests/data` (also found from `perf/`, which includes this file).
 pub fn data(name: &str) -> Vec<u8> {
@@ -34,7 +31,7 @@ pub fn server() -> TlsServer {
 
 /// A client trusting the test CA; `resumption` 0 forces full handshakes.
 pub fn client(resumption: usize) -> TlsClient {
-    ClientBuilder::new()
+    TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .resumption(resumption)
         .build()

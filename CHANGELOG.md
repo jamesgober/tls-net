@@ -13,6 +13,89 @@
 
 ---
 
+## [0.10.0] - 2026-11-11
+
+A simpler API, a few renames, and security fixes. I went through the
+API against how it is used and fixed what was harder than it needed to
+be, breaking changes included. Migration: `docs/MIGRATION-0.10.md`.
+
+### Security
+
+- Host policies: a client that sent no SNI, or another name the same
+  certificate covers, got the default group's rules (for example no client
+  certificate) and could then send a request for the protected host.
+  `TlsServer::host_scope(server_name)` gives each connection a `HostScope`,
+  and `HostScope::permits(host)` tells the HTTP layer whether a request's
+  `Host` belongs to the connection's host group; answer `421` when it does
+  not. `HostPolicy` documents the check as required.
+- An established session no longer keeps the configuration it was accepted
+  under, private keys included, alive after a reload.
+- A client's CRLs need trust anchors, and a client with CRLs refuses a
+  pinned identity without `require_chain`; before, the CRLs could be
+  accepted and never applied.
+- Tickets carry their issue time and open for one period, their advertised
+  lifetime, instead of up to two. Tickets issued by 0.9 are refused
+  once after the upgrade: those clients do one full handshake.
+- `LoadLimits` and `HandshakeLimits` fields set directly are clamped to the
+  setters' ranges.
+- With feature `net-io`, an ALPN name longer than 32 bytes is refused at
+  `build`; net-io would have reported it as no ALPN.
+
+### Added
+
+- `TlsStream`: a client or server over any blocking `Read + Write`, in one
+  call: `client.connect_stream("example.com", tcp)?` and
+  `server.accept_stream(tcp)?`. `TlsStream::client` and `TlsStream::server`
+  take a session made another way (STARTTLS, a pinned identity). `read`
+  returns `Ok(0)` only after `close_notify`; an EOF without it is an
+  `UnexpectedEof` error carrying `UncleanClose`.
+- `TlsError::Transport { kind }` (`TLS-0047`): the transport under a
+  `TlsStream` failed.
+- `HostScope` and `TlsServer::host_scope`.
+- `HandshakeInfo::peer_verified`: whether the peer's certificate was
+  verified. `peer` can be `None` when a verified certificate cannot be read,
+  so authorise on `peer`, not on this alone.
+- A fuzz target for `Host` values, `host_value`.
+
+### Changed
+
+- `ServerReader` and `TlsServer::reader()` are `WorkerAcceptor` and
+  `TlsServer::worker_acceptor()`.
+- `HelloParser::parse` is the function `parse_client_hello`.
+- `INCOMING_MIN` and `OUTGOING_MIN` are `MIN_INPUT_BUFFER` and
+  `MIN_OUTPUT_BUFFER` (same values).
+- `ServerStats::snapshot_version` is `config_version`.
+- `docs/API.md` follows the house format, and every example in it and in the
+  README is compiled as a doctest.
+- `HandshakeLimits::max_in_progress` returns `Self`; it could not fail.
+- Expiry thresholds never put a certificate in `Warn` or `Critical` when it
+  is issued: a certificate under 2 days was `Critical` for its whole life.
+- Builder settings may come in any order: a certificate added before
+  `load_limits`, `validity_skew`, or `allow_group_readable_key` changed is
+  loaded again at `build`, so startup and reload check the same files the
+  same way.
+- `Policy::versions` on a preset follows with the preset's suites, so
+  `Policy::modern().versions(&[Tls13, Tls12])` builds.
+- The peer identity is built on the first `info()` call; the
+  completion counters had built it on every handshake.
+
+### Removed
+
+- `TlsServer::handshakes_in_progress`, `sni_disagreements`, and `version`:
+  read `stats().in_progress`, `stats().sni_disagreements`, and
+  `stats().config_version`.
+- `ServerBuilder::new`, `ClientBuilder::new`, and their `Default` impls:
+  `TlsServer::builder()` and `TlsClient::builder()` are the way in.
+
+### Documentation
+
+- `docs/OPERATIONS.md`: a root certificate in the chain file is sent, not
+  ignored; the expiry thresholds; the ticket lifetime.
+- `docs/API.md`: `Event::EarlyData` does not exist and is gone from the
+  listing; the `HostPolicy` example now shows the `Host` check.
+
+---
+
 ## [0.9.1] - 2026-11-09
 
 Polish. A fix to match the documentation, a missing fuzz target, and the 1.0
@@ -380,7 +463,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/jamesgober/tls-net/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jamesgober/tls-net/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/jamesgober/tls-net/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/tls-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/tls-net/compare/v0.7.1...v0.8.0

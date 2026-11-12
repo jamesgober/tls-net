@@ -19,7 +19,7 @@ HOURS=${1:-24}
 CORPUS=${CORPUS:-$HOME/fuzz-corpus/tls-net}
 TD=${FUZZ_TARGET_DIR:-$HOME/tgt/tls-net-fuzz}
 : "${CORPUS:?}" "${TD:?}"
-TARGETS=${TARGETS:-hello_parse session_step_server session_step_client der_fields pem_intake ticket_open import_sealed}
+TARGETS=${TARGETS:-hello_parse session_step_server session_step_client der_fields pem_intake ticket_open import_sealed host_value}
 mkdir -p "$CORPUS" "$CORPUS/tmp"
 export TMPDIR="$CORPUS/tmp"
 for t in $TARGETS; do mkdir -p "$CORPUS/$t"; done

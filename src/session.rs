@@ -11,7 +11,7 @@ use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedS
 
 use crate::error::{self, TlsError};
 use crate::fingerprint::Fingerprint;
-use crate::hello::{HelloParse, HelloParser};
+use crate::hello::{HelloParse, parse_client_hello};
 use crate::hook::{HelloContext, HelloVerdict};
 use crate::identity::{HandshakeInfo, HandshakeKind, PeerIdentity};
 use crate::observe::{HelloRefusal, Observation, TlsEvent};
@@ -22,12 +22,12 @@ use crate::server::{CapacitySlot, Group as HostGroup, ServerState};
 pub const MAX_RECORD_PAYLOAD: usize = 16_384;
 /// The free output space `step` needs: one maximum wire record (rustls's
 /// `MAX_WIRE_SIZE`: 16,384 + 2,048 + 5).
-pub const OUTGOING_MIN: usize = 18_437;
+pub const MIN_OUTPUT_BUFFER: usize = 18_437;
 /// Room `close` asks for: a close_notify record is at most 31 bytes
 /// (TLS 1.2 with AES-GCM's explicit nonce), with margin.
 const CLOSE_NOTIFY_MAX: usize = 64;
 /// The input buffer a session needs once established: one maximum wire record.
-pub const INCOMING_MIN: usize = 18_437;
+pub const MIN_INPUT_BUFFER: usize = 18_437;
 
 /// The fatal `unrecognized_name` alert in a plaintext record (D-031).
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
@@ -63,7 +63,7 @@ pub enum Event<'i> {
     HandshakeComplete,
     /// Plaintext, a slice of the input; use it, then call `step` again.
     Data(&'i [u8]),
-    /// Fewer than `OUTGOING_MIN` bytes free in the output; flush and call again.
+    /// Fewer than `MIN_OUTPUT_BUFFER` bytes free in the output; flush and call again.
     OutputFull,
     /// `close_notify` received; the plaintext stream ended cleanly.
     PeerClosed,
@@ -272,7 +272,7 @@ impl<C: Engine> Core<C> {
             }
             _ => {}
         }
-        if output.len() < OUTGOING_MIN {
+        if output.len() < MIN_OUTPUT_BUFFER {
             return Some(Ok(Progress {
                 consumed: 0,
                 written: 0,
@@ -441,7 +441,7 @@ impl<C: Engine> Core<C> {
         };
         let mut failed: Option<TlsError> = None;
         loop {
-            if output.len() - *written < OUTGOING_MIN {
+            if output.len() - *written < MIN_OUTPUT_BUFFER {
                 return match failed.take() {
                     Some(e) => Stop::Failed(e),
                     None => Stop::Room,
@@ -523,7 +523,7 @@ impl<C: Engine> Core<C> {
                 }
                 ConnectionState::ReadTraffic(mut read) => {
                     // rustls 0.23 hands out an owned copy (D-035). Bounce it
-                    // through the spare output (at least OUTGOING_MIN bytes,
+                    // through the spare output (at least MIN_OUTPUT_BUFFER bytes,
                     // more than any record) so it can land at the end of the
                     // input bytes this call discards.
                     let (len, extra) = match read.next_record() {
@@ -682,9 +682,9 @@ impl<C: Engine> Core<C> {
         match self.state {
             // A hello may span up to 16 records of up to 65,535 bytes in
             // all (`HelloLimits`): ask for what the parser said it needs.
-            SessionState::Hello => INCOMING_MIN.max(self.hello_needed),
-            SessionState::Handshake => INCOMING_MIN.max(self.held.saturating_add(1)),
-            _ => INCOMING_MIN,
+            SessionState::Hello => MIN_INPUT_BUFFER.max(self.hello_needed),
+            SessionState::Handshake => MIN_INPUT_BUFFER.max(self.held.saturating_add(1)),
+            _ => MIN_INPUT_BUFFER,
         }
     }
 
@@ -726,6 +726,7 @@ impl<C: Engine> Core<C> {
             common.alpn_protocol(),
             server_name,
             kind,
+            self.peer_chain().is_some_and(|c| !c.is_empty()),
         ))
     }
 
@@ -774,7 +775,9 @@ impl<C: Engine> Core<C> {
 /// `Send`, not `Sync`: one connection is driven by one thread at a time.
 pub struct ServerSession {
     core: Core<UnbufferedServerConnection>,
-    state: crate::sync::Shared<ServerState>,
+    /// The snapshot the session was accepted under; `None` once the
+    /// handshake has ended (D-146).
+    state: Option<crate::sync::Shared<ServerState>>,
     slot: Option<CapacitySlot>,
     /// Boxed so an idle session does not carry a 254-byte name buffer (D-096).
     sni: Option<Box<str>>,
@@ -808,7 +811,7 @@ impl ServerSession {
         let max = state.limits.max_handshake_bytes;
         ServerSession {
             core: Core::new(None, SessionState::Hello, max),
-            state,
+            state: Some(state),
             slot: Some(slot),
             sni: None,
             fingerprint: None,
@@ -842,11 +845,19 @@ impl ServerSession {
         r
     }
 
-    /// Counters and events after a step.
+    /// Counters and events after a step. Once the handshake has ended, the
+    /// session lets go of its configuration snapshot (D-146): nothing after
+    /// it reads the snapshot, and holding it would keep every certificate and
+    /// private key of an old configuration alive after a reload.
     fn observe(&mut self, before: SessionState, complete: bool) {
-        let obs = &self.state.obs;
+        let Some(state) = &self.state else {
+            return;
+        };
+        let obs = &state.obs;
         if complete {
-            if let Some(info) = self.info() {
+            // Without the peer identity, which is built on first use (D-104).
+            if let Some(mut info) = self.core.info(self.sni.as_deref()) {
+                info.fingerprint = self.fingerprint.as_ref();
                 record_completion(obs, &info, &self.core);
             }
         }
@@ -864,6 +875,13 @@ impl ServerSession {
                 record_failure(obs, &self.core, before);
             }
         }
+        let ended = !matches!(
+            self.core.state,
+            SessionState::Hello | SessionState::Handshake
+        );
+        if ended && self.slot.is_none() {
+            self.state = None;
+        }
     }
 
     fn step_inner<'i>(
@@ -878,7 +896,10 @@ impl ServerSession {
             return self.core.take_held(input);
         }
         if self.core.state == SessionState::Hello {
-            match HelloParser::parse(input, &self.state.hello_limits) {
+            let Some(state) = self.state.as_ref() else {
+                return Err(self.core.fail(TlsError::Other));
+            };
+            match parse_client_hello(input, &state.hello_limits) {
                 Ok(HelloParse::Incomplete { needed }) => {
                     self.core.hello_needed = needed;
                     return Ok(Progress {
@@ -889,9 +910,9 @@ impl ServerSession {
                 }
                 Ok(HelloParse::Complete { view, .. }) => {
                     self.sni = view.normalized_server_name().map(|n| n.as_str().into());
-                    let kinds = self.state.fingerprints;
+                    let kinds = state.fingerprints;
                     let fingerprint = Fingerprint::compute(&view, kinds);
-                    if let Some(hook) = &self.state.hook {
+                    if let Some(hook) = &state.hook {
                         let ctx = HelloContext {
                             view: &view,
                             fingerprint: &fingerprint,
@@ -901,12 +922,12 @@ impl ServerSession {
                         if let HelloVerdict::Refuse(reason) = hook.on_client_hello(&ctx) {
                             // No alert: a scanner learns nothing (D-014).
                             self.refusal = Some(HelloRefusal::Hook(reason));
-                            self.release();
+                            release(&mut self.slot, Some(state));
                             return Err(self.core.fail(TlsError::Refused(reason)));
                         }
                     }
-                    if self.state.obs.sample() {
-                        self.state.obs.emit(&TlsEvent::HelloCaptured {
+                    if state.obs.sample() {
+                        state.obs.emit(&TlsEvent::HelloCaptured {
                             tag: self.core.tag,
                             view: &view,
                             fingerprint: &fingerprint,
@@ -915,13 +936,12 @@ impl ServerSession {
                     if kinds != crate::fingerprint::FingerprintKinds::NONE {
                         self.fingerprint = Some(fingerprint);
                     }
-                    let Some(slot) = self.state.table.lookup(self.sni.as_deref()) else {
+                    let Some(slot) = state.table.lookup(self.sni.as_deref()) else {
                         self.refusal = Some(HelloRefusal::UnknownName);
-                        self.release();
+                        release(&mut self.slot, Some(state));
                         return self.core.refuse_unknown_name(output);
                     };
-                    let group = self
-                        .state
+                    let group = state
                         .groups
                         .get(slot.group)
                         .copied()
@@ -929,12 +949,11 @@ impl ServerSession {
                     self.group = Some(group);
                     if group.alpn_required && !view.has_alpn() {
                         self.refusal = Some(HelloRefusal::AlpnRequired);
-                        self.release();
+                        release(&mut self.slot, Some(state));
                         return self.core.refuse_no_alpn(output);
                     }
                     self.core.set_max_handshake_bytes(group.max_handshake_bytes);
-                    let config = self
-                        .state
+                    let config = state
                         .configs
                         .get(slot.group)
                         .cloned()
@@ -942,18 +961,18 @@ impl ServerSession {
                     match UnbufferedServerConnection::new(config) {
                         Ok(conn) => self.core.set_conn(conn),
                         Err(e) => {
-                            self.release();
+                            release(&mut self.slot, Some(state));
                             return Err(self.core.fail(error::from_rustls(&e)));
                         }
                     }
                 }
-                Err(e) if self.state.hello_limits.refuse_malformed || is_not_tls(&e) => {
+                Err(e) if state.hello_limits.refuse_malformed || is_not_tls(&e) => {
                     self.refusal = Some(if e.code() == 32 {
                         HelloRefusal::OverBudget
                     } else {
                         HelloRefusal::Malformed
                     });
-                    self.release();
+                    release(&mut self.slot, Some(state));
                     return Err(self.core.fail(e));
                 }
                 Err(e) => {
@@ -961,17 +980,17 @@ impl ServerSession {
                     // fingerprint. Only where nothing else depends on the
                     // hello: with a hook, host groups, or a required ALPN the
                     // hello is refused as before (D-127).
-                    let first = self.state.groups.first().copied();
-                    let lenient = self.state.groups.len() == 1
-                        && self.state.hook.is_none()
+                    let first = state.groups.first().copied();
+                    let lenient = state.groups.len() == 1
+                        && state.hook.is_none()
                         && first.is_some_and(|g| !g.alpn_required);
                     if !lenient {
                         self.refusal = Some(HelloRefusal::Malformed);
-                        self.release();
+                        release(&mut self.slot, Some(state));
                         return Err(self.core.fail(e));
                     }
                     self.group = first;
-                    let config = self.state.configs.first().cloned().ok_or(TlsError::Other)?;
+                    let config = state.configs.first().cloned().ok_or(TlsError::Other)?;
                     let conn = UnbufferedServerConnection::new(config)
                         .map_err(|e| self.core.fail(error::from_rustls(&e)))?;
                     self.core.set_conn(conn);
@@ -1019,7 +1038,10 @@ impl ServerSession {
                 }
             }
         }
-        let limits = self.state.limits;
+        let Some(state) = &self.state else {
+            return Err(TlsError::Other);
+        };
+        let limits = state.limits;
         if let Some(chain) = self.core.peer_chain() {
             let too_large = chain.len() > usize::from(limits.max_peer_chain_len)
                 || chain
@@ -1033,9 +1055,7 @@ impl ServerSession {
     }
 
     fn release(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            self.state.capacity.release(slot);
-        }
+        release(&mut self.slot, self.state.as_ref());
     }
 
     /// Encrypts all of `plaintext` into `output`, or writes nothing.
@@ -1112,6 +1132,16 @@ impl ServerSession {
     }
 }
 
+/// Gives back the handshake slot, if the session still holds one. A free
+/// function, so the hello path can call it while it borrows the snapshot.
+fn release(slot: &mut Option<CapacitySlot>, state: Option<&crate::sync::Shared<ServerState>>) {
+    if let Some(state) = state {
+        if let Some(slot) = slot.take() {
+            state.capacity.release(slot);
+        }
+    }
+}
+
 fn is_not_tls(e: &TlsError) -> bool {
     matches!(
         e,
@@ -1180,7 +1210,8 @@ impl ClientSession {
         let before = self.core.state;
         let r = self.step_inner(input, output);
         if matches!(&r, Ok(p) if p.event == Event::HandshakeComplete) {
-            if let Some(info) = self.info() {
+            // Without the peer identity, which is built on first use (D-104).
+            if let Some(info) = self.core.info(Some(&self.server_name)) {
                 record_completion(&self.obs, &info, &self.core);
             }
         }
@@ -1308,7 +1339,7 @@ fn record_completion<C: Engine>(obs: &Observation, info: &HandshakeInfo<'_>, cor
         server_name: info.server_name,
         kind: info.kind,
         duration: core.started.map(|t| t.elapsed()).unwrap_or_default(),
-        peer_certificate: core.peer_chain().is_some_and(|c| !c.is_empty()),
+        peer_certificate: info.peer_verified,
         fingerprint: info.fingerprint,
     });
 }

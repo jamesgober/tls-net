@@ -8,7 +8,7 @@ mod common;
 use common::{End, RawHello, data, pump, send};
 use proptest::prelude::*;
 use tls_net::{
-    ClientBuilder, HelloLimits, HelloParse, HelloParser, KeySource, TlsServer, TrustAnchors,
+    HelloLimits, HelloParse, KeySource, TlsClient, TlsServer, TrustAnchors, parse_client_hello,
 };
 
 proptest! {
@@ -16,7 +16,7 @@ proptest! {
 
     #[test]
     fn prop_hello_parser_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..20_000)) {
-        if let Ok(HelloParse::Complete { view, length }) = HelloParser::parse(&bytes, &HelloLimits::new()) {
+        if let Ok(HelloParse::Complete { view, length }) = parse_client_hello(&bytes, &HelloLimits::new()) {
             prop_assert!(length <= bytes.len());
             let _ = (view.cipher_suites().count(), view.extensions().count(), view.alpn().count());
         }
@@ -36,7 +36,7 @@ proptest! {
             input.extend(part);
         }
         let limits = HelloLimits::new().max_records(16).unwrap();
-        let _ = HelloParser::parse(&input, &limits);
+        let _ = parse_client_hello(&input, &limits);
     }
 
     #[test]
@@ -59,8 +59,8 @@ proptest! {
             framed.extend(part);
         }
         let limits = HelloLimits::new().max_records(16).unwrap();
-        let a = HelloParser::parse(&whole, &limits).unwrap();
-        let b = HelloParser::parse(&framed, &limits).unwrap();
+        let a = parse_client_hello(&whole, &limits).unwrap();
+        let b = parse_client_hello(&framed, &limits).unwrap();
         match (a, b) {
             (HelloParse::Complete { view: a, .. }, HelloParse::Complete { view: b, .. }) => {
                 prop_assert_eq!(a.normalized_server_name(), b.normalized_server_name());
@@ -78,7 +78,7 @@ proptest! {
     #[test]
     fn prop_any_chunking_delivers_the_same_plaintext(chunk in 1usize..4_000, sizes in proptest::collection::vec(1usize..20_000, 1..6)) {
         let server = TlsServer::builder().certificate(&data("site.pem"), KeySource::Pem(&data("site.key"))).unwrap().build().unwrap();
-        let client = ClientBuilder::new().trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap()).build().unwrap();
+        let client = TlsClient::builder().trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap()).build().unwrap();
         let (mut s, mut c) = (server.accept().unwrap(), client.connect("localhost").unwrap());
         let (mut se, mut ce) = (End::new(chunk), End::new(chunk));
         pump(&mut s, &mut se, &mut c, &mut ce);

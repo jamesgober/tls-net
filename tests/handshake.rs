@@ -6,12 +6,12 @@ mod common;
 
 use common::{End, data, pump, send};
 use tls_net::{
-    Alpn, CipherSuite, ClientBuilder, HandshakeKind, HandshakeLimits, KeySource, Policy,
-    SessionState, TlsClient, TlsError, TlsServer, TrustAnchors, UnknownName, Version,
+    Alpn, CipherSuite, HandshakeKind, HandshakeLimits, KeySource, Policy, SessionState, TlsClient,
+    TlsError, TlsServer, TrustAnchors, UnknownName, Version,
 };
 
 fn client(policy: Policy, alpn: &[Alpn]) -> TlsClient {
-    ClientBuilder::new()
+    TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .policy(policy)
         .alpn(alpn)
@@ -66,7 +66,7 @@ fn test_handshake_tls13_default_policies_complete() {
     assert_eq!(si.kind, HandshakeKind::Full);
     #[cfg(feature = "aws-lc")]
     assert_eq!(si.group, Some(tls_net::Group::X25519MlKem768));
-    assert_eq!(server.handshakes_in_progress(), 0);
+    assert_eq!(server.stats().in_progress, 0);
 }
 
 #[test]
@@ -219,7 +219,7 @@ fn test_unknown_name_refused_with_unrecognized_name_t25() {
 #[test]
 fn test_capacity_gate_refuses_then_releases() {
     let server = site()
-        .limits(HandshakeLimits::server().max_in_progress(1).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(1))
         .build()
         .unwrap();
     let first = server.accept().unwrap();
@@ -231,7 +231,7 @@ fn test_capacity_gate_refuses_then_releases() {
     // A completed handshake released its slot.
     assert!(server.accept().is_ok());
     let zero = site()
-        .limits(HandshakeLimits::server().max_in_progress(0).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(0))
         .build()
         .unwrap();
     assert_eq!(zero.accept().unwrap_err(), TlsError::HandshakeCapacity);
@@ -246,7 +246,7 @@ fn test_server_with_untrusted_ca_refused_t6() {
         .next()
         .unwrap()
         .unwrap();
-    let other = ClientBuilder::new()
+    let other = TlsClient::builder()
         .trust(TrustAnchors::from_der(&[leaf.as_ref()]).unwrap())
         .build()
         .unwrap();
@@ -359,7 +359,7 @@ fn test_output_too_small_is_output_full() {
     let server = site().build().unwrap();
     let mut s = server.accept().unwrap();
     let mut input = [0u8; 10];
-    let mut out = vec![0u8; tls_net::OUTGOING_MIN - 1];
+    let mut out = vec![0u8; tls_net::MIN_OUTPUT_BUFFER - 1];
     let p = s.step(&mut input, &mut out).unwrap();
     assert_eq!(
         (p.consumed, p.written, p.event),
@@ -379,7 +379,7 @@ fn test_not_tls_refused() {
         s.step(&mut input, &mut out).unwrap_err(),
         TlsError::SessionFailed
     );
-    assert_eq!(server.handshakes_in_progress(), 0);
+    assert_eq!(server.stats().in_progress, 0);
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn test_handshake_budget_exceeded() {
         .unwrap()
         .build()
         .unwrap();
-    let small = ClientBuilder::new()
+    let small = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .limits(HandshakeLimits::client().max_handshake_bytes(8192).unwrap())
         .build()
@@ -428,7 +428,7 @@ fn test_handshake_budget_exceeded() {
 #[test]
 fn test_peer_chain_budget_client_side_t22() {
     let server = site().build().unwrap();
-    let strict = ClientBuilder::new()
+    let strict = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .limits(HandshakeLimits::client().max_peer_chain_len(1).unwrap())
         .build()
@@ -533,19 +533,19 @@ fn test_publish_changes_the_handshake_limit() {
     // The gate is the server's, but its limit follows each publish: 0
     // drains, a higher limit lets a spike through (D-132).
     let server = site()
-        .limits(HandshakeLimits::server().max_in_progress(10).unwrap())
+        .limits(HandshakeLimits::server().max_in_progress(10))
         .build()
         .unwrap();
     let held = server.accept().unwrap();
     server
         .reload_handle()
-        .publish(site().limits(HandshakeLimits::server().max_in_progress(0).unwrap()))
+        .publish(site().limits(HandshakeLimits::server().max_in_progress(0)))
         .unwrap();
     assert_eq!(server.accept().unwrap_err(), TlsError::HandshakeCapacity);
     drop(held);
     server
         .reload_handle()
-        .publish(site().limits(HandshakeLimits::server().max_in_progress(2).unwrap()))
+        .publish(site().limits(HandshakeLimits::server().max_in_progress(2)))
         .unwrap();
     let (a, b) = (server.accept().unwrap(), server.accept().unwrap());
     assert_eq!(server.accept().unwrap_err(), TlsError::HandshakeCapacity);

@@ -6,14 +6,14 @@
 mod common;
 
 use common::TcpClient;
-use tls_net::{Alpn, ClientBuilder, TrustAnchors};
+use tls_net::{Alpn, TlsClient, TrustAnchors};
 
 #[test]
 fn test_public_sites_verify_with_mozilla_roots() {
     if std::env::var_os("TLS_NET_NETWORK").is_none() {
         return;
     }
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::mozilla())
         .alpn(&[Alpn::HTTP_1_1])
         .build()
@@ -113,7 +113,7 @@ fn test_platform_verifier_public_sites() {
     if std::env::var_os("TLS_NET_NETWORK").is_none() {
         return;
     }
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::platform())
         .alpn(&[Alpn::HTTP_1_1])
         .build()

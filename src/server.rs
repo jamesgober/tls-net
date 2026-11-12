@@ -24,7 +24,7 @@ use crate::pem;
 use crate::policy::{Policy, Preset};
 use crate::session::ServerSession;
 use crate::snapshot::{Reader, Snapshot};
-use crate::sni::{self, GroupResolver, SniTable};
+use crate::sni::{self, GroupResolver, HostScope, SniTable};
 use crate::tickets::{BoundTickets, TicketKeyRing, TicketKeyRingHandle, TicketMode};
 use crate::verify::ClientAuth;
 
@@ -369,6 +369,59 @@ impl TlsServer {
         Ok(ServerSession::new(self.inner.snapshot.load(), slot))
     }
 
+    /// Runs the handshake for one accepted connection over a blocking
+    /// transport: a [`TlsStream`](crate::TlsStream) that reads and writes
+    /// plaintext. On net-io, net-io drives the session instead.
+    ///
+    /// ```no_run
+    /// use std::io::{Read, Write};
+    /// let tls = tls_net::server_from_files("/etc/tls/site.pem", "/etc/tls/site.key")?;
+    /// let listener = std::net::TcpListener::bind("0.0.0.0:8443")?;
+    /// let (tcp, _) = listener.accept()?;
+    /// let mut conn = tls.accept_stream(tcp)?;
+    /// let mut request = [0u8; 1024];
+    /// let n = conn.read(&mut request)?;
+    /// conn.write_all(&request[..n])?;
+    /// conn.close()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As `accept`; then the handshake's error, `Transport` when the
+    /// transport fails, or `UncleanClose` when it ends first.
+    pub fn accept_stream<S: std::io::Read + std::io::Write>(
+        &self,
+        io: S,
+    ) -> Result<crate::TlsStream<S>, TlsError> {
+        crate::TlsStream::server(self.accept()?, io)
+    }
+
+    /// The hosts a connection may serve, from the server name its handshake
+    /// reported (`HandshakeInfo::server_name`, or net-io's `TlsInfo::sni`).
+    /// Call it once per connection after the handshake, then check every
+    /// request's `Host` with [`HostScope::permits`]; this is what makes a
+    /// [`HostPolicy`] hold against a client that sends another name or none.
+    ///
+    /// The scope uses the current configuration: after a reload, an open
+    /// connection is checked against the new host groups. One lock and an
+    /// `Arc` clone, as `accept`.
+    ///
+    /// ```
+    /// # #[cfg(any(feature = "aws-lc", feature = "ring"))] {
+    /// # let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+    /// # let server = tls_net::server_from_pem(&std::fs::read(format!("{dir}site.pem")).unwrap(), &std::fs::read(format!("{dir}site.key")).unwrap()).unwrap();
+    /// // With no host policies, every host the server knows is in one scope.
+    /// let scope = server.host_scope(Some("localhost"));
+    /// assert!(scope.permits("example.test"));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn host_scope(&self, server_name: Option<&str>) -> HostScope {
+        let state = self.inner.snapshot.load();
+        HostScope::new(Arc::clone(&state.table.names), server_name)
+    }
+
     /// The server's counters, read without locking.
     #[must_use]
     pub fn stats(&self) -> ServerStats {
@@ -382,15 +435,15 @@ impl TlsServer {
             handshakes_full: h.full.load(Relaxed),
             handshakes_resumed: h.resumed.load(Relaxed),
             handshakes_failed: h.failed.load(Relaxed),
-            in_progress: self.handshakes_in_progress(),
+            in_progress: self.inner.shared.capacity.in_progress.load(Relaxed),
             capacity_refusals: obs.refusals.capacity.load(Relaxed),
             hello_refusals: obs.refusals.hello.load(Relaxed),
             tickets_issued: issued,
             tickets_rejected: rejected,
-            snapshot_version: self.version(),
+            config_version: self.inner.snapshot.version(),
             tls12_handshakes: h.tls12.load(Relaxed),
             post_quantum_handshakes: h.post_quantum.load(Relaxed),
-            sni_disagreements: self.sni_disagreements(),
+            sni_disagreements: self.inner.shared.sni_mismatches.load(Relaxed),
         }
     }
 
@@ -405,10 +458,12 @@ impl TlsServer {
             .map(|r| TicketKeyRingHandle::new(Arc::clone(r)))
     }
 
-    /// A per-worker handle: one atomic load per `accept`, a lock only after a reload.
+    /// A per-worker accept handle: one atomic load per `accept`, a lock only
+    /// after a reload. For a driver that accepts on many threads; `accept`
+    /// is the same with one more atomic operation per call (D-102).
     #[must_use]
-    pub fn reader(&self) -> ServerReader {
-        ServerReader {
+    pub fn worker_acceptor(&self) -> WorkerAcceptor {
+        WorkerAcceptor {
             inner: Arc::clone(&self.inner),
             reader: Reader::new(Arc::clone(&self.inner.snapshot)),
         }
@@ -519,35 +574,10 @@ impl TlsServer {
     pub fn as_rustls_configs(&self) -> Vec<Arc<rustls::ServerConfig>> {
         self.inner.snapshot.load().configs.clone()
     }
-
-    /// Handshakes in progress now.
-    #[must_use]
-    pub fn handshakes_in_progress(&self) -> u32 {
-        self.inner
-            .shared
-            .capacity
-            .in_progress
-            .load(Ordering::Relaxed)
-    }
-
-    /// The current configuration version (1 at build, +1 per reload).
-    #[must_use]
-    pub fn version(&self) -> u64 {
-        self.inner.snapshot.version()
-    }
-
-    /// Times rustls's view of the SNI fell outside the session's host group (D-064).
-    #[must_use]
-    pub fn sni_disagreements(&self) -> u64 {
-        self.inner
-            .shared
-            .sni_mismatches
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 /// A per-worker accept handle (`Send`, not `Sync`).
-pub struct ServerReader {
+pub struct WorkerAcceptor {
     inner: Arc<Inner>,
     reader: Reader<ServerState>,
 }
@@ -581,15 +611,15 @@ impl fmt::Debug for Inner {
     }
 }
 
-impl fmt::Debug for ServerReader {
+impl fmt::Debug for WorkerAcceptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ServerReader")
+        f.debug_struct("WorkerAcceptor")
             .field("server", &self.inner)
             .finish()
     }
 }
 
-impl ServerReader {
+impl WorkerAcceptor {
     /// As [`TlsServer::accept`], reading the snapshot without a lock in the
     /// steady state.
     ///
@@ -696,11 +726,108 @@ struct Pending {
     is_default: bool,
     /// Added with `certificate_for`: `entry.names` were configured, not the SANs.
     explicit: bool,
+    /// What it was loaded from, and under which settings, so `build` loads
+    /// it again when the settings changed after the call (D-148).
+    input: Input,
+    loaded_with: LoadSettings,
+}
+
+/// The builder settings that change what a certificate load accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoadSettings {
+    limits: LoadLimits,
+    skew: Duration,
+    allow_group_readable: bool,
+}
+
+/// A certificate's inputs, owned. Key bytes are wiped on drop.
+#[derive(Clone)]
+struct Input {
+    chain: OwnedChain,
+    key: OwnedKey,
+    /// The names given to `certificate_for`.
+    names: Option<Vec<Box<str>>>,
+}
+
+#[derive(Clone)]
+enum OwnedChain {
+    Pem(Vec<u8>),
+    Der(Vec<Vec<u8>>),
+}
+
+#[derive(Clone)]
+enum OwnedKey {
+    Pem(crypt_io::Zeroizing<Vec<u8>>),
+    Der(crypt_io::Zeroizing<Vec<u8>>),
+    File(std::path::PathBuf),
+    #[cfg(feature = "key-vault")]
+    Vault {
+        vault: Arc<key_vault::KeyVault>,
+        handle: key_vault::KeyHandle,
+        custody: crate::custody::KeyCustody,
+    },
+}
+
+impl OwnedKey {
+    fn new(key: &KeySource<'_>) -> OwnedKey {
+        match key {
+            KeySource::Pem(b) => OwnedKey::Pem(crypt_io::Zeroizing::new(b.to_vec())),
+            KeySource::Der(b) => OwnedKey::Der(crypt_io::Zeroizing::new(b.to_vec())),
+            KeySource::File(p) => OwnedKey::File(p.to_path_buf()),
+            #[cfg(feature = "key-vault")]
+            KeySource::Vault {
+                vault,
+                handle,
+                custody,
+            } => OwnedKey::Vault {
+                vault: Arc::clone(vault),
+                handle: *handle,
+                custody: *custody,
+            },
+        }
+    }
+
+    fn source(&self) -> KeySource<'_> {
+        match self {
+            OwnedKey::Pem(b) => KeySource::Pem(b),
+            OwnedKey::Der(b) => KeySource::Der(b),
+            OwnedKey::File(p) => KeySource::File(p),
+            #[cfg(feature = "key-vault")]
+            OwnedKey::Vault {
+                vault,
+                handle,
+                custody,
+            } => KeySource::Vault {
+                vault: Arc::clone(vault),
+                handle: *handle,
+                custody: *custody,
+            },
+        }
+    }
+}
+
+impl Input {
+    fn load(&self, opts: &LoadOptions) -> Result<CertificateEntry, TlsError> {
+        let names: Option<Vec<&str>> = self
+            .names
+            .as_ref()
+            .map(|n| n.iter().map(|n| &**n).collect());
+        let ders: Vec<&[u8]>;
+        let chain = match &self.chain {
+            OwnedChain::Pem(pem) => Chain::Pem(pem),
+            OwnedChain::Der(der) => {
+                ders = der.iter().map(Vec::as_slice).collect();
+                Chain::Der(&ders)
+            }
+        };
+        certs::load(chain, self.key.source(), names.as_deref(), opts)
+    }
 }
 
 /// Builds a [`TlsServer`]. Methods that parse return `Result` at once, so an
-/// error points at the call that caused it. Set `load_limits`,
-/// `allow_group_readable_key`, and `validity_skew` before adding certificates.
+/// error points at the call that caused it. Settings can come in any order:
+/// a certificate added before `load_limits`, `allow_group_readable_key`, or
+/// `validity_skew` changed is loaded again at `build` under the final values.
 ///
 /// ```
 /// use tls_net::{Alpn, KeySource, Policy, TlsServer};
@@ -779,18 +906,13 @@ impl fmt::Debug for ServerBuilder {
     }
 }
 
-impl Default for ServerBuilder {
-    fn default() -> Self {
-        ServerBuilder::new()
-    }
-}
-
 /// The largest OCSP staple accepted.
 const MAX_STAPLE: usize = 16 << 10;
 
 impl ServerBuilder {
     /// An empty builder with the `compatible` policy and default budgets.
-    pub fn new() -> Self {
+    /// `TlsServer::builder()` is the public way in (one way to start).
+    pub(crate) fn new() -> Self {
         ServerBuilder {
             pending: Vec::new(),
             reload_names: None,
@@ -873,6 +995,29 @@ impl ServerBuilder {
         }
     }
 
+    fn load_settings(&self) -> LoadSettings {
+        LoadSettings {
+            limits: self.load_limits,
+            skew: self.skew,
+            allow_group_readable: self.allow_group_readable,
+        }
+    }
+
+    /// Loads a certificate now, so an error points at the call, and keeps
+    /// its inputs for `build`.
+    fn add(mut self, input: Input, is_default: bool, explicit: bool) -> Result<Self, TlsError> {
+        let entry = input.load(&self.options())?;
+        let loaded_with = self.load_settings();
+        self.pending.push(Pending {
+            entry,
+            is_default,
+            explicit,
+            input,
+            loaded_with,
+        });
+        Ok(self)
+    }
+
     /// The default certificate: served for any name it covers (its SANs), and
     /// for unknown names when `UnknownName::UseDefault`. The first call
     /// registers the default; later calls add entries named by their SANs.
@@ -880,15 +1025,14 @@ impl ServerBuilder {
     /// # Errors
     ///
     /// `TLS-0010` to `TLS-0020` from the load-time checks.
-    pub fn certificate(mut self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError> {
-        let entry = certs::load(Chain::Pem(chain_pem), key, None, &self.options())?;
+    pub fn certificate(self, chain_pem: &[u8], key: KeySource<'_>) -> Result<Self, TlsError> {
         let is_default = !self.pending.iter().any(|p| p.is_default);
-        self.pending.push(Pending {
-            entry,
-            is_default,
-            explicit: false,
-        });
-        Ok(self)
+        let input = Input {
+            chain: OwnedChain::Pem(chain_pem.to_vec()),
+            key: OwnedKey::new(&key),
+            names: None,
+        };
+        self.add(input, is_default, false)
     }
 
     /// A certificate for explicit names (exact or `*.` wildcards), each of
@@ -898,7 +1042,7 @@ impl ServerBuilder {
     ///
     /// `TLS-0010` to `TLS-0020`; `NameNotCovered` for a name outside its SANs.
     pub fn certificate_for(
-        mut self,
+        self,
         names: &[&str],
         chain_pem: &[u8],
         key: KeySource<'_>,
@@ -908,13 +1052,12 @@ impl ServerBuilder {
                 reason: "certificate_for needs at least one name",
             });
         }
-        let entry = certs::load(Chain::Pem(chain_pem), key, Some(names), &self.options())?;
-        self.pending.push(Pending {
-            entry,
-            is_default: false,
-            explicit: true,
-        });
-        Ok(self)
+        let input = Input {
+            chain: OwnedChain::Pem(chain_pem.to_vec()),
+            key: OwnedKey::new(&key),
+            names: Some(names.iter().map(|&n| n.into()).collect()),
+        };
+        self.add(input, false, true)
     }
 
     /// As [`certificate`](Self::certificate), with the chain as DER.
@@ -923,18 +1066,17 @@ impl ServerBuilder {
     ///
     /// As `certificate`.
     pub fn certificate_der(
-        mut self,
+        self,
         chain_der: &[&[u8]],
         key: KeySource<'_>,
     ) -> Result<Self, TlsError> {
-        let entry = certs::load(Chain::Der(chain_der), key, None, &self.options())?;
         let is_default = !self.pending.iter().any(|p| p.is_default);
-        self.pending.push(Pending {
-            entry,
-            is_default,
-            explicit: false,
-        });
-        Ok(self)
+        let input = Input {
+            chain: OwnedChain::Der(chain_der.iter().map(|c| c.to_vec()).collect()),
+            key: OwnedKey::new(&key),
+            names: None,
+        };
+        self.add(input, is_default, false)
     }
 
     /// What unknown names get. Default: `UseDefault` with a default
@@ -962,15 +1104,17 @@ impl ServerBuilder {
         self
     }
 
-    /// The handshake budgets.
+    /// The handshake budgets; values outside the setters' ranges are clamped
+    /// to them.
     pub fn limits(mut self, limits: HandshakeLimits) -> Self {
-        self.limits = limits;
+        self.limits = limits.clamped();
         self
     }
 
-    /// Budgets for certificate and key intake. Set before adding certificates.
+    /// Budgets for certificate and key intake; values outside the setters'
+    /// ranges are clamped to them.
     pub fn load_limits(mut self, limits: LoadLimits) -> Self {
-        self.load_limits = limits;
+        self.load_limits = limits.clamped();
         self
     }
 
@@ -1061,15 +1205,13 @@ impl ServerBuilder {
         self
     }
 
-    /// Allow key files readable by group or others (Unix). Off by default;
-    /// set before adding certificates.
+    /// Allow key files readable by group or others (Unix). Off by default.
     pub fn allow_group_readable_key(mut self, allow: bool) -> Self {
         self.allow_group_readable = allow;
         self
     }
 
-    /// Clock skew allowed on `not_before` (default 5 minutes, at most 1 day);
-    /// set before adding certificates.
+    /// Clock skew allowed on `not_before` (default 5 minutes, at most 1 day).
     pub fn validity_skew(mut self, skew: Duration) -> Self {
         self.skew = skew.min(Duration::from_secs(86_400));
         self
@@ -1145,8 +1287,18 @@ impl ServerBuilder {
             None => 2,
         };
 
-        let mut entries: Vec<CertificateEntry> =
-            self.pending.iter().map(|p| p.entry.clone()).collect();
+        // A certificate added before a load setting changed is loaded again
+        // under the final settings, as a reload would load it (D-148).
+        let now = self.load_settings();
+        let opts = self.options();
+        let mut entries = Vec::with_capacity(self.pending.len());
+        for p in &self.pending {
+            entries.push(if p.loaded_with == now {
+                p.entry.clone()
+            } else {
+                p.input.load(&opts)?
+            });
+        }
         for (name, staple) in &self.ocsp {
             let mut hit = false;
             // A staple goes to the certificate its certID names (by serial),
@@ -1240,6 +1392,14 @@ impl ServerBuilder {
             if alpn_policy == AlpnPolicy::Required && alpn.is_empty() {
                 return Err(TlsError::PolicyInvalid {
                     reason: "ALPN is required but no protocol is configured",
+                });
+            }
+            // net-io carries at most 32 bytes of ALPN; a longer name would
+            // reach it as no ALPN at all (D-152).
+            #[cfg(feature = "net-io")]
+            if alpn.iter().any(|a| a.as_bytes().len() > 32) {
+                return Err(TlsError::PolicyInvalid {
+                    reason: "an ALPN name longer than 32 bytes does not fit net-io",
                 });
             }
             #[cfg(feature = "net-io")]
@@ -1395,7 +1555,7 @@ pub fn server_from_files(
 mod tests {
     use super::*;
     #[cfg(any(feature = "aws-lc", feature = "ring"))]
-    use crate::{ClientBuilder, Event, HandshakeKind, TrustAnchors};
+    use crate::{Event, HandshakeKind, TlsClient, TrustAnchors};
 
     pub(crate) static CLOCK_AHEAD: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
@@ -1454,7 +1614,7 @@ mod tests {
             .client_auth(ClientAuth::required(ca.clone()))
             .build()
             .unwrap();
-        let client = ClientBuilder::new()
+        let client = TlsClient::builder()
             .trust(ca)
             .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
             .unwrap()
@@ -1504,7 +1664,7 @@ mod tests {
                 .unwrap()
         };
         let budget = |s: &TlsServer| s.inner.snapshot.load().groups[0].max_handshake_bytes;
-        let only_gate = build(HandshakeLimits::server().max_in_progress(64).unwrap());
+        let only_gate = build(HandshakeLimits::server().max_in_progress(64));
         assert_eq!(budget(&only_gate), 96 << 10);
         let explicit = build(
             HandshakeLimits::server()

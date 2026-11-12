@@ -186,14 +186,194 @@ impl Slot {
     }
 }
 
-/// The SNI table of one configuration snapshot.
-#[derive(Debug, Default)]
-pub(crate) struct SniTable {
+/// The names of one configuration snapshot and the host group each belongs
+/// to. It holds no keys, so a [`HostScope`](crate::HostScope) can keep it
+/// for a connection's life without keeping certificates or private keys.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NameTable {
     exact: HashMap<Box<str>, Slot>,
     wildcard: HashMap<Box<str>, Slot>,
     default: Option<Slot>,
     /// Whether an unknown name gets the default entry.
     use_default: bool,
+}
+
+impl NameTable {
+    /// The slot for a normalised name: exact, then wildcard, then the default
+    /// (when unknown names get it). At most two hash lookups, no allocation.
+    pub(crate) fn lookup(&self, name: Option<&str>) -> Option<Slot> {
+        if let Some(name) = name {
+            if let Some(slot) = self.exact.get(name) {
+                return Some(*slot);
+            }
+            if let Some((_, parent)) = name.split_once('.') {
+                if let Some(slot) = self.wildcard.get(parent) {
+                    return Some(*slot);
+                }
+            }
+        }
+        if self.use_default { self.default } else { None }
+    }
+}
+
+/// The hosts one connection may serve: the hosts in the same host group as
+/// the server name its handshake was accepted under (D-143).
+///
+/// A host policy ([`HostPolicy`](crate::HostPolicy)) applies its rules to a
+/// handshake by the SNI the client sends. A client that sends another name,
+/// or none, gets another group's rules, and can then send a request for a
+/// host under the policy. Only the HTTP layer sees that request, so it must
+/// check every request's `Host` (or `:authority`) with [`permits`](Self::permits)
+/// and refuse the ones outside the scope, for example with
+/// `421 Misdirected Request`.
+///
+/// Get one per connection from [`TlsServer::host_scope`](crate::TlsServer::host_scope),
+/// after the handshake; `permits` is then two hash lookups, without a lock
+/// or an allocation. Cloning is one `Arc` increment.
+///
+/// ```
+/// # #[cfg(any(feature = "aws-lc", feature = "ring"))] {
+/// # let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+/// # let chain = std::fs::read(format!("{dir}site.pem")).unwrap();
+/// # let key = std::fs::read(format!("{dir}site.key")).unwrap();
+/// # let ca = tls_net::TrustAnchors::from_pem(&std::fs::read(format!("{dir}ca.pem")).unwrap()).unwrap();
+/// use tls_net::{ClientAuth, HostPolicy, KeySource, TlsServer};
+/// // site.pem covers localhost, example.test, and *.example.test.
+/// let server = TlsServer::builder()
+///     .certificate(&chain, KeySource::Pem(&key))?
+///     .host(&["admin.example.test"], HostPolicy::new().client_auth(ClientAuth::required(ca)))?
+///     .build()?;
+/// // A connection whose SNI was www.example.test, or that sent none:
+/// let scope = server.host_scope(Some("www.example.test"));
+/// assert!(scope.permits("www.example.test"));
+/// assert!(scope.permits("www.example.test:443"));
+/// assert!(!scope.permits("admin.example.test"), "answer 421");
+/// assert!(!server.host_scope(None).permits("admin.example.test"));
+/// // A connection accepted under the admin host's rules:
+/// assert!(server.host_scope(Some("admin.example.test")).permits("admin.example.test"));
+/// # }
+/// # Ok::<(), tls_net::TlsError>(())
+/// ```
+#[derive(Clone)]
+pub struct HostScope {
+    names: Arc<NameTable>,
+    /// The connection's group; `None` when its name resolves to no host.
+    group: Option<usize>,
+}
+
+impl HostScope {
+    pub(crate) fn new(names: Arc<NameTable>, server_name: Option<&str>) -> HostScope {
+        let group = match server_name {
+            None => names.lookup(None),
+            Some(n) => normalize_server_name(n).and_then(|n| names.lookup(Some(n.as_str()))),
+        }
+        .map(|slot| slot.group);
+        HostScope { names, group }
+    }
+
+    /// Whether a request for `host` may be served on this connection: `host`
+    /// resolves, by the same rules as SNI, to the connection's host group.
+    ///
+    /// `host` is a `Host` header or `:authority` value: a DNS name, IPv4
+    /// address, or bracketed IPv6 address, with an optional `:port`. An IP
+    /// address resolves as a hello without SNI does. A value that is none of
+    /// these (`a b`, `x.test:8o`) is `false`, as is every host when the
+    /// connection's name resolves to no host.
+    #[must_use]
+    pub fn permits(&self, host: &str) -> bool {
+        let Some(group) = self.group else {
+            return false;
+        };
+        let slot = match parse_host(host) {
+            HostValue::Ip => self.names.lookup(None),
+            HostValue::Name(name) => self.names.lookup(Some(name.as_str())),
+            HostValue::Invalid => return false,
+        };
+        slot.is_some_and(|s| s.group == group)
+    }
+}
+
+impl fmt::Debug for HostScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostScope")
+            .field("group", &self.group)
+            .finish_non_exhaustive()
+    }
+}
+
+/// For the `host_value` fuzz target: a table of an exact name, a wildcard,
+/// a name moved to group 1, and the default; checks `permits` against an
+/// independent reading of the value.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_host(host: &str) -> bool {
+    let mut t = NameTable::default();
+    let slot = |group| Slot {
+        preferred: Some(0),
+        rsa: None,
+        group,
+    };
+    t.exact.insert("a.test".into(), slot(0));
+    t.exact.insert("admin.x.test".into(), slot(1));
+    t.wildcard.insert("x.test".into(), slot(0));
+    t.default = Some(slot(0));
+    t.use_default = true;
+    let names = Arc::new(t);
+    let permitted = HostScope::new(Arc::clone(&names), Some("a.test")).permits(host);
+    let admin = HostScope::new(names, Some("admin.x.test")).permits(host);
+    // One group or the other, never both; never a value that does not parse.
+    assert!(!(permitted && admin), "{host:?}");
+    if permitted || admin {
+        assert!(!matches!(parse_host(host), HostValue::Invalid), "{host:?}");
+        assert!(
+            !host.bytes().any(|b| b.is_ascii_control() || b == b' '),
+            "{host:?}"
+        );
+    }
+    permitted
+}
+
+/// A `Host` or `:authority` value, without its port. Built and matched in
+/// one call on the stack, so the inline name costs no allocation.
+#[allow(clippy::large_enum_variant)]
+enum HostValue {
+    Ip,
+    Name(NormalizedName),
+    Invalid,
+}
+
+fn parse_host(host: &str) -> HostValue {
+    let digits = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = host.strip_prefix('[') {
+        // An IPv6 literal: "[addr]" or "[addr]:port".
+        return match rest.split_once(']') {
+            Some((addr, tail))
+                if addr.parse::<std::net::Ipv6Addr>().is_ok()
+                    && (tail.is_empty() || tail.strip_prefix(':').is_some_and(digits)) =>
+            {
+                HostValue::Ip
+            }
+            _ => HostValue::Invalid,
+        };
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if digits(port) => name,
+        Some(_) => return HostValue::Invalid,
+        None => host,
+    };
+    if name.parse::<std::net::Ipv4Addr>().is_ok() {
+        return HostValue::Ip;
+    }
+    match normalize_server_name(name) {
+        Some(n) => HostValue::Name(n),
+        None => HostValue::Invalid,
+    }
+}
+
+/// The SNI table of one configuration snapshot.
+#[derive(Debug, Default)]
+pub(crate) struct SniTable {
+    /// Shared with every `HostScope` made from this snapshot.
+    pub(crate) names: Arc<NameTable>,
     /// The certified keys, indexed by slot entries.
     keys: Vec<(Arc<CertifiedKey>, EntryKey)>,
     /// rustls's view of the SNI fell outside the session's group (D-032);
@@ -206,6 +386,12 @@ impl SniTable {
         SniTable::default()
     }
 
+    /// The names, for changes while the table is built (never shared yet,
+    /// so this does not copy).
+    fn names_mut(&mut self) -> &mut NameTable {
+        Arc::make_mut(&mut self.names)
+    }
+
     /// Adds an entry; returns its index.
     pub(crate) fn add_key(&mut self, key: Arc<CertifiedKey>, kind: EntryKey) -> usize {
         self.keys.push((key, kind));
@@ -216,9 +402,10 @@ impl SniTable {
     /// `false` if the name already has an entry of the same key type.
     pub(crate) fn add_name(&mut self, name: &str, entry: usize, group: usize) -> bool {
         let kind = self.keys[entry].1;
+        let names = self.names_mut();
         let (map, key) = match name.strip_prefix("*.") {
-            Some(suffix) => (&mut self.wildcard, suffix),
-            None => (&mut self.exact, name),
+            Some(suffix) => (&mut names.wildcard, suffix),
+            None => (&mut names.exact, name),
         };
         let slot = map.entry(key.into()).or_insert(Slot {
             group,
@@ -234,8 +421,9 @@ impl SniTable {
     /// (exact, or the wildcard that covers it) serve it in that group. A
     /// `*.` name moves the wildcard itself. `false` if no certificate covers it.
     pub(crate) fn assign(&mut self, name: &str, group: usize) -> bool {
+        let names = self.names_mut();
         if let Some(suffix) = name.strip_prefix("*.") {
-            return match self.wildcard.get_mut(suffix) {
+            return match names.wildcard.get_mut(suffix) {
                 Some(slot) => {
                     slot.group = group;
                     true
@@ -243,13 +431,13 @@ impl SniTable {
                 None => false,
             };
         }
-        let found = self.exact.get(name).copied().or_else(|| {
+        let found = names.exact.get(name).copied().or_else(|| {
             let (_, parent) = name.split_once('.')?;
-            self.wildcard.get(parent).copied()
+            names.wildcard.get(parent).copied()
         });
         match found {
             Some(slot) => {
-                self.exact.insert(name.into(), Slot { group, ..slot });
+                names.exact.insert(name.into(), Slot { group, ..slot });
                 true
             }
             None => false,
@@ -262,24 +450,14 @@ impl SniTable {
             ..Slot::default()
         };
         slot.put(entry, self.keys[entry].1);
-        self.default = Some(slot);
-        self.use_default = use_default;
+        let names = self.names_mut();
+        names.default = Some(slot);
+        names.use_default = use_default;
     }
 
-    /// The slot for a normalised name: exact, then wildcard, then the default
-    /// (when unknown names get it). At most two hash lookups, no allocation.
+    /// As [`NameTable::lookup`].
     pub(crate) fn lookup(&self, name: Option<&str>) -> Option<Slot> {
-        if let Some(name) = name {
-            if let Some(slot) = self.exact.get(name) {
-                return Some(*slot);
-            }
-            if let Some((_, parent)) = name.split_once('.') {
-                if let Some(slot) = self.wildcard.get(parent) {
-                    return Some(*slot);
-                }
-            }
-        }
-        if self.use_default { self.default } else { None }
+        self.names.lookup(name)
     }
 
     fn choose(&self, slot: Slot, schemes: &[RustlsScheme]) -> Option<Arc<CertifiedKey>> {

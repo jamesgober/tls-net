@@ -364,15 +364,29 @@ impl Default for Policy {
     }
 }
 
+/// A preset's suites for these versions: every suite tls-net names, without
+/// ChaCha20 for FIPS.
+fn preset_suites(versions: &[Version], preset: Preset) -> Vec<CipherSuite> {
+    ALL_SUITES
+        .into_iter()
+        .filter(|s| versions.contains(&s.version()))
+        .filter(|s| {
+            preset != Preset::Fips
+                || !matches!(
+                    s,
+                    CipherSuite::Tls13ChaCha20Poly1305Sha256
+                        | CipherSuite::EcdheEcdsaChaCha20Poly1305Sha256
+                        | CipherSuite::EcdheRsaChaCha20Poly1305Sha256
+                )
+        })
+        .collect()
+}
+
 impl Policy {
     fn base(versions: &[Version], preset: Preset) -> Policy {
-        let suites = ALL_SUITES
-            .into_iter()
-            .filter(|s| versions.contains(&s.version()))
-            .collect();
         Policy {
             versions: versions.to_vec(),
-            suites,
+            suites: preset_suites(versions, preset),
             groups: vec![
                 Group::X25519MlKem768,
                 Group::X25519,
@@ -420,14 +434,6 @@ impl Policy {
     #[must_use]
     pub fn fips() -> Policy {
         let mut p = Policy::base(&[Version::Tls13, Version::Tls12], Preset::Fips);
-        p.suites.retain(|s| {
-            !matches!(
-                s,
-                CipherSuite::Tls13ChaCha20Poly1305Sha256
-                    | CipherSuite::EcdheEcdsaChaCha20Poly1305Sha256
-                    | CipherSuite::EcdheRsaChaCha20Poly1305Sha256
-            )
-        });
         p.groups = vec![
             Group::Secp256r1MlKem768,
             Group::X25519MlKem768,
@@ -487,6 +493,11 @@ impl Policy {
     /// `PolicyInvalid` for an empty list or a duplicate.
     pub fn versions(mut self, versions: &[Version]) -> Result<Policy, TlsError> {
         self.versions = list(versions, "version list")?;
+        // Unless the suites were named, they follow the versions, so
+        // `modern().versions(&[Tls13, Tls12])` gains the TLS 1.2 suites (D-150).
+        if !self.suites_explicit {
+            self.suites = preset_suites(&self.versions, self.preset);
+        }
         Ok(self)
     }
 

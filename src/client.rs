@@ -182,7 +182,8 @@ pub enum ServerIdentity {
         name: DnsName,
         /// SHA-256 of acceptable SubjectPublicKeyInfos.
         spki_sha256: Vec<[u8; 32]>,
-        /// Verify the chain against the anchors as well.
+        /// Verify the chain against the anchors as well. Required on a
+        /// client with CRLs, which are checked on the chain only.
         require_chain: bool,
     },
 }
@@ -222,6 +223,8 @@ struct Inner {
     /// Verifies against the anchors; refuses every certificate without them.
     config: Arc<rustls::ClientConfig>,
     anchors: bool,
+    /// CRLs were given: a pin alone is refused (D-145).
+    crls: bool,
     algs: rustls::crypto::WebPkiSupportedAlgorithms,
     limits: HandshakeLimits,
     provider_name: &'static str,
@@ -338,6 +341,31 @@ impl TlsClient {
         self.connect_to(&ServerIdentity::parse(server_name)?)
     }
 
+    /// Connects over a blocking transport and runs the handshake: a
+    /// [`TlsStream`](crate::TlsStream) that reads and writes plaintext.
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "webpki-roots")] {
+    /// use std::io::Write;
+    /// let tcp = std::net::TcpStream::connect("example.com:443")?;
+    /// let mut tls = tls_net::client()?.connect_stream("example.com", tcp)?;
+    /// tls.write_all(b"GET / HTTP/1.1\r\nhost: example.com\r\n\r\n")?;
+    /// # }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As `connect`; then the handshake's error, `Transport` when the
+    /// transport fails, or `UncleanClose` when it ends first.
+    pub fn connect_stream<S: std::io::Read + std::io::Write>(
+        &self,
+        server_name: &str,
+        io: S,
+    ) -> Result<crate::TlsStream<S>, TlsError> {
+        crate::TlsStream::client(self.connect(server_name)?, io)
+    }
+
     /// A session for an identity.
     ///
     /// # Errors
@@ -360,6 +388,13 @@ impl TlsClient {
                 }
                 if *require_chain && !self.inner.anchors {
                     return Err(no_anchors);
+                }
+                // A pin alone checks no CRL: a client that has CRLs checks the
+                // chain too, so a revoked certificate is refused (D-145).
+                if !*require_chain && self.inner.crls {
+                    return Err(TlsError::PolicyInvalid {
+                        reason: "a client with CRLs needs require_chain on a pinned identity",
+                    });
                 }
                 self.pinned_config(spki_sha256, *require_chain)
             }
@@ -490,15 +525,10 @@ impl fmt::Debug for ClientBuilder {
     }
 }
 
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        ClientBuilder::new()
-    }
-}
-
 impl ClientBuilder {
     /// No anchors yet, the client default policy, resumption for 256 sessions.
-    pub fn new() -> Self {
+    /// `TlsClient::builder()` is the public way in (one way to start).
+    pub(crate) fn new() -> Self {
         ClientBuilder {
             trust: None,
             policy: Policy::client_default(),
@@ -549,7 +579,10 @@ impl ClientBuilder {
         Ok(self)
     }
 
-    /// Checks server certificates against these CRLs.
+    /// Checks server certificates against these CRLs. They are checked on
+    /// the chain, so they need [`trust`](Self::trust), and a pinned identity
+    /// on this client needs `require_chain: true`; `build` and `connect_to`
+    /// refuse otherwise.
     pub fn crls(mut self, crls: Crls, policy: RevocationPolicy) -> Self {
         self.crls = Some((crls, policy));
         self
@@ -587,7 +620,7 @@ impl ClientBuilder {
 
     /// The handshake budgets (client defaults: 128 KiB, 10 certificates of at most 32 KiB).
     pub fn limits(mut self, limits: HandshakeLimits) -> Self {
-        self.limits = limits;
+        self.limits = limits.clamped();
         self
     }
 
@@ -606,6 +639,13 @@ impl ClientBuilder {
                 reason: "the provider cannot do these versions",
             })?;
         let anchors = self.trust.is_some();
+        // CRLs are checked on the chain, so without anchors they would never
+        // be applied (D-145; the server refuses the same since D-131).
+        if self.crls.is_some() && !anchors {
+            return Err(TlsError::PolicyInvalid {
+                reason: "CRLs need trust anchors",
+            });
+        }
         let chain: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>> = match &self.trust {
             #[cfg(feature = "platform-verifier")]
             Some(anchors) if anchors.is_platform() => {
@@ -661,6 +701,7 @@ impl ClientBuilder {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
                 anchors,
+                crls: self.crls.is_some(),
                 algs,
                 limits: self.limits,
                 provider_name,
@@ -681,7 +722,7 @@ impl ClientBuilder {
 pub fn client() -> Result<TlsClient, TlsError> {
     #[cfg(feature = "webpki-roots")]
     {
-        ClientBuilder::new().trust(TrustAnchors::mozilla()).build()
+        TlsClient::builder().trust(TrustAnchors::mozilla()).build()
     }
     #[cfg(not(feature = "webpki-roots"))]
     {
@@ -698,7 +739,7 @@ pub fn client() -> Result<TlsClient, TlsError> {
 ///
 /// `NoProvider`, `PemInvalid`, `NoCertificate`, `BadAnchor`.
 pub fn client_with_ca_pem(ca_pem: &[u8]) -> Result<TlsClient, TlsError> {
-    ClientBuilder::new()
+    TlsClient::builder()
         .trust(TrustAnchors::from_pem(ca_pem)?)
         .build()
 }
