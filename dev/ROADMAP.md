@@ -96,7 +96,7 @@ Exit: a 1.0 readiness note (`docs/STABILITY-1.0.md` draft) that lists, item by i
 - [ ] Re-run the security review (threat table, attack tests, dependency footprint, `cargo audit`, `cargo deny`).
 - [x] Check webpki-roots, rustls, and the provider for newer releases: every dependency is on its newest stable release at 0.9.1 (rustls 0.23.46, aws-lc-rs 1.19.0, ring 0.17.14, webpki-roots 1.0.11, rustls-platform-verifier 0.7.1); rustls 0.24 is still 0.24.0-dev.2.
 - [x] The 1.0 readiness note: `docs/STABILITY-1.0.md` (draft, D-140).
-- [ ] The `import_sealed` fuzz target (added at 0.9.1, D-140): its 24-hour run.
+- [x] The `import_sealed` fuzz target (added at 0.9.1, D-140): 24.1 hours, 737,121,304 executions, no finding (`docs/SECURITY.md`).
 - [ ] The edge-case list of PLAN section 10 (59 groups) written out next to the tests and checked off against them.
 - [x] `alert()` and `HandshakeFailed::alert` report the alerts rustls sends for certificate refusals (D-139).
 
