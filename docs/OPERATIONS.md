@@ -11,7 +11,7 @@
 
 | Item | What tls-net expects |
 |---|---|
-| Chain file | PEM, end-entity certificate first, then the intermediates in order. The root is not needed and is ignored if present. A chain that does not link up, or a key that does not match the end-entity certificate, is refused at load (`TLS-0010` to `TLS-0020`) |
+| Chain file | PEM, end-entity certificate first, then the intermediates in order. Leave the root out: clients have it, and a root in the file is sent in every handshake like the rest of the chain. A chain that does not link up, or a key that does not match the end-entity certificate, is refused at load (`TLS-0010` to `TLS-0020`) |
 | Key file | PEM: PKCS#8, PKCS#1 (RSA), or SEC1 (EC). On Unix the file must have no group or other permission bits (`0600` or `0400`), else `KeyFilePermissions` (`TLS-0012`); `ServerBuilder::allow_group_readable_key(true)` lifts the check where a group must read it. Windows has no check yet: restrict the file to the service account |
 | Key in a vault | `KeySource::Vault` (feature `key-vault`) keeps the private key out of the process's ordinary memory; signing goes through the vault |
 | Key types | ECDSA P-256 and P-384, Ed25519, RSA 2048 bits or more. An ECDSA and an RSA certificate for the same names can be loaded together; tls-net serves whichever the client supports, preferring ECDSA |
@@ -52,17 +52,17 @@ Cost: building 100 ECDSA certificates takes about 2 ms; the swap about 25 ns (`d
 | State | When |
 |---|---|
 | `Ok` | more than both thresholds remain |
-| `Warn` | less than max(7 days, a third of the certificate's lifetime) |
-| `Critical` | less than max(2 days, a tenth of its lifetime) |
+| `Warn` | less than the longer of 7 days and a third of the certificate's lifetime, but at most half the lifetime |
+| `Critical` | less than the longer of 2 days and a tenth of its lifetime, but at most a fifth of the lifetime |
 | `Expired` | at or after `not_after` |
 
-The thresholds scale with the lifetime, so a 6-hour internal certificate does not warn just after it is issued. Every entry in `Warn` or worse is also sent to the observer as `CertificateExpiring`. Alert on `Warn`, page on `Critical`. tls-net still serves an expired certificate if nothing replaced it; clients will refuse it.
+The thresholds scale with the lifetime, so a certificate is `Ok` when it is issued however short its life: a 90-day certificate warns at 30 days and is critical at 9, a 15-day one at 7 days and 2, a 6-hour internal one at 3 hours and 72 minutes. Every entry in `Warn` or worse is also sent to the observer as `CertificateExpiring`. Alert on `Warn`, page on `Critical`. tls-net still serves an expired certificate if nothing replaced it; clients will refuse it.
 
 ---
 
 ## Session tickets
 
-Resumption saves a full handshake's signature and most of its CPU. Tickets are sealed with XChaCha20-Poly1305 under keys from a ring that advances every `period`; a ticket opens for two periods.
+Resumption saves a full handshake's signature and most of its CPU. Tickets are sealed with XChaCha20-Poly1305 under keys from a ring that advances every `period`. A ticket opens for one `period` after it was issued, the lifetime clients are told; the previous epoch's key is kept so a ticket issued late in an epoch still opens early in the next. Five minutes of clock difference between servers that share keys is allowed.
 
 | Mode | Use when | Restart behaviour |
 |---|---|---|

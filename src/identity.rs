@@ -40,7 +40,15 @@ pub struct HandshakeInfo<'s> {
     pub server_name: Option<&'s str>,
     /// Full, full after a retry, or resumed.
     pub kind: HandshakeKind,
-    /// The peer's certificate identity, when it sent one.
+    /// Whether the peer presented a certificate and it was verified (its
+    /// chain, or a pin). On a client always `true`; on a server, `false`
+    /// when the client sent none. Under `ClientAuth::required` it is `true`
+    /// for every completed handshake, resumptions included (D-125).
+    pub peer_verified: bool,
+    /// The peer's certificate identity, read from the verified certificate.
+    /// `None` when there is none, and also when tls-net cannot read one that
+    /// was verified (more than 1,024 SANs, for example), so authorise on
+    /// what `peer` contains, never on `peer_verified` alone.
     pub peer: Option<&'s PeerIdentity>,
     /// Server side: the ClientHello's fingerprints, when enabled.
     pub fingerprint: Option<&'s Fingerprint>,
@@ -56,6 +64,7 @@ impl<'s> HandshakeInfo<'s> {
         alpn: Option<&'s [u8]>,
         server_name: Option<&'s str>,
         kind: HandshakeKind,
+        peer_verified: bool,
     ) -> Self {
         HandshakeInfo {
             version,
@@ -64,6 +73,7 @@ impl<'s> HandshakeInfo<'s> {
             alpn,
             server_name,
             kind,
+            peer_verified,
             peer: None,
             fingerprint: None,
             early_data_accepted: false,

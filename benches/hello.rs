@@ -10,11 +10,12 @@ use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tls_net::{
-    Alpn, ClientBuilder, Event, HelloLimits, HelloParse, HelloParser, Ja4, TrustAnchors, ja3_string,
+    Alpn, Event, HelloLimits, HelloParse, Ja4, TlsClient, TrustAnchors, ja3_string,
+    parse_client_hello,
 };
 
 fn real_hello() -> Vec<u8> {
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(
             TrustAnchors::from_pem(
                 &std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ca.pem")).unwrap(),
@@ -39,19 +40,19 @@ fn hello(c: &mut Criterion) {
     g.throughput(Throughput::Bytes(bytes.len() as u64));
     g.bench_function("hello_parse", |b| {
         b.iter(
-            || match HelloParser::parse(black_box(&bytes), &limits).unwrap() {
+            || match parse_client_hello(black_box(&bytes), &limits).unwrap() {
                 HelloParse::Complete { length, .. } => length,
                 _ => unreachable!(),
             },
         );
     });
-    let HelloParse::Complete { view, .. } = HelloParser::parse(&bytes, &limits).unwrap() else {
+    let HelloParse::Complete { view, .. } = parse_client_hello(&bytes, &limits).unwrap() else {
         unreachable!()
     };
     g.bench_function("ja4", |b| b.iter(|| Ja4::compute(black_box(&view))));
     g.bench_function("parse_and_ja4", |b| {
         b.iter(
-            || match HelloParser::parse(black_box(&bytes), &limits).unwrap() {
+            || match parse_client_hello(black_box(&bytes), &limits).unwrap() {
                 HelloParse::Complete { view, .. } => Ja4::compute(&view),
                 _ => unreachable!(),
             },

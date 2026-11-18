@@ -25,9 +25,13 @@ use crate::error::TlsError;
 use crate::observe::{Observation, TlsEvent};
 
 /// Ticket format version.
-const VERSION: u8 = 1;
-/// Version and epoch: the associated data.
-const HEADER: usize = 9;
+/// Ticket format 2 adds the issue time (D-151).
+const VERSION: u8 = 2;
+/// Version, epoch, and issue time in seconds: the associated data.
+const HEADER: usize = 17;
+/// How far in the future a ticket's issue time may be: another server of a
+/// fleet that shares ticket keys may run a little ahead.
+const ISSUE_SKEW: u64 = 300;
 /// Header, nonce, and tag.
 pub(crate) const OVERHEAD: usize = HEADER + 24 + 16;
 /// Forward steps of a ratchet before the ring reseeds instead.
@@ -263,10 +267,11 @@ impl TicketKeyRing {
         self.advance_to(now);
     }
 
-    /// The state for use now: one read lock when the ring is current, which
-    /// is every call but the first of an epoch.
-    fn current(&self) -> impl std::ops::Deref<Target = RingState> + '_ {
-        let now = (self.clock)() / self.period;
+    /// The state for use at `secs` (read from the ring's clock): one read
+    /// lock when the ring is current, which is every call but the first of
+    /// an epoch.
+    fn current_at(&self, secs: u64) -> impl std::ops::Deref<Target = RingState> + '_ {
+        let now = secs / self.period;
         {
             let st = self
                 .state
@@ -362,10 +367,12 @@ impl TicketKeyRing {
     /// header and `bind`, the group's client-authentication binding (D-125):
     /// `bind` is not sent, so a ticket opens only where it was issued.
     fn seal(&self, plain: &[u8], bind: &[u8; 32]) -> Option<Vec<u8>> {
-        let st = self.current();
+        let secs = (self.clock)();
+        let st = self.current_at(secs);
         let mut aad = [0u8; HEADER + 32];
         aad[0] = VERSION;
-        aad[1..HEADER].copy_from_slice(&st.epoch.to_be_bytes());
+        aad[1..9].copy_from_slice(&st.epoch.to_be_bytes());
+        aad[9..HEADER].copy_from_slice(&secs.to_be_bytes());
         aad[HEADER..].copy_from_slice(bind);
         // One allocation: the capacity covers the header, so moving the
         // sealed bytes up to make room for it does not reallocate.
@@ -391,8 +398,16 @@ impl TicketKeyRing {
         if ticket.len() < OVERHEAD || ticket[0] != VERSION {
             return None;
         }
-        let epoch = u64::from_be_bytes(ticket[1..HEADER].try_into().ok()?);
-        let st = self.current();
+        let epoch = u64::from_be_bytes(ticket[1..9].try_into().ok()?);
+        let issued = u64::from_be_bytes(ticket[9..HEADER].try_into().ok()?);
+        // A ticket opens for the lifetime it was issued with, one period,
+        // not for as long as its epoch's key is held (D-151). The issue time
+        // is authenticated, so it cannot be moved.
+        let secs = (self.clock)();
+        let st = self.current_at(secs);
+        if issued > secs.saturating_add(ISSUE_SKEW) || secs.saturating_sub(issued) > self.period {
+            return None;
+        }
         let key = if epoch == st.epoch {
             &st.current
         } else if Some(epoch) == st.epoch.checked_sub(1) {
@@ -785,6 +800,29 @@ mod tests {
         t.store(900 * HOUR, Ordering::Relaxed);
         r.advance();
         assert_eq!(r.epoch(), 1_005);
+    }
+
+    #[test]
+    fn test_ticket_refused_after_its_lifetime_though_key_still_held() {
+        // Sealed at the start of epoch 1,000; the key stays open until epoch
+        // 1,002, but the ticket's lifetime is one period (D-151).
+        let t = Arc::new(Time::new(1_000 * HOUR));
+        let r = ring(hours(1), &t);
+        let ticket = r.encrypt(b"x").unwrap();
+        t.store(1_001 * HOUR, Ordering::Relaxed);
+        assert!(r.decrypt(&ticket).is_some(), "exactly one period old");
+        t.store(1_001 * HOUR + 1, Ordering::Relaxed);
+        assert!(r.decrypt(&ticket).is_none(), "older than its lifetime");
+        // Sealed late in epoch 1,001, it opens in epoch 1,002 within its lifetime.
+        t.store(1_002 * HOUR - 60, Ordering::Relaxed);
+        let late = r.encrypt(b"y").unwrap();
+        t.store(1_002 * HOUR + 1_800, Ordering::Relaxed);
+        assert!(r.decrypt(&late).is_some());
+        // An issue time from the future beyond the skew is refused; it is
+        // authenticated, so changing it fails the tag as well.
+        let mut moved = late.clone();
+        moved[16] ^= 1;
+        assert!(r.decrypt(&moved).is_none());
     }
 
     #[test]

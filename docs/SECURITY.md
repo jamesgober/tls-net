@@ -13,6 +13,7 @@
 - [Threats, defences, tests, costs](#threats-defences-tests-costs)
 - [Hardening record (0.7)](#hardening-record-07)
 - [Adversarial review (0.9)](#adversarial-review-09)
+- [Fixed in 0.10](#fixed-in-010)
 - [Where tls-net is stricter than the RFCs](#where-tls-net-is-stricter-than-the-rfcs)
 - [What tls-net does not defend against](#what-tls-net-does-not-defend-against)
 
@@ -38,7 +39,7 @@ A flaw in the TLS protocol implementation or the cryptography belongs to rustls 
 
 **Trust boundary:** every byte given to `step` is hostile. Configuration (certificates, keys, policies, limits) is trusted to mean what the operator wants, but it is validated at load so a weak or broken configuration is refused rather than served. The attacker does not control configuration files or process memory; a reader of process memory defeats key custody, as key-vault's own documentation says.
 
-**Out of scope here, in place elsewhere:** the TLS state machine and the cryptography (rustls and its provider), connection limits and deadlines (net-io), rates and bans (bouncer-io), `Host` against SNI (the HTTP layer).
+**Out of scope here, in place elsewhere:** the TLS state machine and the cryptography (rustls and its provider), connection limits and deadlines (net-io), rates and bans (bouncer-io). The HTTP layer checks each request's `Host` with the `HostScope` tls-net gives it (T-31).
 
 ---
 
@@ -64,8 +65,8 @@ Costs are per handshake or per record unless stated; measured values are from `d
 | T-13 | Handshake CPU exhaustion | capacity cap checked in `accept` before any parsing; bouncer-io rates; ECDSA preferred; resumption; net-io's handshake deadline | `tests/attacks.rs` (`test_t13_*`: refused at the cap before any parse); `tests/net_io.rs` (`test_t13_*`: a stalled handshake's slot comes back at net-io's deadline) | `accept` 61 ns |
 | T-14 | ClientHello parser abuse | lengths checked against what remains; counts checked before iterating; 16 KiB, 4-record, and list budgets; linear time; after a failure rustls never reads further input (D-111) | `src/hello.rs` (every budget at n-1, n, n+1); `tests/properties.rs`; `tests/attacks.rs` (`test_t14_*`: malformed hellos, junk after a failure); fuzz targets `hello_parse`, `session_step_server`, `session_step_client` | parse 0.28 µs, parse plus JA4 0.82 µs for a 1.5 KiB hello |
 | T-15 | Cross-protocol attacks (ALPACA) | strict ALPN; `AlpnPolicy::Required` on internal listeners; unknown SNI refused without a default | `tests/handshake.rs` (an HTTP ALPN against an SMTP-only listener); `tests/extended.rs` (unconfigured SNI on a back-channel listener) | 0 |
-| T-16 | Domain fronting | the session reports the normalised SNI; the HTTP layer compares it with `Host` | `tests/extended.rs` (`test_t16_*`) | 0 |
-| T-17 | Truncation | `close_notify` tracked; EOF without it is `Unclean` | `tests/handshake.rs` (`test_unclean_eof_is_reported_t17`) | 0 |
+| T-16 | Domain fronting | the session reports the normalised SNI; the HTTP layer checks `Host` against the connection's `HostScope` (T-31) | `tests/extended.rs` (`test_t16_*`) | 0 |
+| T-17 | Truncation | `close_notify` tracked; EOF without it is `Unclean`; `TlsStream` turns it into an `UnexpectedEof` error, never `Ok(0)` | `tests/handshake.rs` (`test_unclean_eof_is_reported_t17`); `tests/stream.rs` (`test_stream_truncation_without_close_notify_is_an_error`) | 0 |
 | T-18 | Certificate expiry outage | proportional warning thresholds; expiry events; reload refuses expired certificates | `src/expiry.rs` (warn at `not_after - lifetime/3`); `tests/attacks.rs` (`test_t18_*`: an expired certificate in a reload is refused and the old one is still served) | report under 1 µs per entry |
 | T-19 | Half-written files during reload | key match check; reload is all or nothing | `tests/extended.rs` (`test_reload_keeps_handshakes_in_progress_t19`: new chain with old key refused, old certificate served, handshakes in flight across both a good and a refused reload complete) | as a reload (1.74 ms for 100 certificates) |
 | T-20 | Log or terminal injection through SNI or ALPN | SNI validated as LDH ASCII, anything else treated as absent; events carry SNI only in normalised form and ALPN only as configured names | `tests/attacks.rs` (`test_t20_*`: control bytes in SNI treated as absent; no event holds a raw control byte with every hello sampled) | part of the hello parse |
@@ -79,6 +80,7 @@ Costs are per handshake or per record unless stated; measured values are from `d
 | T-28 | Process-wide provider confusion | tls-net never reads or installs the process default | `tests/provider.rs` (`test_t28_*`: after another crate installs a secp384r1-only default, tls-net still negotiates X25519MLKEM768) | 0 |
 | T-29 | A post-handshake message split over records to crash the session | while rustls holds part of a message, `encrypt` and `close` wait for `step` instead of calling rustls on an empty buffer (D-126) | `tests/attacks.rs` (`test_t29_*`: a ticket in 64-byte records; `encrypt` and `close` return `WrongState`, then work once the rest arrives) | one header check per `step` |
 | T-30 | Resumption past a client-authentication change, or past the client certificate's expiry | tickets and cached sessions are bound to the group's client-auth rules; a resumed handshake is refused without a required certificate or with an expired one (D-125) | `tests/attacks.rs` (`test_t30_*`: required auth published after an anonymous session, with tickets and with the cache; a removed pin); `src/server.rs` (`test_resumed_client_certificate_checked_for_expiry`) | 32 bytes more associated data per ticket; 1 to 2 µs per resumed handshake with a client certificate (estimate) |
+| T-31 | A host policy skipped: a client sends no SNI, or another name the same certificate covers, gets the default group's rules (no client certificate), then sends a request for the protected host | `TlsServer::host_scope` and `HostScope::permits`, which the HTTP layer calls for every request's `Host` and answers `421` when it is `false`; `HostPolicy`'s docs make the check a requirement (D-143) | `tests/hosts.rs` (no SNI and a sibling SNI complete without a certificate, and their scopes refuse the admin host; the admin SNI needs a certificate; `Host` values parsed strictly; a reload that adds a policy); fuzz target `host_value` | one lock per connection [est. 60 ns], under 100 ns per request [est.] |
 
 ---
 
@@ -91,7 +93,7 @@ Costs are per handshake or per record unless stated; measured values are from `d
 - **D-110, found by tlsfuzzer.** The ClientHello parser accepted only record versions `0x0301` to `0x0303`, so a hello in a `0x0300` record (tlsfuzzer, older stacks) was refused with no alert before rustls saw it. RFC 5246 appendix E.1 requires a server to accept any `{03,XX}`; rustls does. Now accepted. No security effect: the record version never selects the protocol.
 - **D-111, found by the session fuzz targets.** After a rustls error, tls-net called rustls again to collect the alert; with nothing queued, rustls read the next record, and a second malformed record made it queue a second fatal alert. That trips a `debug_assert!` in rustls, a panic in any debug build of an application from bytes a peer sends; release builds were not affected beyond an unsent second alert. Now rustls is called after a failure only while it holds queued records. Regression tests replay the fuzzers' inputs on both sides.
 
-**Fuzz campaign.** Six targets at 0.7 (a seventh, `import_sealed`, was added at 0.9.1 and is in its 24-hour run), seeded with 18 real ClientHellos (Chromium, Windows Schannel, OpenSSL, curl, wget, Python, rustls) and 7 real server flights (`fuzz/seeds/`, D-108), each run for 24 hours at low priority on WSL2 with AddressSanitizer and debug assertions (`fuzz/run-24h.sh`).
+**Fuzz campaign.** Six targets at 0.7, `import_sealed` at 0.9.1, and `host_value` at 0.10, seeded with 18 real ClientHellos (Chromium, Windows Schannel, OpenSSL, curl, wget, Python, rustls) and 7 real server flights (`fuzz/seeds/`, D-108), each run for 24 hours at low priority on WSL2 with AddressSanitizer and debug assertions (`fuzz/run-24h.sh`).
 
 | Target | Input | Hours | Executions | Coverage (edges) | Corpus | Findings |
 |---|---|---|---|---|---|---|
@@ -101,9 +103,12 @@ Costs are per handshake or per record unless stated; measured values are from `d
 | `der_fields` | the DER field reader | 24.3 | 3,613,674,429 | 645 | 386 | none |
 | `ticket_open` | arbitrary bytes as a session ticket; none may open | 24.1 | 996,060,126 | 549 | 43 | none |
 | `session_step_client` | server flights into a client session, in chunks | 24.6 | 58,823,032 | 6,513 | 2,593 | none |
-| `import_sealed` (0.9.1) | arbitrary bytes as a ticket-key hand-off; none may import, and sealed as an export's plaintext only the two export layouts import | first run 0.17 (24-hour run started 2026-11-10) | 4,571,209 | 767 | 59 | none |
+| `import_sealed` (0.9.1) | arbitrary bytes as a ticket-key hand-off; none may import, and sealed as an export's plaintext only the two export layouts import | 24.1 | 737,121,304 | 852 | 81 | none |
+| `host_value` (0.10) | arbitrary bytes as a request's `Host` against two connections' host scopes; never both permit, and a permitted value is a valid name | 4.0 | 337,805,894 | 263 | 186 | none |
 
 The first runs started on 2026-11-06. The session targets found D-111 within hours; from `2b7c1c8`, which has the fix, `hello_parse`, both session targets, and `pem_intake` started again from their corpora and ran the 24 hours above. libFuzzer measures each input on the wall clock, which WSL steps, so the first campaign also wrote 61 timeout artifacts: every one replays cleanly in at most 17 ms of CPU. The same steps stopped `der_fields` after 5.4 hours and `ticket_open` after 3.3, and left one `session_step_client` job blocked inside libFuzzer's own alarm handler after 11.75 hours. Those three continued from their corpora with libFuzzer's timeout off and a progress watchdog that turns a real hang into a crash artifact (D-115). A signal from outside this repository stopped all three 1.8 hours later; they resumed from the same corpora on the same code and finished their 24 hours (D-117). Their rows add the segments: `der_fields` 5.4 + 1.8 + 17.1 hours, `ticket_open` 3.3 + 1.8 + 19.0, `session_step_client` 11.75 + 1.8 + 11.1. With the timeout off, the watchdog never fired and no target wrote an artifact.
+
+`import_sealed` ran on 0.9.1 in two segments, 18.1 and 6.0 hours. On 0.10.0, `host_value` ran 4 hours, and `ticket_open` and both session targets ran 2 more hours each from their corpora (116,478,815, 14,605,422, and 9,249,661 executions) to cover the ticket format and session changes. None wrote an artifact.
 
 **Soak.** `perf/soak.sh` (NFR-21): tls-net on net-io's reactor, 8 workers, 32 client threads making mixed full and resumed handshakes, a certificate reload every 60 seconds, a 10-minute ticket epoch.
 
@@ -158,6 +163,23 @@ Three reviewers read the source with no access to the author's notes, each over 
 | OCSP staples went to every certificate for a name, not the one they are for | low | D-137 |
 
 What held, in the reviewers' words condensed: offsets and budgets in the session and the parser; data never handed out before completion or after a failure; the ticket construction (fresh nonces, bound epochs, only two epochs open, nothing printed); constant-time pin comparison over the full SPKI; the verified end-entity as the only source of a peer identity; reload built completely before the swap; the capacity gate released on every path; SNI normalisation and one-label wildcards; presets that cannot weaken; STARTTLS leftovers refused; nothing secret or unescaped in events and errors.
+
+---
+
+## Fixed in 0.10
+
+Each fix has a regression test.
+
+- **Host policies.** A client that sent no SNI, or another name the same certificate covers, ran its handshake under the default group's rules, and nothing let the HTTP layer see that the session had not met the protected host's rules. `HostScope::permits` is that check (T-31).
+- **Expiry thresholds.** A certificate living under 2 days was `Critical` from issue, and one under 7 days `Warn`, the opposite of `docs/OPERATIONS.md`.
+- **Client CRLs** were accepted without anchors, and never applied on a pinned connection without a chain check.
+- **Reload.** An established session kept the configuration it was accepted under, private keys included, alive after a reload.
+- **Limits.** `LoadLimits` and `HandshakeLimits` fields assigned directly bypassed their ranges: a 256 MiB buffer for a 241-byte key, or no handshake budget.
+- **Builder order.** Load settings given after `certificate` were skipped at startup and applied at reload, so a renewal of the same files could be refused.
+- **Peer identity.** The completion counters built it at every handshake, read or not.
+- **Smaller fixes.** `Policy::versions` on a preset kept the preset's suites; a ticket opened for up to two periods against an advertised one; an ALPN name over 32 bytes reached net-io as no ALPN; `peer` can be `None` under `ClientAuth::required` when the verified certificate cannot be read (now documented, with `peer_verified` added); four documentation errors.
+
+Recorded, not changed: `TlsServer::accept`, the only accept net-io can call, takes one uncontended lock per connection (about 60 ns against a handshake of 300 to 450 µs); a lock-free cell without `unsafe` is an open item in `dev/ROADMAP.md`.
 
 ---
 

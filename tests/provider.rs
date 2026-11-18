@@ -7,7 +7,7 @@
 mod common;
 
 use common::{End, data, pump};
-use tls_net::{ClientBuilder, Group, KeySource, TlsServer, TrustAnchors};
+use tls_net::{Group, KeySource, TlsClient, TlsServer, TrustAnchors};
 
 #[test]
 fn test_t28_process_default_provider_is_ignored() {
@@ -21,7 +21,7 @@ fn test_t28_process_default_provider_is_ignored() {
         .unwrap()
         .build()
         .unwrap();
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();

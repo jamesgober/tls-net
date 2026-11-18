@@ -31,8 +31,8 @@ use net_io::{
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use tls_net::{
-    Alpn, ClientAuth, ClientBuilder, Event, HandshakeKind, KeySource, ServerIdentity, TlsClient,
-    TlsError, TlsServer, TrustAnchors,
+    Alpn, ClientAuth, Event, HandshakeKind, KeySource, ServerIdentity, TlsClient, TlsError,
+    TlsServer, TrustAnchors,
 };
 
 fn trust() -> TrustAnchors {
@@ -133,7 +133,7 @@ fn direct(tls: &TlsServer) -> (net_io::Server, SocketAddr) {
 fn test_direct_mode_sites_alpn_and_resumption() {
     let tls = sites().build().unwrap();
     let (server, addr) = direct(&tls);
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(trust())
         .alpn(&[Alpn::HTTP_1_1])
         .resumption(8)
@@ -149,7 +149,7 @@ fn test_direct_mode_sites_alpn_and_resumption() {
     assert!(reply.ends_with("version=0x0304"), "{reply}");
     assert_eq!(second, HandshakeKind::Resumed);
     // The second site, by SNI, with HTTP/2 offered first.
-    let h2 = ClientBuilder::new()
+    let h2 = TlsClient::builder()
         .trust(trust())
         .alpn(&[Alpn::H2, Alpn::HTTP_1_1])
         .build()
@@ -174,7 +174,7 @@ fn test_direct_mode_reload_under_traffic() {
         .map(|_| {
             let (stop, done) = (Arc::clone(&stop), Arc::clone(&done));
             std::thread::spawn(move || {
-                let client = ClientBuilder::new()
+                let client = TlsClient::builder()
                     .trust(trust())
                     .alpn(&[Alpn::HTTP_1_1])
                     .build()
@@ -382,7 +382,7 @@ fn ask_at(addr: SocketAddr, client: &TlsClient) -> Result<String, TlsError> {
 }
 
 fn client_with(cert: &str, key: &str) -> TlsClient {
-    ClientBuilder::new()
+    TlsClient::builder()
         .trust(trust())
         .client_certificate(&data(cert), KeySource::Pem(&data(key)))
         .unwrap()
@@ -408,7 +408,7 @@ fn test_back_channel_pinned_client_key() {
         ask(&other).map_or(true, |s| s.is_empty()),
         "other key admitted"
     );
-    let anonymous = ClientBuilder::new().trust(trust()).build().unwrap();
+    let anonymous = TlsClient::builder().trust(trust()).build().unwrap();
     assert!(
         ask(&anonymous).map_or(true, |s| s.is_empty()),
         "anonymous admitted"
@@ -593,7 +593,7 @@ fn scripted_mta() -> SocketAddr {
 
 #[test]
 fn test_starttls_against_scripted_server() {
-    let client = ClientBuilder::new().trust(trust()).build().unwrap();
+    let client = TlsClient::builder().trust(trust()).build().unwrap();
     let secure = starttls_session(scripted_mta(), "localhost", &client);
     assert!(secure.contains("SIZE"), "{secure}");
 }
@@ -605,7 +605,7 @@ fn test_starttls_against_real_mta() {
     };
     let addr: SocketAddr = addr.to_str().unwrap().parse().unwrap();
     let name = std::env::var("TLS_NET_MTA_NAME").unwrap_or_else(|_| "localhost".to_owned());
-    let client = ClientBuilder::new().trust(trust()).build().unwrap();
+    let client = TlsClient::builder().trust(trust()).build().unwrap();
     let secure = starttls_session(addr, &name, &client);
     // Postfix stops advertising STARTTLS once TLS is on.
     assert!(!secure.contains("STARTTLS"), "{secure}");

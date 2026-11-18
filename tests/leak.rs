@@ -15,7 +15,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 
 use common::{End, data, pump};
-use tls_net::{ClientBuilder, HandshakeKind, KeySource, TlsClient, TlsServer, TrustAnchors};
+use tls_net::{HandshakeKind, KeySource, TlsClient, TlsServer, TrustAnchors};
 
 struct Live;
 
@@ -56,7 +56,7 @@ fn round(server: &TlsServer, client: &TlsClient, i: usize) -> usize {
     if i % 10 == 0 {
         server.ticket_keys().unwrap().rotate_now().unwrap();
     }
-    let fresh = ClientBuilder::new()
+    let fresh = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();
@@ -82,7 +82,7 @@ fn test_nfr21_reloads_rotations_and_handshakes_hold_no_heap() {
         .unwrap()
         .build()
         .unwrap();
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(TrustAnchors::from_pem(&data("ca.pem")).unwrap())
         .build()
         .unwrap();

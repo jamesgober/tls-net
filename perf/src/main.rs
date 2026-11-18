@@ -369,7 +369,7 @@ fn soak_threads(tls: &tls_net::TlsServer) {
             let st = tls.stats();
             eprintln!(
                 "rss_kib {rss} full {} resumed {} failed {} tickets {} rejected {} version {}",
-                st.handshakes_full, st.handshakes_resumed, st.handshakes_failed, st.tickets_issued, st.tickets_rejected, st.snapshot_version
+                st.handshakes_full, st.handshakes_resumed, st.handshakes_failed, st.tickets_issued, st.tickets_rejected, st.config_version
             );
         });
     }

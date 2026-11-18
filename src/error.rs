@@ -194,6 +194,12 @@ pub enum TlsError {
     PeerMisbehaved,
     /// The transport ended without `close_notify` (`TLS-0043`).
     UncleanClose,
+    /// The transport under a [`TlsStream`](crate::TlsStream) failed: a reset,
+    /// a timeout, a refused write (`TLS-0047`).
+    Transport {
+        /// The operating system's error kind.
+        kind: io::ErrorKind,
+    },
     /// The traffic keys reached their usage limit; reconnect (`TLS-0044`).
     KeyUsageExhausted,
     /// Bytes arrived after the STARTTLS reply, before the handshake (`TLS-0045`).
@@ -369,6 +375,7 @@ impl TlsError {
             E::KeyUsageExhausted => 44,
             E::StartTlsInjection => 45,
             E::EarlyDataRefused => 46,
+            E::Transport { .. } => 47,
             E::OutputFull { .. } | E::WrongState | E::SessionFailed => 50,
         }
     }
@@ -380,7 +387,7 @@ impl TlsError {
         match self.code() {
             0 => C::Internal,
             1 | 3 | 4 | 12 | 17 | 20 | 21 | 35 | 36 | 46 | 50 => C::FailedPrecondition,
-            10 | 43 => C::Unavailable,
+            10 | 43 | 47 => C::Unavailable,
             30 | 32 => C::ResourceExhausted,
             33 | 45 => C::PermissionDenied,
             34 => C::NotFound,
@@ -397,7 +404,7 @@ impl TlsError {
             0 | 40 | 45 => Action::Operator,
             1..=4 | 11..=21 => Action::FixConfig,
             10 | 30 | 41 | 44 => Action::Retry,
-            43 => Action::RetryIdempotent,
+            43 | 47 => Action::RetryIdempotent,
             46 => Action::RetryWithoutEarlyData,
             _ => Action::None,
         }
@@ -425,6 +432,7 @@ impl TlsError {
             37..=40 => "Certificate was not accepted",
             43 | 44 => "Connection closed early",
             45 => "Mail server sent unexpected data",
+            47 => "Connection failed",
             _ => "Secure connection failed",
         }
     }
@@ -533,6 +541,7 @@ impl fmt::Display for TlsError {
             E::DecryptFailed => f.write_str("record failed to decrypt"),
             E::PeerMisbehaved => f.write_str("peer broke the TLS protocol"),
             E::UncleanClose => f.write_str("connection closed without close_notify"),
+            E::Transport { kind } => write!(f, "transport failed: {kind}"),
             E::KeyUsageExhausted => f.write_str("traffic keys reached their usage limit; reconnect"),
             E::StartTlsInjection => f.write_str("bytes arrived after the STARTTLS reply, before the handshake"),
             E::EarlyDataRefused => f.write_str("early data refused"),
@@ -675,6 +684,9 @@ mod tests {
             TlsError::UnknownServerName,
             TlsError::PinMismatch,
             TlsError::UncleanClose,
+            TlsError::Transport {
+                kind: io::ErrorKind::ConnectionReset,
+            },
             TlsError::OutputFull { required: 1 },
         ];
         for e in &all {
@@ -692,6 +704,12 @@ mod tests {
         );
         assert_eq!(TlsError::HandshakeCapacity.action(), Action::Retry);
         assert_eq!(TlsError::UncleanClose.action(), Action::RetryIdempotent);
+        let reset = TlsError::Transport {
+            kind: io::ErrorKind::ConnectionReset,
+        };
+        assert_eq!(reset.action(), Action::RetryIdempotent);
+        assert_eq!(reset.category(), ErrorCategory::Unavailable);
+        assert_eq!(reset.public_message(), "Connection failed");
         assert_eq!(
             TlsError::UnknownServerName.category(),
             ErrorCategory::NotFound

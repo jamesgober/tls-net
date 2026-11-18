@@ -133,7 +133,7 @@ impl HelloLimits {
     }
 }
 
-/// The result of [`HelloParser::parse`].
+/// The result of [`parse_client_hello`].
 #[non_exhaustive]
 #[derive(Debug)]
 #[allow(
@@ -157,95 +157,94 @@ pub enum HelloParse<'a> {
     },
 }
 
-/// Parses a ClientHello from the start of a TLS byte stream.
+/// Parses one ClientHello from the start of a TLS byte stream, within
+/// `limits`. Nothing is allocated.
 ///
 /// ```
-/// use tls_net::{HelloLimits, HelloParse, HelloParser};
-/// assert!(matches!(HelloParser::parse(b"\x16\x03\x01", &HelloLimits::new()), Ok(HelloParse::Incomplete { needed: 5 })));
-/// assert_eq!(HelloParser::parse(b"GET / HTTP/1.1\r\n", &HelloLimits::new()).unwrap_err(), tls_net::TlsError::NotTls);
+/// use tls_net::{HelloLimits, HelloParse, parse_client_hello};
+/// let limits = HelloLimits::new();
+/// assert!(matches!(parse_client_hello(b"\x16\x03\x01", &limits), Ok(HelloParse::Incomplete { needed: 5 })));
+/// assert_eq!(parse_client_hello(b"GET / HTTP/1.1\r\n", &limits).unwrap_err(), tls_net::TlsError::NotTls);
 /// ```
-#[derive(Clone, Copy, Debug)]
-pub struct HelloParser;
-
-impl HelloParser {
-    /// Parses one ClientHello within `limits`. Nothing is allocated.
-    ///
-    /// # Errors
-    ///
-    /// `NotTls`, `BadRecord`, `HelloMalformed`, `DuplicateExtension`
-    /// (`TLS-0031`); `HelloTooLarge`, `HelloTooFragmented`,
-    /// `HelloOverBudget` (`TLS-0032`).
-    pub fn parse<'a>(input: &'a [u8], limits: &HelloLimits) -> Result<HelloParse<'a>, TlsError> {
-        let limits = &limits.clamped();
-        let max_records = usize::from(limits.max_records).min(MAX_SEGMENTS);
-        let mut segs: [&'a [u8]; MAX_SEGMENTS] = [&[]; MAX_SEGMENTS];
-        let mut nseg = 0usize;
-        let mut pos = 0usize;
-        let mut have = 0usize;
-        let mut hello_len: Option<usize> = None;
-        let mut record_version = 0u16;
-        loop {
-            if let Some(len) = hello_len {
-                if have >= len + 4 {
-                    break;
-                }
-            }
-            if nseg == max_records {
-                return Err(TlsError::HelloTooFragmented);
-            }
-            let Some(header) = input.get(pos..pos + RECORD_HEADER) else {
-                check_prefix(&input[pos.min(input.len())..])?;
-                return Ok(HelloParse::Incomplete {
-                    needed: pos + RECORD_HEADER,
-                });
-            };
-            let (typ, version, len) = (
-                header[0],
-                u16::from_be_bytes([header[1], header[2]]),
-                usize::from(u16::from_be_bytes([header[3], header[4]])),
-            );
-            check_header(typ, version)?;
-            if len == 0 || len > MAX_RECORD {
-                return Err(TlsError::BadRecord);
-            }
-            if nseg == 0 {
-                record_version = version;
-            }
-            let body_start = pos + RECORD_HEADER;
-            let end = body_start + len;
-            // The hello's length is known as soon as its 4-byte header is in.
-            let Some(payload) = input.get(body_start..end) else {
-                if hello_len.is_none() {
-                    let avail = &input[body_start.min(input.len())..];
-                    if let Some(l) = early_length(&segs[..nseg], avail) {
-                        check_hello_len(l, limits)?;
-                    }
-                }
-                return Ok(HelloParse::Incomplete { needed: end });
-            };
-            segs[nseg] = payload;
-            nseg += 1;
-            have += len;
-            pos = end;
-            if hello_len.is_none() && have >= 4 {
-                let stream = Stream::new(&segs[..nseg]);
-                if stream.byte(0) != Some(1) {
-                    return Err(TlsError::HelloMalformed);
-                }
-                let l = stream.u24(1).ok_or(TlsError::HelloMalformed)?;
-                check_hello_len(l, limits)?;
-                hello_len = Some(l);
+///
+/// # Errors
+///
+/// `NotTls`, `BadRecord`, `HelloMalformed`, `DuplicateExtension`
+/// (`TLS-0031`); `HelloTooLarge`, `HelloTooFragmented`,
+/// `HelloOverBudget` (`TLS-0032`).
+pub fn parse_client_hello<'a>(
+    input: &'a [u8],
+    limits: &HelloLimits,
+) -> Result<HelloParse<'a>, TlsError> {
+    let limits = &limits.clamped();
+    let max_records = usize::from(limits.max_records).min(MAX_SEGMENTS);
+    let mut segs: [&'a [u8]; MAX_SEGMENTS] = [&[]; MAX_SEGMENTS];
+    let mut nseg = 0usize;
+    let mut pos = 0usize;
+    let mut have = 0usize;
+    let mut hello_len: Option<usize> = None;
+    let mut record_version = 0u16;
+    loop {
+        if let Some(len) = hello_len {
+            if have >= len + 4 {
+                break;
             }
         }
-        let total = hello_len.unwrap_or(0) + 4;
-        // The records must end exactly with the hello.
-        if have != total {
-            return Err(TlsError::HelloMalformed);
+        if nseg == max_records {
+            return Err(TlsError::HelloTooFragmented);
         }
-        let stream = Stream::new(&segs[..nseg]);
-        let view = parse_body(stream, record_version, limits)?;
-        Ok(HelloParse::Complete { view, length: pos })
+        let Some(header) = input.get(pos..pos + RECORD_HEADER) else {
+            check_prefix(&input[pos.min(input.len())..])?;
+            return Ok(HelloParse::Incomplete {
+                needed: pos + RECORD_HEADER,
+            });
+        };
+        let (typ, version, len) = (
+            header[0],
+            u16::from_be_bytes([header[1], header[2]]),
+            usize::from(u16::from_be_bytes([header[3], header[4]])),
+        );
+        check_header(typ, version)?;
+        if len == 0 || len > MAX_RECORD {
+            return Err(TlsError::BadRecord);
+        }
+        if nseg == 0 {
+            record_version = version;
+        }
+        let body_start = pos + RECORD_HEADER;
+        let end = body_start + len;
+        // The hello's length is known as soon as its 4-byte header is in.
+        let Some(payload) = input.get(body_start..end) else {
+            if hello_len.is_none() {
+                let avail = &input[body_start.min(input.len())..];
+                if let Some(l) = early_length(&segs[..nseg], avail) {
+                    check_hello_len(l, limits)?;
+                }
+            }
+            return Ok(HelloParse::Incomplete { needed: end });
+        };
+        segs[nseg] = payload;
+        nseg += 1;
+        have += len;
+        pos = end;
+        if hello_len.is_none() && have >= 4 {
+            let stream = Stream::new(&segs[..nseg]);
+            if stream.byte(0) != Some(1) {
+                return Err(TlsError::HelloMalformed);
+            }
+            let l = stream.u24(1).ok_or(TlsError::HelloMalformed)?;
+            check_hello_len(l, limits)?;
+            hello_len = Some(l);
+        }
     }
+    let total = hello_len.unwrap_or(0) + 4;
+    // The records must end exactly with the hello.
+    if have != total {
+        return Err(TlsError::HelloMalformed);
+    }
+    let stream = Stream::new(&segs[..nseg]);
+    let view = parse_body(stream, record_version, limits)?;
+    Ok(HelloParse::Complete { view, length: pos })
 }
 
 fn check_prefix(rest: &[u8]) -> Result<(), TlsError> {
@@ -1028,7 +1027,7 @@ pub(crate) mod tests {
     }
 
     fn complete(input: &[u8]) -> ClientHelloView<'_> {
-        match HelloParser::parse(input, &HelloLimits::new()).unwrap() {
+        match parse_client_hello(input, &HelloLimits::new()).unwrap() {
             HelloParse::Complete { view, length } => {
                 assert_eq!(length, input.len());
                 view
@@ -1041,7 +1040,7 @@ pub(crate) mod tests {
     fn test_server_name_raw_is_the_bytes_as_sent() {
         let records = HelloBuilder::new().sni(b"Web_01.Example.").records(16_000);
         let Ok(HelloParse::Complete { view, .. }) =
-            HelloParser::parse(&records, &HelloLimits::new())
+            parse_client_hello(&records, &HelloLimits::new())
         else {
             panic!("not parsed");
         };
@@ -1049,7 +1048,7 @@ pub(crate) mod tests {
         // The checked forms refuse the underscore.
         assert_eq!(view.server_name(), None);
         let none = HelloBuilder::new().records(16_000);
-        let Ok(HelloParse::Complete { view, .. }) = HelloParser::parse(&none, &HelloLimits::new())
+        let Ok(HelloParse::Complete { view, .. }) = parse_client_hello(&none, &HelloLimits::new())
         else {
             panic!("not parsed");
         };
@@ -1068,7 +1067,7 @@ pub(crate) mod tests {
         }
         let records = b.records(16_000);
         assert!(matches!(
-            HelloParser::parse(&records, &limits),
+            parse_client_hello(&records, &limits),
             Err(TlsError::HelloOverBudget { .. })
         ));
     }
@@ -1121,7 +1120,7 @@ pub(crate) mod tests {
     fn test_parse_every_prefix_incomplete_or_error_never_panics() {
         let h = HelloBuilder::new().sni(b"a.example.test").records(50);
         for n in 0..h.len() {
-            match HelloParser::parse(&h[..n], &HelloLimits::new()) {
+            match parse_client_hello(&h[..n], &HelloLimits::new()) {
                 Ok(HelloParse::Incomplete { needed }) => assert!(needed > n),
                 Ok(HelloParse::Complete { .. }) => panic!("complete at {n}"),
                 Err(TlsError::HelloTooFragmented) => {}
@@ -1134,7 +1133,7 @@ pub(crate) mod tests {
     fn test_parse_incomplete_exact_after_header() {
         let h = HelloBuilder::new().records(16_384);
         assert!(
-            matches!(HelloParser::parse(&h[..9], &HelloLimits::new()), Ok(HelloParse::Incomplete { needed }) if needed == h.len())
+            matches!(parse_client_hello(&h[..9], &HelloLimits::new()), Ok(HelloParse::Incomplete { needed }) if needed == h.len())
         );
     }
 
@@ -1144,7 +1143,7 @@ pub(crate) mod tests {
         for minor in [0u8, 1, 2, 3, 4, 0xff] {
             let mut h = hello.clone();
             h[2] = minor;
-            match HelloParser::parse(&h, &HelloLimits::new()) {
+            match parse_client_hello(&h, &HelloLimits::new()) {
                 Ok(HelloParse::Complete { view, .. }) => {
                     assert_eq!(view.record_version(), 0x0300 | u16::from(minor));
                 }
@@ -1157,42 +1156,42 @@ pub(crate) mod tests {
     fn test_parse_refusals() {
         let l = HelloLimits::new();
         assert_eq!(
-            HelloParser::parse(b"\x80\x2e\x01", &l).unwrap_err(),
+            parse_client_hello(b"\x80\x2e\x01", &l).unwrap_err(),
             TlsError::NotTls
         );
         assert_eq!(
-            HelloParser::parse(b"PROXY TCP4 ", &l).unwrap_err(),
+            parse_client_hello(b"PROXY TCP4 ", &l).unwrap_err(),
             TlsError::NotTls
         );
         assert_eq!(
-            HelloParser::parse(b"\x15\x03\x03\x00\x02\x02\x28", &l).unwrap_err(),
+            parse_client_hello(b"\x15\x03\x03\x00\x02\x02\x28", &l).unwrap_err(),
             TlsError::BadRecord
         );
         for version in [[2u8, 0], [4, 1], [0, 0], [0xff, 0xff]] {
             let header = [22, version[0], version[1], 0, 0x10];
             assert_eq!(
-                HelloParser::parse(&header, &l).unwrap_err(),
+                parse_client_hello(&header, &l).unwrap_err(),
                 TlsError::BadRecord,
                 "{version:?}"
             );
         }
         assert_eq!(
-            HelloParser::parse(b"\x16\x03\x01\x00\x00", &l).unwrap_err(),
+            parse_client_hello(b"\x16\x03\x01\x00\x00", &l).unwrap_err(),
             TlsError::BadRecord
         );
         assert_eq!(
-            HelloParser::parse(b"\x16\x03\x01\x40\x01", &l).unwrap_err(),
+            parse_client_hello(b"\x16\x03\x01\x40\x01", &l).unwrap_err(),
             TlsError::BadRecord
         );
         let mut big = vec![22, 3, 1, 0x40, 0];
         big.extend([1, 0, 0x40, 1]);
         assert_eq!(
-            HelloParser::parse(&big, &l).unwrap_err(),
+            parse_client_hello(&big, &l).unwrap_err(),
             TlsError::HelloTooLarge
         );
         let frag = HelloBuilder::new().records(20);
         assert_eq!(
-            HelloParser::parse(&frag, &l).unwrap_err(),
+            parse_client_hello(&frag, &l).unwrap_err(),
             TlsError::HelloTooFragmented
         );
         let dup = HelloBuilder::new()
@@ -1200,7 +1199,7 @@ pub(crate) mod tests {
             .sni(b"b.test")
             .records(16_384);
         assert_eq!(
-            HelloParser::parse(&dup, &l).unwrap_err(),
+            parse_client_hello(&dup, &l).unwrap_err(),
             TlsError::DuplicateExtension
         );
         let psk_not_last = HelloBuilder::new()
@@ -1208,7 +1207,7 @@ pub(crate) mod tests {
             .sni(b"a.test")
             .records(16_384);
         assert_eq!(
-            HelloParser::parse(&psk_not_last, &l).unwrap_err(),
+            parse_client_hello(&psk_not_last, &l).unwrap_err(),
             TlsError::HelloMalformed
         );
     }
@@ -1218,10 +1217,10 @@ pub(crate) mod tests {
         let l = HelloLimits::new().max_ciphers(4).unwrap();
         let mut b = HelloBuilder::new();
         b.ciphers = vec![1, 2, 3, 4];
-        assert!(HelloParser::parse(&b.records(16_384), &l).is_ok());
+        assert!(parse_client_hello(&b.records(16_384), &l).is_ok());
         b.ciphers.push(5);
         assert_eq!(
-            HelloParser::parse(&b.records(16_384), &l).unwrap_err(),
+            parse_client_hello(&b.records(16_384), &l).unwrap_err(),
             TlsError::HelloOverBudget {
                 what: "cipher suite"
             }
@@ -1229,7 +1228,7 @@ pub(crate) mod tests {
 
         let names: Vec<&[u8]> = vec![b"x"; 32];
         assert!(
-            HelloParser::parse(
+            parse_client_hello(
                 &HelloBuilder::new().alpn(&names).records(16_384),
                 &HelloLimits::new()
             )
@@ -1237,7 +1236,7 @@ pub(crate) mod tests {
         );
         let names: Vec<&[u8]> = vec![b"x"; 33];
         assert_eq!(
-            HelloParser::parse(
+            parse_client_hello(
                 &HelloBuilder::new().alpn(&names).records(16_384),
                 &HelloLimits::new()
             )
@@ -1248,10 +1247,10 @@ pub(crate) mod tests {
         for t in 0..64u16 {
             many = many.ext(0x7000 + t, vec![]);
         }
-        assert!(HelloParser::parse(&many.records(16_384), &HelloLimits::new()).is_ok());
+        assert!(parse_client_hello(&many.records(16_384), &HelloLimits::new()).is_ok());
         let many = many.ext(0x7100, vec![]);
         assert_eq!(
-            HelloParser::parse(&many.records(16_384), &HelloLimits::new()).unwrap_err(),
+            parse_client_hello(&many.records(16_384), &HelloLimits::new()).unwrap_err(),
             TlsError::HelloOverBudget { what: "extension" }
         );
     }
@@ -1259,7 +1258,7 @@ pub(crate) mod tests {
     #[test]
     fn test_parse_budgets_at_n_minus_one_n_n_plus_one_t14() {
         let parse = |b: &HelloBuilder, l: &HelloLimits| {
-            HelloParser::parse(&b.records(16_384), l).map(|_| ())
+            parse_client_hello(&b.records(16_384), l).map(|_| ())
         };
         // Cipher suites, limit 4.
         let l = HelloLimits::new().max_ciphers(4).unwrap();
@@ -1301,7 +1300,7 @@ pub(crate) mod tests {
         for (chunk, records, ok) in [(134, 3, true), (100, 4, true), (80, 5, false)] {
             let wire = b.records(chunk);
             assert_eq!(wire.len(), 400 + 5 * records);
-            let r = HelloParser::parse(&wire, &HelloLimits::new());
+            let r = parse_client_hello(&wire, &HelloLimits::new());
             assert_eq!(r.is_ok(), ok, "{records} records: {r:?}");
             if !ok {
                 assert_eq!(r.unwrap_err(), TlsError::HelloTooFragmented);
@@ -1315,7 +1314,7 @@ pub(crate) mod tests {
         for bad in [vec![0, 0], vec![0, 3, 0, 0, 0], vec![0, 4, 1, 0, 1, b'a']] {
             let h = HelloBuilder::new().ext(0, bad).records(16_384);
             assert_eq!(
-                HelloParser::parse(&h, &l).unwrap_err(),
+                parse_client_hello(&h, &l).unwrap_err(),
                 TlsError::HelloMalformed
             );
         }
@@ -1336,7 +1335,7 @@ pub(crate) mod tests {
         h[4] += 1;
         h.push(0);
         assert_eq!(
-            HelloParser::parse(&h, &HelloLimits::new()).unwrap_err(),
+            parse_client_hello(&h, &HelloLimits::new()).unwrap_err(),
             TlsError::HelloMalformed
         );
     }

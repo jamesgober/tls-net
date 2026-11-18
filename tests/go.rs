@@ -17,8 +17,7 @@ use std::time::Duration;
 
 use common::{TcpClient, data, spawn_https};
 use tls_net::{
-    Alpn, ClientAuth, ClientBuilder, Event, KeySource, Policy, TlsClient, TlsServer, TrustAnchors,
-    Version,
+    Alpn, ClientAuth, Event, KeySource, Policy, TlsClient, TlsServer, TrustAnchors, Version,
 };
 
 fn enabled() -> bool {
@@ -242,7 +241,7 @@ fn test_go_server_tls13_tls12_and_alpn() {
         return;
     }
     let go = GoServer::start(&["-alpn", "h2,http/1.1"]);
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(trust())
         .alpn(&[Alpn::H2])
         .build()
@@ -252,7 +251,7 @@ fn test_go_server_tls13_tls12_and_alpn() {
         reply.starts_with("version=TLS1.3 alpn=h2 client=none") && reply.ends_with("echo=ping"),
         "{reply}"
     );
-    let tls12 = ClientBuilder::new()
+    let tls12 = TlsClient::builder()
         .trust(trust())
         .policy(
             Policy::client_default()
@@ -271,7 +270,7 @@ fn test_go_server_resumes_tls_net_client() {
         return;
     }
     let go = GoServer::start(&[]);
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(trust())
         .resumption(8)
         .build()
@@ -288,7 +287,7 @@ fn test_go_server_requires_and_verifies_tls_net_client_certificate() {
         return;
     }
     let go = GoServer::start(&["-clientca", &path("ca.pem")]);
-    let client = ClientBuilder::new()
+    let client = TlsClient::builder()
         .trust(trust())
         .client_certificate(&data("client.pem"), KeySource::Pem(&data("client.key")))
         .unwrap()
@@ -297,7 +296,7 @@ fn test_go_server_requires_and_verifies_tls_net_client_certificate() {
     let reply = go.ask(&client);
     assert!(reply.contains("client=client.test"), "{reply}");
     // Without a certificate the Go server refuses the handshake.
-    let anonymous = ClientBuilder::new().trust(trust()).build().unwrap();
+    let anonymous = TlsClient::builder().trust(trust()).build().unwrap();
     let sock = TcpStream::connect(go.addr).unwrap();
     let mut c = TcpClient::new(sock, anonymous.connect("localhost").unwrap());
     let refused = c

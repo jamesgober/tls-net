@@ -151,6 +151,17 @@ impl LoadLimits {
         self.check_chain_order = on;
         self
     }
+
+    /// The fields held to the setters' ranges: a field set directly takes
+    /// any value, and a key buffer is sized from `max_key_file_bytes` (D-147).
+    pub(crate) fn clamped(self) -> Self {
+        LoadLimits {
+            max_chain_file_bytes: self.max_chain_file_bytes.clamp(1024, 16 << 20),
+            max_key_file_bytes: self.max_key_file_bytes.clamp(256, 1 << 20),
+            max_chain_len: self.max_chain_len.clamp(1, 32),
+            check_chain_order: self.check_chain_order,
+        }
+    }
 }
 
 /// What a certificate is for.

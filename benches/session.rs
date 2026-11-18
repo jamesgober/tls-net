@@ -156,8 +156,8 @@ fn accept(c: &mut Criterion) {
     g.bench_function("TlsServer::accept", |b| {
         b.iter(|| black_box(srv.accept().unwrap()))
     });
-    let mut reader = srv.reader();
-    g.bench_function("ServerReader::accept", |b| {
+    let mut reader = srv.worker_acceptor();
+    g.bench_function("WorkerAcceptor::accept", |b| {
         b.iter(|| black_box(reader.accept().unwrap()))
     });
     g.finish();

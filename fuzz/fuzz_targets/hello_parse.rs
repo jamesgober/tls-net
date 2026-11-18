@@ -4,11 +4,11 @@
 //! its input, and every accessor of a complete view works.
 
 use libfuzzer_sys::fuzz_target;
-use tls_net::{HelloLimits, HelloParse, HelloParser};
+use tls_net::{HelloLimits, HelloParse, parse_client_hello};
 
 fuzz_target!(|data: &[u8]| {
     let limits = HelloLimits::new();
-    if let Ok(HelloParse::Complete { view, length }) = HelloParser::parse(data, &limits) {
+    if let Ok(HelloParse::Complete { view, length }) = parse_client_hello(data, &limits) {
         assert!(length <= data.len());
         let _ = view.cipher_suites().count();
         let _ = view.extension_types().count();

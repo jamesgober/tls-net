@@ -374,7 +374,7 @@ fn dec_list(out: &mut impl fmt::Write, values: impl Iterator<Item = u16>) {
 mod tests {
     use super::*;
     use crate::hello::tests::HelloBuilder;
-    use crate::hello::{HelloLimits, HelloParse, HelloParser};
+    use crate::hello::{HelloLimits, HelloParse, parse_client_hello};
 
     /// The ClientHello behind FoxIO's published JA4 example
     /// `t13d1516h2_8daaf6152771_e5627efa2ab1` (15 ciphers, 16 extensions,
@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn view_of(bytes: &[u8]) -> ClientHelloView<'_> {
-        match HelloParser::parse(bytes, &HelloLimits::new()).unwrap() {
+        match parse_client_hello(bytes, &HelloLimits::new()).unwrap() {
             HelloParse::Complete { view, .. } => view,
             HelloParse::Incomplete { .. } => panic!("incomplete"),
         }
