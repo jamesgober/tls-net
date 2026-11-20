@@ -236,6 +236,26 @@ pub(crate) struct ServerState {
     pub(crate) obs: Arc<Observation>,
     /// The server's handshake gate, the same in every snapshot.
     pub(crate) capacity: Arc<Capacity>,
+    /// Why `accept_quic` is refused, if it is: checked once per snapshot.
+    #[cfg(feature = "quic")]
+    pub(crate) quic_refusal: Option<&'static str>,
+}
+
+/// Why a configuration cannot run QUIC handshakes, or `None` when it can:
+/// QUIC needs TLS 1.3 and an ALPN protocol (RFC 9001 sections 4.2 and 8.1).
+#[cfg(feature = "quic")]
+pub(crate) fn quic_refusal(policy: &Policy, alpn: &[Alpn]) -> Option<&'static str> {
+    let tls13 = policy
+        .rustls_versions()
+        .iter()
+        .any(|v| v.version == rustls::ProtocolVersion::TLSv1_3);
+    if !tls13 {
+        Some("QUIC needs TLS 1.3 in the policy")
+    } else if alpn.is_empty() {
+        Some("QUIC needs at least one ALPN protocol")
+    } else {
+        None
+    }
 }
 
 /// The wall clock for the checks at completion. Unit tests move it forward
@@ -395,6 +415,43 @@ impl TlsServer {
         io: S,
     ) -> Result<crate::TlsStream<S>, TlsError> {
         crate::TlsStream::server(self.accept()?, io)
+    }
+
+    /// The TLS side of one QUIC connection (feature `quic`), sending
+    /// `transport_params`: the encoded transport parameters (RFC 9000
+    /// section 18), opaque to tls-net. Call it when the client's first
+    /// Initial has arrived, so the parameters can carry
+    /// `original_destination_connection_id`. Takes a handshake capacity slot,
+    /// as [`accept`](Self::accept).
+    ///
+    /// The ClientHello goes through the same gates as over TCP: the parser
+    /// and its budgets, the hello hook, the SNI table and host groups, then
+    /// the group's rustls configuration.
+    ///
+    /// # Errors
+    ///
+    /// `PolicyInvalid` when a host group's policy lacks TLS 1.3 or the group
+    /// has no ALPN protocol; `HandshakeCapacity` at the limit.
+    #[cfg(feature = "quic")]
+    pub fn accept_quic(
+        &self,
+        transport_params: Vec<u8>,
+    ) -> Result<crate::quic::QuicSession, TlsError> {
+        let state = self.inner.snapshot.load();
+        if let Some(reason) = state.quic_refusal {
+            return Err(TlsError::PolicyInvalid { reason });
+        }
+        let slot = self
+            .inner
+            .shared
+            .capacity
+            .acquire()
+            .ok_or_else(|| self.inner.refuse())?;
+        Ok(crate::quic::QuicSession::server(
+            state,
+            slot,
+            transport_params,
+        ))
     }
 
     /// The hosts a connection may serve, from the server name its handshake
@@ -636,6 +693,33 @@ impl WorkerAcceptor {
         Ok(ServerSession::new(
             crate::sync::Shared::clone(self.reader.get()),
             slot,
+        ))
+    }
+
+    /// As [`TlsServer::accept_quic`].
+    ///
+    /// # Errors
+    ///
+    /// As `TlsServer::accept_quic`.
+    #[cfg(feature = "quic")]
+    pub fn accept_quic(
+        &mut self,
+        transport_params: Vec<u8>,
+    ) -> Result<crate::quic::QuicSession, TlsError> {
+        let state = crate::sync::Shared::clone(self.reader.get());
+        if let Some(reason) = state.quic_refusal {
+            return Err(TlsError::PolicyInvalid { reason });
+        }
+        let slot = self
+            .inner
+            .shared
+            .capacity
+            .acquire()
+            .ok_or_else(|| self.inner.refuse())?;
+        Ok(crate::quic::QuicSession::server(
+            state,
+            slot,
+            transport_params,
         ))
     }
 }
@@ -1381,6 +1465,12 @@ impl ServerBuilder {
 
         let mut configs = Vec::with_capacity(settings.len());
         let mut groups = Vec::with_capacity(settings.len());
+        // Every host group must be able to run QUIC, since the group is
+        // known only once the ClientHello has arrived.
+        #[cfg(feature = "quic")]
+        let quic_refusal = settings
+            .iter()
+            .find_map(|(alpn, _, _, policy)| quic_refusal(policy, alpn));
         for (group, (alpn, alpn_policy, auth, policy)) in settings.into_iter().enumerate() {
             for (i, a) in alpn.iter().enumerate() {
                 if alpn[i + 1..].contains(a) {
@@ -1491,6 +1581,8 @@ impl ServerBuilder {
             fingerprints: self.fingerprints,
             obs: Arc::clone(&shared.obs),
             capacity: Arc::clone(&shared.capacity),
+            #[cfg(feature = "quic")]
+            quic_refusal,
         })
     }
 }

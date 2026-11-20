@@ -235,6 +235,9 @@ struct Inner {
     /// resumes only with the verifier that made the session (D-133).
     pinned: std::sync::Mutex<Vec<PinnedConfig>>,
     obs: Arc<Observation>,
+    /// Why `connect_quic` is refused, if it is.
+    #[cfg(feature = "quic")]
+    quic_refusal: Option<&'static str>,
 }
 
 /// A pin set (sorted), whether it requires a chain, and its configuration.
@@ -372,6 +375,66 @@ impl TlsClient {
     ///
     /// As `connect`.
     pub fn connect_to(&self, identity: &ServerIdentity) -> Result<ClientSession, TlsError> {
+        let (config, name, shown) = self.session_config(identity)?;
+        let conn =
+            UnbufferedClientConnection::new(config, name).map_err(|e| error::from_rustls(&e))?;
+        Ok(ClientSession::new(
+            conn,
+            shown,
+            &self.inner.limits,
+            Arc::clone(&self.inner.obs),
+        ))
+    }
+
+    /// The TLS side of a QUIC connection to `server_name` (feature `quic`),
+    /// sending `transport_params`: the encoded transport parameters (RFC 9000
+    /// section 18), opaque to tls-net, in the `quic_transport_parameters`
+    /// extension.
+    ///
+    /// # Errors
+    ///
+    /// `PolicyInvalid` when the policy lacks TLS 1.3, no ALPN protocol is
+    /// set, or the client has no trust anchors; otherwise as `connect`.
+    #[cfg(feature = "quic")]
+    pub fn connect_quic(
+        &self,
+        server_name: &str,
+        transport_params: Vec<u8>,
+    ) -> Result<crate::quic::QuicSession, TlsError> {
+        self.connect_quic_to(&ServerIdentity::parse(server_name)?, transport_params)
+    }
+
+    /// As [`connect_quic`](Self::connect_quic), for an identity (a pinned
+    /// key, for example).
+    ///
+    /// # Errors
+    ///
+    /// As `connect_quic` and `connect_to`.
+    #[cfg(feature = "quic")]
+    pub fn connect_quic_to(
+        &self,
+        identity: &ServerIdentity,
+        transport_params: Vec<u8>,
+    ) -> Result<crate::quic::QuicSession, TlsError> {
+        if let Some(reason) = self.inner.quic_refusal {
+            return Err(TlsError::PolicyInvalid { reason });
+        }
+        let (config, name, shown) = self.session_config(identity)?;
+        crate::quic::QuicSession::client(
+            config,
+            name,
+            shown,
+            transport_params,
+            &self.inner.limits,
+            Arc::clone(&self.inner.obs),
+        )
+    }
+
+    /// The configuration, the rustls name, and the shown name for an identity.
+    fn session_config(
+        &self,
+        identity: &ServerIdentity,
+    ) -> Result<(Arc<rustls::ClientConfig>, ServerName<'static>, Box<str>), TlsError> {
         let no_anchors = TlsError::PolicyInvalid {
             reason: "no trust anchors",
         };
@@ -402,14 +465,7 @@ impl TlsClient {
             _ => Arc::clone(&self.inner.config),
         };
         let (name, shown) = identity.server_name()?;
-        let conn =
-            UnbufferedClientConnection::new(config, name).map_err(|e| error::from_rustls(&e))?;
-        Ok(ClientSession::new(
-            conn,
-            shown,
-            &self.inner.limits,
-            Arc::clone(&self.inner.obs),
-        ))
+        Ok((config, name, shown))
     }
 
     /// The configuration for a pin set: kept, so a second connection to the
@@ -697,6 +753,8 @@ impl ClientBuilder {
             }
             config.key_log = Arc::new(crate::server::KeyLogAdapter(Arc::clone(sink)));
         }
+        #[cfg(feature = "quic")]
+        let quic_refusal = crate::server::quic_refusal(&self.policy, &self.alpn);
         Ok(TlsClient {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -708,6 +766,8 @@ impl ClientBuilder {
                 chain,
                 pinned: std::sync::Mutex::new(Vec::new()),
                 obs: Arc::new(Observation::new(self.observer, 0)),
+                #[cfg(feature = "quic")]
+                quic_refusal,
             }),
         })
     }

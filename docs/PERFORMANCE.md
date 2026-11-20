@@ -97,6 +97,18 @@ Linux: WSL2, one core (`taskset -c 6`), 3,000 rounds, load about 120. Windows: 4
 - Handshakes: the server's first step (hello parse, JA4, SNI lookup) costs 1.6 to 2.5 µs more than rustls's; the client side's share fell when the peer identity became lazy (D-104). Windows shows less overhead than Linux, where the crypto itself is faster, so the fixed cost is a larger share.
 - `step` at 16 KiB: tls-net bounces each record's plaintext through the output buffer back into the input (D-035), one 16 KiB copy more than the driver's single copy; the measured difference is about that one copy. rustls 0.24's in-place reads remove it (0.9).
 
+### QUIC (medians)
+
+`benches/quic.rs`: tls-net's `QuicSession` against rustls's QUIC connection, alternating, in memory. Linux (WSL2), 2,000 rounds, 3 runs, 0.11.0.
+
+| Operation | tls-net | rustls | Ratio |
+|---|---|---|---|
+| full handshake | 236.6 µs | 233.1 µs | 1.013 |
+| resumed handshake | 151.9 µs | 150.2 µs | 1.014 |
+| Initial packet: seal 1,184 bytes, header mask, open | 280 ns | 280 ns | 1.000 |
+
+The handshake difference is the hello parse, JA4, and SNI lookup a TCP accept also does. The key types are the rustls keys behind one more call.
+
 ### Criterion (Windows, lightest load of the run)
 
 | Bench | Time |

@@ -18,7 +18,7 @@
 </div>
 <br>
 
-Every public item in `tls-net`: signature, behaviour, errors, cost, and examples. **Status: `0.10.0`.** Each item shows the version that shipped it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). 0.10.0 simplified the API (the simplicity audit in [`STABILITY-1.0.md`](./STABILITY-1.0.md)): `TlsStream` is new, and some names changed ([`MIGRATION-0.10.md`](./MIGRATION-0.10.md)). Every example is compiled as a doctest with the default features; those that need a network or files outside the repository are compiled but not run. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md).
+Every public item in `tls-net`: signature, behaviour, errors, cost, and examples. **Status: `0.11.0`.** Each item shows the version that shipped it and its grade (P0 required, P1 expected, P2 high value, P3 after 1.0). 0.10.0 simplified the API (the simplicity audit in [`STABILITY-1.0.md`](./STABILITY-1.0.md)): `TlsStream` is new, and some names changed ([`MIGRATION-0.10.md`](./MIGRATION-0.10.md)). 0.11.0 adds [QUIC](#quic) behind feature `quic`. Every example is compiled as a doctest with the default features; those that need a network or files outside the repository are compiled but not run. Design and reasons: [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -92,6 +92,11 @@ Every public item in `tls-net`: signature, behaviour, errors, cost, and examples
   - [`Fingerprint` and `FingerprintKinds`](#fingerprint-and-fingerprintkinds)
   - [`HelloHook`, `HelloContext`, `HelloVerdict`, `RefuseReason`](#hellohook-hellocontext-helloverdict-refusereason)
 - [net-io seam](#net-io-seam)
+- [QUIC](#quic)
+  - [`accept_quic` and `connect_quic`](#accept_quic-and-connect_quic)
+  - [`QuicSession`](#quicsession)
+  - [`KeyChange`, `Keys`, `PacketKey`, `HeaderKey`, `Secrets`](#keychange-keys-packetkey-headerkey-secrets)
+  - [`initial_keys` and `retry_tag`](#initial_keys-and-retry_tag)
 - [Escape hatch](#escape-hatch)
 - [Errors](#errors)
   - [`TlsError`](#tlserror)
@@ -1562,7 +1567,8 @@ impl<'a> ClientHelloView<'a> {
     pub fn has_encrypted_client_hello(&self) -> bool;
     pub fn session_id_len(&self) -> u8;
     pub fn padding_len(&self) -> Option<u16>;
-    pub fn raw(&self) -> Option<&'a [u8]>;   // the handshake message, when it sits in one record
+    pub fn raw(&self) -> Option<&'a [u8]>;   // the handshake message, when it sits in one record or came over QUIC
+    pub fn is_quic(&self) -> bool;           // 0.11: read from QUIC CRYPTO data; record_version() is then 0
 }
 pub fn is_grease(value: u16) -> bool;        // RFC 8701: 0x0A0A, 0x1A1A, ... 0xFAFA
 pub fn normalize_server_name(name: &str) -> Option<NormalizedName>;   // the FR-17 rule, also used on rustls's view
@@ -1690,6 +1696,138 @@ Type conversions only: no extra state, no allocation. Works with net-io `>= 0.7,
 
 ---
 
+## QUIC
+
+P1, `0.11.0`, feature `quic`. The TLS side of QUIC (RFC 9001): tls-net runs the handshake and hands out the keys; the transport frames CRYPTO data, protects packets, and sends them. Nothing here does I/O, and no rustls type appears in the API. QUIC version 1 only; 0-RTT, QUIC version 2, and multipath are not in this release.
+
+### `accept_quic` and `connect_quic`
+
+```rust,ignore
+impl TlsServer {
+    pub fn accept_quic(&self, transport_params: Vec<u8>) -> Result<QuicSession, TlsError>;
+}
+impl WorkerAcceptor {
+    pub fn accept_quic(&mut self, transport_params: Vec<u8>) -> Result<QuicSession, TlsError>;
+}
+impl TlsClient {
+    pub fn connect_quic(&self, server_name: &str, transport_params: Vec<u8>) -> Result<QuicSession, TlsError>;
+    pub fn connect_quic_to(&self, identity: &ServerIdentity, transport_params: Vec<u8>) -> Result<QuicSession, TlsError>;
+}
+```
+
+`transport_params` are the encoded transport parameters (RFC 9000 section 18), opaque to tls-net, sent in the `quic_transport_parameters` extension. A server calls `accept_quic` once the client's first Initial has arrived, so its parameters can carry `original_destination_connection_id`.
+
+Refused at the call, with `PolicyInvalid` (`TLS-0002`), when the policy lacks TLS 1.3 or no ALPN protocol is set (RFC 9001 sections 4.2 and 8.1); on a server, when any host group lacks either, since the group is known only once the ClientHello has arrived. A policy that also allows TLS 1.2 is accepted: QUIC negotiates TLS 1.3 only, and tls-net checks the version again at completion (D-154). `accept_quic` takes a handshake capacity slot as `accept` does (`HandshakeCapacity`, `TLS-0030`), and releases it when the handshake ends or the session is dropped.
+
+The ClientHello goes through the same gates as over TCP: the parser and its budgets (`HelloLimits`, with no lenient path), the hello hook, the SNI table and host groups, the group's rustls configuration, `HandshakeLimits`, the checks at completion (D-125, D-127), and the observer. A hello without ALPN is refused with `NoApplicationProtocol` and alert 120. Tickets, the session cache, and the key log work as for TCP; `TlsServer::host_scope(session.server_name())` gives the `Host` check (D-143). JA4 starts with `q` for a hello that came over QUIC.
+
+```rust
+# #[cfg(all(feature = "quic", any(feature = "aws-lc", feature = "ring")))] {
+use tls_net::{Alpn, KeySource, TlsClient, TlsServer, TrustAnchors};
+# let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+# let read = |f: &str| std::fs::read(format!("{dir}{f}")).unwrap();
+let h3 = Alpn::new(b"h3")?;
+let server = TlsServer::builder()
+    .certificate(&read("site.pem"), KeySource::Pem(&read("site.key")))?
+    .alpn(&[h3.clone()])
+    .build()?;
+let client = TlsClient::builder()
+    .trust(TrustAnchors::from_pem(&read("ca.pem"))?)
+    .alpn(&[h3])
+    .build()?;
+let mut c = client.connect_quic("localhost", b"client params".to_vec())?;
+let mut s = server.accept_quic(b"server params".to_vec())?;
+// Each write_handshake output goes to the peer at the level it was written at.
+let mut flight = Vec::new();
+c.write_handshake(&mut flight);
+s.read_handshake(&flight)?;
+assert!(s.is_handshaking());
+# }
+# Ok::<(), tls_net::TlsError>(())
+```
+
+Cost: the same as a TCP accept up to the hello (one atomic for the slot, one parse); the hello is buffered once (at most `max_hello_bytes`) until it is whole. The in-memory handshake is within 1.5% of rustls's own QUIC connection (`benches/quic.rs`, `docs/PERFORMANCE.md`).
+
+### `QuicSession`
+
+```rust,ignore
+pub struct QuicSession { /* Send, not Sync */ }
+impl QuicSession {
+    pub fn read_handshake(&mut self, data: &[u8]) -> Result<(), TlsError>;
+    pub fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange>;
+    pub fn peer_transport_parameters(&self) -> Option<&[u8]>;
+    pub fn alert(&self) -> Option<u8>;
+    pub fn is_handshaking(&self) -> bool;
+    pub fn state(&self) -> SessionState;            // Hello, Handshake, Established, Failed
+    pub fn alpn(&self) -> Option<&[u8]>;
+    pub fn server_name(&self) -> Option<&str>;      // server: normalised SNI; client: the name connected to
+    pub fn negotiated_suite(&self) -> Option<CipherSuite>;  // once the ServerHello is processed
+    pub fn info(&self) -> Option<HandshakeInfo<'_>>;        // with the peer identity, after the handshake
+    pub fn fingerprint(&self) -> Option<&Fingerprint>;      // server
+    pub fn set_tag(&mut self, tag: u64);
+    pub fn error_code(&self) -> Option<u16>;
+}
+```
+
+`read_handshake` takes CRYPTO data in order, one encryption level per call: rustls refuses a key change in the middle of buffered data. `write_handshake` appends what to send at the current write level; when it returns a `KeyChange`, the bytes appended so far go at the old level and the next call's at the new one. A failed session stays failed: `read_handshake` returns `SessionFailed`, `write_handshake` writes nothing and hands out no keys.
+
+Closing on failure: send `CRYPTO_ERROR` with `0x100 + alert()` when `alert()` is `Some`. tls-net's own refusals carry `unrecognized_name` (112) and `no_application_protocol` (120); its checks at completion carry `certificate_required` (116), `certificate_expired` (45), `bad_certificate` (42), `protocol_version` (70), or `internal_error` (80); rustls's failures carry rustls's alert. A hello tls-net cannot read, the hello hook, and the budgets have no alert, as over TCP (D-014): close without a TLS reason. `Action` stays about retrying; the alert is the close reason (D-157).
+
+A server must not process 1-RTT packets until `is_handshaking()` is `false` (RFC 9001 section 5.7): before then the client is not authenticated, and tls-net's checks at completion have not run.
+
+### `KeyChange`, `Keys`, `PacketKey`, `HeaderKey`, `Secrets`
+
+```rust,ignore
+pub enum KeyChange { Handshake { keys: Keys }, OneRtt { keys: Keys, next: Secrets } }
+pub struct Keys { pub local: DirectionalKeys, pub remote: DirectionalKeys }
+pub struct DirectionalKeys { pub packet: PacketKey, pub header: HeaderKey }
+
+impl PacketKey {    // Send + Sync
+    pub fn seal(&self, packet_number: u64, header: &[u8], payload: &mut [u8]) -> Result<[u8; 16], TlsError>;
+    pub fn open(&self, packet_number: u64, header: &[u8], payload_and_tag: &mut [u8]) -> Result<usize, TlsError>;
+    pub fn tag_len(&self) -> usize;                 // 16
+    pub fn confidentiality_limit(&self) -> u64;
+    pub fn integrity_limit(&self) -> u64;
+}
+impl HeaderKey {    // Send + Sync
+    pub fn mask(&self, sample: &[u8; 16]) -> Result<[u8; 5], TlsError>;
+}
+impl Secrets {      // Clone
+    pub fn next_packet_keys(&mut self) -> PacketKeySet;
+}
+pub struct PacketKeySet { pub local: PacketKey, pub remote: PacketKey }
+```
+
+`local` protects what this endpoint sends, `remote` opens what it receives. `seal` encrypts in place with the nonce from the packet number and the header as associated data, and returns the tag (`QuicInput`, `TLS-0048`, for a payload longer than the AEAD allows); `open` decrypts ciphertext followed by its tag in place and returns the plaintext length (`DecryptFailed`, `TLS-0042`). `mask` is RFC 9001 section 5.4.1's mask: apply the low 4 bits of `mask[0]` to a long header's first byte, the low 5 to a short header's, and `mask[1..]` to the packet number; the top 3 bits of `mask[0]` are always 0 (D-156). `next_packet_keys` gives the next key phase's packet keys and moves on; header keys do not change. Thin wrappers over rustls's own keys: no copy, one virtual call.
+
+### `initial_keys` and `retry_tag`
+
+```rust,ignore
+pub enum Side { Client, Server }
+pub fn initial_keys(client_dcid: &[u8], side: Side) -> Result<Keys, TlsError>;
+pub fn retry_tag(pseudo_packet: &[u8]) -> Result<[u8; 16], TlsError>;
+```
+
+`initial_keys` derives the Initial keys from the client's first Destination Connection ID (RFC 9001 section 5.2) with the provider's `TLS_AES_128_GCM_SHA256`, so a server can open a client's first packet, and answer it, before accepting anything. `QuicInput` for a connection ID over 20 bytes. `retry_tag` is the Retry Integrity Tag (RFC 9001 section 5.8) over the Retry Pseudo-Packet; rustls has no AEAD under a fixed key, so this one call goes to the provider (aws-lc-rs or ring) directly (D-155). Both are tested against RFC 9001 appendix A, byte for byte.
+
+```rust
+# #[cfg(all(feature = "quic", any(feature = "aws-lc", feature = "ring")))] {
+use tls_net::quic::{Side, initial_keys};
+let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+let client = initial_keys(&dcid, Side::Client)?;
+let server = initial_keys(&dcid, Side::Server)?;
+let header = [0xc3; 22];
+let mut packet = b"CRYPTO frames".to_vec();
+let tag = client.local.packet.seal(2, &header, &mut packet)?;
+packet.extend_from_slice(&tag);
+let n = server.remote.packet.open(2, &header, &mut packet)?;
+assert_eq!(&packet[..n], b"CRYPTO frames");
+# }
+# Ok::<(), tls_net::TlsError>(())
+```
+
+---
+
 ## Escape hatch
 
 P2, `0.5.0`, feature `rustls-escape-hatch`. **Outside semver**: may change in any release.
@@ -1793,6 +1931,7 @@ Carried by `PeerCertificateInvalid`.
 | TLS-0042 | `DecryptFailed`, `PeerMisbehaved` | Aborted | None | Secure connection failed |
 | TLS-0043 | `UncleanClose` | Unavailable | RetryIdempotent | Connection closed early |
 | TLS-0047 | `Transport { kind }` | Unavailable | RetryIdempotent | Connection failed |
+| TLS-0048 | `QuicInput { what }` | InvalidArgument | None | Secure connection failed |
 | TLS-0044 | `KeyUsageExhausted` | Aborted | Retry | Connection closed early |
 | TLS-0045 | `StartTlsInjection` | PermissionDenied | Operator | Mail server sent unexpected data |
 | TLS-0046 | `EarlyDataRefused` | FailedPrecondition | RetryWithoutEarlyData | Secure connection failed |
@@ -1817,6 +1956,7 @@ No variant holds key bytes. `Debug` and `Display` of every variant are scanned i
 | `ja3-md5` | off | `ja3_md5`, `FingerprintKinds::JA3_MD5` |
 | `rustls-escape-hatch` | off | raw rustls configurations, outside semver |
 | `dangerous-keylog` | off | `ServerBuilder::dangerous_key_log`; never in production; refused with FIPS |
+| `quic` | off | the [QUIC](#quic) module, `accept_quic`, `connect_quic` (`0.11.0`) |
 
 Without a provider feature every constructor returns `NoProvider` (`TLS-0001`).
 

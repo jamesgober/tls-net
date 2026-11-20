@@ -13,6 +13,36 @@
 
 ---
 
+## [0.11.0] - 2026-11-20
+
+QUIC. tls-net now runs the TLS handshake for a QUIC transport and hands out
+its packet keys, behind the new `quic` feature. Nothing changes without it.
+
+### Added
+
+- `TlsServer::accept_quic` and `TlsClient::connect_quic` (and
+  `WorkerAcceptor::accept_quic`, `TlsClient::connect_quic_to`) return a
+  `QuicSession`: feed it CRYPTO data with `read_handshake`, take what to send
+  with `write_handshake`, and install the keys each `KeyChange` hands out.
+- A QUIC ClientHello goes through the same checks as one over TCP: the
+  parser and its budgets, the hello hook, the SNI table and host groups, the
+  handshake budget, the capacity cap, and the checks at completion.
+- `PacketKey` (`seal`, `open`, the AEAD limits), `HeaderKey::mask`, and
+  `Secrets::next_packet_keys` for key updates.
+- `quic::initial_keys` and `quic::retry_tag`, which need no session.
+- `ClientHelloView::is_quic`; JA4 starts with `q` for a hello over QUIC.
+- `TlsError::QuicInput` (`TLS-0048`).
+- Fuzz targets `quic_hello_parse`, `quic_step_server`, `quic_step_client`.
+
+### Notes
+
+- QUIC needs TLS 1.3 and an ALPN protocol; `accept_quic` and `connect_quic`
+  refuse a configuration without them. A policy that also allows TLS 1.2
+  still works: QUIC connections only ever use TLS 1.3.
+- QUIC version 1 only. 0-RTT and QUIC version 2 come later.
+
+---
+
 ## [0.10.0] - 2026-11-11
 
 A simpler API, a few renames, and security fixes. I went through the
