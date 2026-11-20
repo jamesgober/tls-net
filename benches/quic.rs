@@ -157,7 +157,11 @@ fn main() {
     let mut packet = vec![0u8; 1200];
     for i in 0..rounds + 50 {
         let t = Instant::now();
-        let tag = ours.local.packet.seal(1, &header, &mut packet[..1184]).unwrap();
+        let tag = ours
+            .local
+            .packet
+            .seal(1, &header, &mut packet[..1184])
+            .unwrap();
         packet[1184..].copy_from_slice(&tag);
         let sample: [u8; 16] = packet[4..20].try_into().unwrap();
         black_box(ours.local.header.mask(&sample).unwrap());

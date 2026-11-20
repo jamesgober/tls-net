@@ -110,6 +110,14 @@ Exit: the API checked against the simplicity bar (Tier 1 covers about 80% of use
 - [ ] Not changed, with the reason: `TlsServer::accept`, the only accept net-io's `TlsAcceptor` can call, takes one uncontended lock per connection for the snapshot (about 60 ns against a 300 to 450 µs handshake). A lock-free cell needs either `unsafe` (forbidden here) or a per-thread cache keyed by server, whose cost and complexity are not yet justified by a measurement under contention. Measure with 8 or more net-io workers on a quiet machine with the 0.9.x performance re-tune; change it only if the lock shows.
 - [ ] For net-io (not tls-net's code): a drain or maximum age for connections opened before a reload, so a rotated key's rules stop applying to long-lived connections. Since D-146 those connections no longer keep the old keys in memory.
 
+## v0.11.0 - QUIC
+Exit: quic-net can run a QUIC version 1 handshake through tls-net without a rustls type in its API (D-153); the RFC 9001 appendix A vectors pass byte for byte on both providers; a QUIC accept passes every gate a TCP accept does (T-32); fuzz targets for the QUIC hello and both session sides.
+- [x] `quic` module: `accept_quic`, `connect_quic`, `QuicSession`, `KeyChange`, `PacketKey`, `HeaderKey`, `Secrets`, `initial_keys`, `retry_tag` (D-153 to D-157).
+- [x] Tests: RFC 9001 A.2 to A.5, an in-memory handshake to 1-RTT with key updates, resumption, the refusals and alerts, the gates (`tests/quic.rs`); ring and aws-lc-rs in CI.
+- [x] Fuzz targets `quic_hello_parse`, `quic_step_server`, `quic_step_client`, seeded from real handshakes.
+- [ ] 0-RTT (`zero_rtt_keys`, `is_early_data_accepted`, `reject_early_data`) once quic-net runs the first handshake end to end.
+- [ ] QUIC version 2 (RFC 9369) when quic-net needs it.
+
 ## v1.0.0 - Stable (James's explicit go)
 - [ ] Full audit recorded in `docs/STABILITY-1.0.md` (API, docs, tests, benchmarks, security).
 - [ ] Every end-to-end target of PLAN section 9 met, including the two carried from 0.6 (D-106).
@@ -117,4 +125,4 @@ Exit: the API checked against the simplicity bar (Tier 1 covers about 80% of use
 - [ ] API frozen until 2.0.
 
 ## After 1.0 (P3)
-Early data (0-RTT), kTLS secrets hand-over, QUIC wrapper, raw public keys (RFC 7250), client-side ECH (RFC 9849), certificate compression (RFC 8879), Windows key file ACL check, dynamic record sizing. Each moves into a 1.x minor with a reason.
+Early data (0-RTT) over TCP, kTLS secrets hand-over, raw public keys (RFC 7250), client-side ECH (RFC 9849), certificate compression (RFC 8879), Windows key file ACL check, dynamic record sizing. Each moves into a 1.x minor with a reason.

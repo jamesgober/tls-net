@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: beta (<code>0.10.0</code>).</strong> Every planned feature before 1.0 is in and tested against OpenSSL, curl, and Go: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, on net-io's reactor bulk transfer runs 1.23 times tokio-rustls, and an idle connection costs half as much memory; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Every threat in the model has an attack test, and the fuzz campaign, soak, conformance runs, and Miri results are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. The consumers' shapes (a net-io server in direct mode, a mutual-TLS back-channel, STARTTLS against Postfix) run end to end in CI; running a server is in <a href="./docs/OPERATIONS.md"><code>docs/OPERATIONS.md</code></a>. Every security fix comes with a test that fails without it (<code>docs/SECURITY.md</code>). What 1.0 still needs, item by item, is in <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>. 0.10 simplified the API after an audit of how it is used (<a href="./docs/MIGRATION-0.10.md"><code>docs/MIGRATION-0.10.md</code></a>). Next: the rest of the pre-1.0 polish; rustls 0.24 and its exporters when 0.24 is released (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
+        <strong>Status: beta (<code>0.11.0</code>).</strong> Every planned feature before 1.0 is in and tested against OpenSSL, curl, and Go: server and client sessions, policies (including FIPS), certificate checks, SNI with host policies, ALPN, mutual TLS with pins, hot reload, session tickets with a sealed hand-off across restarts, JA4 fingerprints with a hook, key-vault custody, observer events and statistics, the platform verifier, the STARTTLS helper, and the net-io adapter. Handshakes cost within 3% of rustls alone, on net-io's reactor bulk transfer runs 1.23 times tokio-rustls, and an idle connection costs half as much memory; numbers, method, and open gaps are in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>. Every threat in the model has an attack test, and the fuzz campaign, soak, conformance runs, and Miri results are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. The consumers' shapes (a net-io server in direct mode, a mutual-TLS back-channel, STARTTLS against Postfix) run end to end in CI; running a server is in <a href="./docs/OPERATIONS.md"><code>docs/OPERATIONS.md</code></a>. Every security fix comes with a test that fails without it (<code>docs/SECURITY.md</code>). What 1.0 still needs, item by item, is in <a href="./docs/STABILITY-1.0.md"><code>docs/STABILITY-1.0.md</code></a>. 0.10 simplified the API after an audit of how it is used (<a href="./docs/MIGRATION-0.10.md"><code>docs/MIGRATION-0.10.md</code></a>). Next: the rest of the pre-1.0 polish; rustls 0.24 and its exporters when 0.24 is released (<a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>).
     </blockquote>
 </div>
 
@@ -49,13 +49,14 @@
 - **Session tickets** under a rotating key ring (ephemeral, ratchet with a sealed hand-off across restarts, or derived for clusters).
 - **Observation**: an observer for handshake, refusal, reload, expiry, and rotation events, and lock-free server counters (`stats()`).
 - **FIPS 140-3** mode over aws-lc-rs (feature `fips`), checked with `is_fips()`.
+- **QUIC** handshakes and packet keys for a QUIC transport (feature `quic`), through the same hello checks as TCP.
 - **Errors** with stable codes (`TLS-nnnn`), categories, and messages that never carry key material.
 
 ## Installation
 
 ```toml
 [dependencies]
-tls-net = "0.10"
+tls-net = "0.11"
 ```
 
 The default crypto provider is aws-lc-rs, which builds C and assembly code: you need a C compiler (on Windows, Visual Studio Build Tools or clang). On Windows x86-64, NASM is used when it is on `PATH`; otherwise aws-lc-sys uses its prebuilt objects (feature `prebuilt-nasm` forces them). The `ring` feature selects the ring provider instead, without post-quantum key exchange. Build needs per platform, FIPS included, are in [`docs/PLATFORM-NOTES.md`](./docs/PLATFORM-NOTES.md).

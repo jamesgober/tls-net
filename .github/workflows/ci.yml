@@ -43,12 +43,16 @@ jobs:
         run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Clippy (ring provider only)
         run: cargo clippy --all-targets --no-default-features --features ring,webpki-roots -- -D warnings
+      - name: Clippy (ring provider, QUIC)
+        run: cargo clippy --all-targets --no-default-features --features ring,quic -- -D warnings
       - name: Test (default features)
         run: cargo test
       - name: Test (all features but fips)
         run: cargo test --features ${{ env.FULL }}
       - name: Test (no default features)
         run: cargo test --no-default-features
+      - name: Test QUIC (ring provider)
+        run: cargo test --no-default-features --features ring,quic,dangerous-keylog --test quic
       - name: Platform verifier against public sites
         if: matrix.rust == 'stable'
         run: cargo test --features platform-verifier --test network test_platform_verifier
@@ -153,6 +157,8 @@ jobs:
           go version
       - name: Test with fips
         run: cargo test --features fips
+      - name: Test QUIC with fips
+        run: cargo test --features fips,quic --test quic
 
   loom:
     # Model checks of the snapshot, the capacity gate, and the ticket ring (D-080).
