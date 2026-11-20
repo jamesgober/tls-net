@@ -703,61 +703,19 @@ impl<C: Engine> Core<C> {
         if !self.established() {
             return None;
         }
-        let common = self.conn.as_ref()?.common();
-        let version = match common.protocol_version()? {
-            rustls::ProtocolVersion::TLSv1_3 => Version::Tls13,
-            rustls::ProtocolVersion::TLSv1_2 => Version::Tls12,
-            _ => return None,
-        };
-        let cipher_suite =
-            CipherSuite::from_wire(u16::from(common.negotiated_cipher_suite()?.suite()))?;
-        let group = common
-            .negotiated_key_exchange_group()
-            .and_then(|g| Group::from_wire(u16::from(g.name())));
-        let kind = match common.handshake_kind()? {
-            rustls::HandshakeKind::Full => HandshakeKind::Full,
-            rustls::HandshakeKind::FullWithHelloRetryRequest => HandshakeKind::FullWithHelloRetry,
-            rustls::HandshakeKind::Resumed => HandshakeKind::Resumed,
-        };
-        Some(HandshakeInfo::new(
-            version,
-            cipher_suite,
-            group,
-            common.alpn_protocol(),
-            server_name,
-            kind,
-            self.peer_chain().is_some_and(|c| !c.is_empty()),
-        ))
+        handshake_info(self.conn.as_ref()?.common(), server_name)
     }
 
     pub(crate) fn peer_chain(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
         self.conn.as_ref()?.common().peer_certificates()
     }
 
-    fn resumed(&self) -> bool {
-        self.conn.as_ref().and_then(|c| c.common().handshake_kind())
-            == Some(rustls::HandshakeKind::Resumed)
-    }
-
-    fn alpn_negotiated(&self) -> bool {
-        self.conn
-            .as_ref()
-            .is_some_and(|c| c.common().alpn_protocol().is_some())
-    }
-
-    /// The peer's identity, parsed from its end-entity certificate on the
-    /// first call and kept in `cell` (D-104).
+    /// The peer's identity, built on the first call (D-104).
     fn peer_identity<'a>(
         &self,
         cell: &'a OnceCell<Option<Box<PeerIdentity>>>,
     ) -> Option<&'a PeerIdentity> {
-        cell.get_or_init(|| {
-            self.peer_chain()
-                .and_then(|chain| chain.first())
-                .and_then(|c| PeerIdentity::from_der(c.as_ref()))
-                .map(Box::new)
-        })
-        .as_deref()
+        peer_identity(self.peer_chain(), cell)
     }
 
     pub(crate) fn error_code(&self) -> Option<u16> {
@@ -1018,40 +976,10 @@ impl ServerSession {
     /// for a certificate on resumption, so a resumed session is checked
     /// against the group's rules and its certificate's expiry (D-125).
     fn complete(&mut self) -> Result<(), TlsError> {
-        if let Some(g) = self.group {
-            if g.alpn_required && !self.core.alpn_negotiated() {
-                return Err(TlsError::NoApplicationProtocol);
-            }
-            if self.core.resumed() {
-                match self.core.peer_chain().and_then(|c| c.first()) {
-                    None if g.auth_required => return Err(TlsError::PeerCertificateRequired),
-                    None => {}
-                    Some(cert) => {
-                        let expired = crate::der::parse_certificate(cert.as_ref())
-                            .is_none_or(|f| f.not_after <= crate::server::wall_clock());
-                        if expired {
-                            return Err(TlsError::PeerCertificateInvalid(
-                                crate::error::CertificateProblem::Expired,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        let Some(state) = &self.state else {
+        let (Some(state), Some(conn)) = (&self.state, self.core.conn.as_ref()) else {
             return Err(TlsError::Other);
         };
-        let limits = state.limits;
-        if let Some(chain) = self.core.peer_chain() {
-            let too_large = chain.len() > usize::from(limits.max_peer_chain_len)
-                || chain
-                    .iter()
-                    .any(|c| c.len() > limits.max_peer_cert_bytes as usize);
-            if too_large {
-                return Err(TlsError::PeerChainTooLarge);
-            }
-        }
-        Ok(())
+        check_server_completion(conn.common(), self.group, &state.limits)
     }
 
     fn release(&mut self) {
@@ -1237,12 +1165,9 @@ impl ClientSession {
         }
         let p = self.core.run(input, output)?;
         if p.event == Event::HandshakeComplete {
-            let too_large = self.core.peer_chain().is_some_and(|chain| {
-                chain.len() > self.max_chain_len
-                    || chain.iter().any(|c| c.len() > self.max_cert_bytes)
-            });
-            if too_large {
-                return Err(self.core.fail(TlsError::PeerChainTooLarge));
+            let chain = self.core.peer_chain();
+            if let Err(e) = check_peer_chain(chain, self.max_chain_len, self.max_cert_bytes) {
+                return Err(self.core.fail(e));
             }
         }
         Ok(p)
@@ -1313,8 +1238,123 @@ impl ClientSession {
     }
 }
 
+/// The handshake's results from rustls's state, without the peer identity
+/// (built on first use, D-104).
+pub(crate) fn handshake_info<'s>(
+    common: &'s rustls::CommonState,
+    server_name: Option<&'s str>,
+) -> Option<HandshakeInfo<'s>> {
+    let version = match common.protocol_version()? {
+        rustls::ProtocolVersion::TLSv1_3 => Version::Tls13,
+        rustls::ProtocolVersion::TLSv1_2 => Version::Tls12,
+        _ => return None,
+    };
+    let cipher_suite =
+        CipherSuite::from_wire(u16::from(common.negotiated_cipher_suite()?.suite()))?;
+    let group = common
+        .negotiated_key_exchange_group()
+        .and_then(|g| Group::from_wire(u16::from(g.name())));
+    let kind = match common.handshake_kind()? {
+        rustls::HandshakeKind::Full => HandshakeKind::Full,
+        rustls::HandshakeKind::FullWithHelloRetryRequest => HandshakeKind::FullWithHelloRetry,
+        rustls::HandshakeKind::Resumed => HandshakeKind::Resumed,
+    };
+    Some(HandshakeInfo::new(
+        version,
+        cipher_suite,
+        group,
+        common.alpn_protocol(),
+        server_name,
+        kind,
+        common.peer_certificates().is_some_and(|c| !c.is_empty()),
+    ))
+}
+
+/// The peer's identity, parsed from its end-entity certificate on the first
+/// call and kept in `cell` (D-104).
+pub(crate) fn peer_identity<'a>(
+    chain: Option<&[rustls::pki_types::CertificateDer<'static>]>,
+    cell: &'a OnceCell<Option<Box<PeerIdentity>>>,
+) -> Option<&'a PeerIdentity> {
+    cell.get_or_init(|| {
+        chain
+            .and_then(|chain| chain.first())
+            .and_then(|c| PeerIdentity::from_der(c.as_ref()))
+            .map(Box::new)
+    })
+    .as_deref()
+}
+
+/// The server's checks at completion: the host group's rules again, then
+/// the client certificate's budgets. rustls checks ALPN on the first hello
+/// only, so a second hello after a HelloRetryRequest could drop it (D-127);
+/// and it does not ask for a certificate on resumption, so a resumed session
+/// is checked against the group's rules and its certificate's expiry (D-125).
+pub(crate) fn check_server_completion(
+    common: &rustls::CommonState,
+    group: Option<HostGroup>,
+    limits: &crate::limits::HandshakeLimits,
+) -> Result<(), TlsError> {
+    let chain = common.peer_certificates();
+    if let Some(g) = group {
+        if g.alpn_required && common.alpn_protocol().is_none() {
+            return Err(TlsError::NoApplicationProtocol);
+        }
+        if common.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+            match chain.and_then(|c| c.first()) {
+                None if g.auth_required => return Err(TlsError::PeerCertificateRequired),
+                None => {}
+                Some(cert) => {
+                    let expired = crate::der::parse_certificate(cert.as_ref())
+                        .is_none_or(|f| f.not_after <= crate::server::wall_clock());
+                    if expired {
+                        return Err(TlsError::PeerCertificateInvalid(
+                            crate::error::CertificateProblem::Expired,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    check_peer_chain(
+        chain,
+        usize::from(limits.max_peer_chain_len),
+        limits.max_peer_cert_bytes as usize,
+    )
+}
+
+/// The peer chain's budgets, checked once the handshake has finished.
+pub(crate) fn check_peer_chain(
+    chain: Option<&[rustls::pki_types::CertificateDer<'static>]>,
+    max_len: usize,
+    max_cert_bytes: usize,
+) -> Result<(), TlsError> {
+    let too_large = chain.is_some_and(|chain| {
+        chain.len() > max_len || chain.iter().any(|c| c.len() > max_cert_bytes)
+    });
+    if too_large {
+        return Err(TlsError::PeerChainTooLarge);
+    }
+    Ok(())
+}
+
 /// Counts and reports a completed handshake.
 fn record_completion<C: Engine>(obs: &Observation, info: &HandshakeInfo<'_>, core: &Core<C>) {
+    report_completion(
+        obs,
+        info,
+        core.tag,
+        core.started.map(|t| t.elapsed()).unwrap_or_default(),
+    );
+}
+
+/// Counts and reports a completed handshake, for any session type.
+pub(crate) fn report_completion(
+    obs: &Observation,
+    info: &HandshakeInfo<'_>,
+    tag: u64,
+    duration: std::time::Duration,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     let c = &obs.handshakes;
     match info.kind {
@@ -1331,14 +1371,14 @@ fn record_completion<C: Engine>(obs: &Observation, info: &HandshakeInfo<'_>, cor
         c.post_quantum.fetch_add(1, Relaxed);
     }
     obs.emit(&TlsEvent::HandshakeCompleted {
-        tag: core.tag,
+        tag,
         version: info.version,
         cipher_suite: info.cipher_suite,
         group: info.group,
         alpn: info.alpn,
         server_name: info.server_name,
         kind: info.kind,
-        duration: core.started.map(|t| t.elapsed()).unwrap_or_default(),
+        duration,
         peer_certificate: info.peer_verified,
         fingerprint: info.fingerprint,
     });
@@ -1346,13 +1386,24 @@ fn record_completion<C: Engine>(obs: &Observation, info: &HandshakeInfo<'_>, cor
 
 /// Counts and reports a failed handshake.
 fn record_failure<C: Engine>(obs: &Observation, core: &Core<C>, stage: SessionState) {
+    report_failure(obs, core.tag, core.error_code(), core.alert(), stage);
+}
+
+/// Counts and reports a failed handshake, for any session type.
+pub(crate) fn report_failure(
+    obs: &Observation,
+    tag: u64,
+    code: Option<u16>,
+    alert: Option<u8>,
+    stage: SessionState,
+) {
     obs.handshakes
         .failed
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     obs.emit(&TlsEvent::HandshakeFailed {
-        tag: core.tag,
-        code: core.error_code().unwrap_or(0),
-        alert: core.alert(),
+        tag,
+        code: code.unwrap_or(0),
+        alert,
         stage,
     });
 }

@@ -19,7 +19,7 @@ HOURS=${1:-24}
 CORPUS=${CORPUS:-$HOME/fuzz-corpus/tls-net}
 TD=${FUZZ_TARGET_DIR:-$HOME/tgt/tls-net-fuzz}
 : "${CORPUS:?}" "${TD:?}"
-TARGETS=${TARGETS:-hello_parse session_step_server session_step_client der_fields pem_intake ticket_open import_sealed host_value}
+TARGETS=${TARGETS:-hello_parse session_step_server session_step_client der_fields pem_intake ticket_open import_sealed host_value quic_hello_parse quic_step_server quic_step_client}
 mkdir -p "$CORPUS" "$CORPUS/tmp"
 export TMPDIR="$CORPUS/tmp"
 for t in $TARGETS; do mkdir -p "$CORPUS/$t"; done
@@ -33,6 +33,17 @@ for f in seeds/client_hello/*.bin; do
   done
 done
 for f in seeds/server_flight/*.bin; do cp "$f" "$CORPUS/session_step_client/seed-$(basename "$f" .bin)"; done
+# QUIC: ClientHellos as CRYPTO data, raw and behind a chunk-size byte, and
+# server flights as length-prefixed pieces, one per encryption level.
+mkdir -p "$CORPUS/quic_hello_parse" "$CORPUS/quic_step_server" "$CORPUS/quic_step_client"
+for f in seeds/quic_client_hello/*.bin; do
+  n=$(basename "$f" .bin)
+  cp "$f" "$CORPUS/quic_hello_parse/seed-$n"
+  for c in ff 05 40; do
+    { printf "\x$c"; cat "$f"; } >"$CORPUS/quic_step_server/seed-$c-$n"
+  done
+done
+for f in seeds/quic_server_flight/*.bin; do cp "$f" "$CORPUS/quic_step_client/seed-$(basename "$f" .bin)"; done
 # Certificates: the test fixtures and up to 64 of the system's roots.
 for f in ../tests/data/*.der; do cp "$f" "$CORPUS/der_fields/seed-$(basename "$f")"; done
 for f in ../tests/data/*.pem; do cp "$f" "$CORPUS/pem_intake/seed-$(basename "$f")"; done

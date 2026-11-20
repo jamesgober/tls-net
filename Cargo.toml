@@ -34,7 +34,7 @@ authors = ["James Gober <me@jamesgober.com>"]
 
 [package.metadata.docs.rs]
 # Every feature except `fips`, which needs CMake and Go (decision D-042).
-features = ["aws-lc", "ring", "webpki-roots", "platform-verifier", "key-vault", "net-io", "ja3-md5", "rustls-escape-hatch", "dangerous-keylog"]
+features = ["aws-lc", "ring", "webpki-roots", "platform-verifier", "key-vault", "net-io", "ja3-md5", "rustls-escape-hatch", "dangerous-keylog", "quic"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
@@ -50,8 +50,8 @@ default = ["aws-lc", "webpki-roots", "key-vault", "net-io"]
 
 # Crypto provider (decision D-004). With both on, aws-lc-rs is used. With
 # neither, every constructor returns `TlsError::NoProvider`.
-aws-lc = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
-ring = ["rustls/ring"]
+aws-lc = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum", "dep:aws-lc-rs"]
+ring = ["rustls/ring", "dep:ring"]
 # FIPS 140-3 mode over aws-lc-rs: builds aws-lc-fips-sys, which needs CMake
 # and Go (and on Windows NASM, Ninja, and clang). Kept out of the gate's
 # feature list on Windows and macOS (decision D-042).
@@ -78,6 +78,9 @@ rustls-escape-hatch = []
 # NSS key log output for debugging. Never in production (decision D-040).
 dangerous-keylog = []
 
+# QUIC handshakes and packet keys for a QUIC transport (decision D-153).
+quic = []
+
 
 # DEPENDENCIES
 # #################################
@@ -87,8 +90,11 @@ dangerous-keylog = []
 # process-default provider.
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
 
-# Only so `prebuilt-nasm` can reach aws-lc-rs; rustls already depends on it.
+# rustls's own providers, already in the tree with them: `prebuilt-nasm`
+# reaches aws-lc-rs through this, and the QUIC Retry tag is one AEAD seal
+# under a fixed key that rustls has no API for (decision D-155).
 aws-lc-rs = { version = "1.19", optional = true, default-features = false }
+ring = { version = "0.17.14", optional = true, default-features = false }
 
 # Mozilla root program bundle for clients (CDLA-Permissive-2.0 data).
 webpki-roots = { version = "1.0.11", optional = true }
@@ -158,6 +164,11 @@ required-features = ["rustls-escape-hatch"]
 name = "memory"
 harness = false
 required-features = ["rustls-escape-hatch"]
+
+[[bench]]
+name = "quic"
+harness = false
+required-features = ["rustls-escape-hatch", "quic", "aws-lc"]
 
 
 # LINTS

@@ -200,6 +200,12 @@ pub enum TlsError {
         /// The operating system's error kind.
         kind: io::ErrorKind,
     },
+    /// A QUIC key was given input it cannot take: a connection ID over 20
+    /// bytes, or a payload longer than the AEAD allows (`TLS-0048`).
+    QuicInput {
+        /// What was refused.
+        what: &'static str,
+    },
     /// The traffic keys reached their usage limit; reconnect (`TLS-0044`).
     KeyUsageExhausted,
     /// Bytes arrived after the STARTTLS reply, before the handshake (`TLS-0045`).
@@ -376,6 +382,7 @@ impl TlsError {
             E::StartTlsInjection => 45,
             E::EarlyDataRefused => 46,
             E::Transport { .. } => 47,
+            E::QuicInput { .. } => 48,
             E::OutputFull { .. } | E::WrongState | E::SessionFailed => 50,
         }
     }
@@ -542,6 +549,7 @@ impl fmt::Display for TlsError {
             E::PeerMisbehaved => f.write_str("peer broke the TLS protocol"),
             E::UncleanClose => f.write_str("connection closed without close_notify"),
             E::Transport { kind } => write!(f, "transport failed: {kind}"),
+            E::QuicInput { what } => write!(f, "QUIC key input refused: {what}"),
             E::KeyUsageExhausted => f.write_str("traffic keys reached their usage limit; reconnect"),
             E::StartTlsInjection => f.write_str("bytes arrived after the STARTTLS reply, before the handshake"),
             E::EarlyDataRefused => f.write_str("early data refused"),
@@ -687,6 +695,9 @@ mod tests {
             TlsError::Transport {
                 kind: io::ErrorKind::ConnectionReset,
             },
+            TlsError::QuicInput {
+                what: "connection ID",
+            },
             TlsError::OutputFull { required: 1 },
         ];
         for e in &all {
@@ -715,6 +726,12 @@ mod tests {
             ErrorCategory::NotFound
         );
         assert_eq!(TlsError::PinMismatch.action(), Action::Operator);
+        let quic = TlsError::QuicInput {
+            what: "connection ID",
+        };
+        assert_eq!(quic.code(), 48);
+        assert_eq!(quic.category(), ErrorCategory::InvalidArgument);
+        assert_eq!(quic.action(), Action::None);
         assert_eq!(TlsError::Other.category(), ErrorCategory::Internal);
         assert_eq!(
             TlsError::NoCommonGroup.category(),

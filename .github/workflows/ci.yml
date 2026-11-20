@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   # Every feature except `fips`, which needs CMake and Go and has its own job
   # (decision D-042).
-  FULL: aws-lc,ring,prebuilt-nasm,webpki-roots,platform-verifier,key-vault,net-io,ja3-md5,rustls-escape-hatch,dangerous-keylog
+  FULL: aws-lc,ring,prebuilt-nasm,webpki-roots,platform-verifier,key-vault,net-io,ja3-md5,rustls-escape-hatch,dangerous-keylog,quic
   RUSTFLAGS: "-D warnings"
   # Run every JS action on Node.js 24 ahead of GitHub's forced migration,
   # silencing "Node.js 20 actions are deprecated" runner warnings.
