@@ -247,6 +247,40 @@ pub fn parse_client_hello<'a>(
     Ok(HelloParse::Complete { view, length: pos })
 }
 
+/// Parses one ClientHello from the start of QUIC CRYPTO data at the Initial
+/// level: the handshake message itself, with no record layer (RFC 9001
+/// section 4). The same checks and budgets as [`parse_client_hello`], except
+/// `max_records`, which has no meaning here. `length` is the message's.
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+pub(crate) fn parse_quic_client_hello<'a>(
+    input: &'a [u8],
+    limits: &HelloLimits,
+) -> Result<HelloParse<'a>, TlsError> {
+    let limits = &limits.clamped();
+    let Some(header) = input.get(..4) else {
+        if input.first().is_some_and(|&t| t != 1) {
+            return Err(TlsError::HelloMalformed);
+        }
+        return Ok(HelloParse::Incomplete { needed: 4 });
+    };
+    if header[0] != 1 {
+        return Err(TlsError::HelloMalformed);
+    }
+    let len =
+        (usize::from(header[1]) << 16) | (usize::from(header[2]) << 8) | usize::from(header[3]);
+    check_hello_len(len, limits)?;
+    let total = len + 4;
+    let Some(message) = input.get(..total) else {
+        return Ok(HelloParse::Incomplete { needed: total });
+    };
+    let mut view = parse_body(Stream::new(&[message]), 0, limits)?;
+    view.quic = true;
+    Ok(HelloParse::Complete {
+        view,
+        length: total,
+    })
+}
+
 fn check_prefix(rest: &[u8]) -> Result<(), TlsError> {
     match rest {
         [] => Ok(()),
@@ -447,6 +481,8 @@ pub struct ClientHelloView<'a> {
     pre_shared_key: bool,
     early_data: bool,
     encrypted_client_hello: bool,
+    /// Read from QUIC CRYPTO data rather than TLS records.
+    quic: bool,
 }
 
 fn parse_body<'a>(
@@ -505,6 +541,7 @@ fn parse_body<'a>(
         pre_shared_key: false,
         early_data: false,
         encrypted_client_hello: false,
+        quic: false,
     };
     if c.pos == end {
         return Ok(view);
@@ -698,10 +735,17 @@ impl<'a> ClientHelloView<'a> {
         }
     }
 
-    /// The legacy version of the first record header.
+    /// The legacy version of the first record header; 0 for a hello that
+    /// came over QUIC, which has no records.
     #[must_use]
     pub fn record_version(&self) -> u16 {
         self.record_version
+    }
+
+    /// Whether the hello came over QUIC (CRYPTO data, not TLS records).
+    #[must_use]
+    pub fn is_quic(&self) -> bool {
+        self.quic
     }
 
     /// The hello's legacy version field.
@@ -913,7 +957,8 @@ impl<'a> ClientHelloView<'a> {
         self.padding
     }
 
-    /// The whole handshake message, when it sits in one record.
+    /// The whole handshake message, when it sits in one record or came over
+    /// QUIC.
     #[must_use]
     pub fn raw(&self) -> Option<&'a [u8]> {
         (self.stream.n == 1).then(|| self.stream.segs[0])
@@ -1344,5 +1389,73 @@ pub(crate) mod tests {
     fn test_is_grease_all_sixteen() {
         let n = (0..=u16::MAX).filter(|v| is_grease(*v)).count();
         assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn test_quic_hello_parses_the_bare_message() {
+        let b = HelloBuilder::new()
+            .sni(b"Example.TEST")
+            .alpn(&[b"h3"])
+            .ext(0x39, vec![1, 2]);
+        let msg = b.body();
+        for cut in 0..msg.len() {
+            match parse_quic_client_hello(&msg[..cut], &HelloLimits::new()).unwrap() {
+                HelloParse::Incomplete { needed } => assert!(needed > cut),
+                HelloParse::Complete { .. } => panic!("complete at {cut}"),
+            }
+        }
+        let mut input = msg.clone();
+        input.extend([9, 9, 9]);
+        let HelloParse::Complete { view, length } =
+            parse_quic_client_hello(&input, &HelloLimits::new()).unwrap()
+        else {
+            panic!("incomplete");
+        };
+        assert_eq!(
+            length,
+            msg.len(),
+            "the bytes after the hello are not its own"
+        );
+        assert!(view.is_quic());
+        assert_eq!(view.record_version(), 0);
+        assert_eq!(view.raw(), Some(&msg[..]));
+        assert_eq!(
+            view.normalized_server_name().unwrap().as_str(),
+            "example.test"
+        );
+        assert!(view.has_alpn());
+        assert!(crate::Ja4::compute(&view).as_str().starts_with('q'));
+        // The same hello over TCP is not marked as QUIC.
+        let records = b.records(16_384);
+        assert!(!complete(&records).is_quic());
+        assert!(
+            crate::Ja4::compute(&complete(&records))
+                .as_str()
+                .starts_with('t')
+        );
+    }
+
+    #[test]
+    fn test_quic_hello_refusals() {
+        let limits = HelloLimits::new();
+        // A record header is not a handshake message.
+        let records = HelloBuilder::new().records(16_384);
+        assert_eq!(
+            parse_quic_client_hello(&records, &limits).unwrap_err(),
+            TlsError::HelloMalformed
+        );
+        assert_eq!(
+            parse_quic_client_hello(&[2], &limits).unwrap_err(),
+            TlsError::HelloMalformed
+        );
+        // The length is checked as soon as the header is in.
+        assert_eq!(
+            parse_quic_client_hello(&[1, 0x01, 0, 0], &limits).unwrap_err(),
+            TlsError::HelloTooLarge
+        );
+        assert_eq!(
+            parse_quic_client_hello(&[1, 0, 0, 10], &limits).unwrap_err(),
+            TlsError::HelloMalformed
+        );
     }
 }

@@ -67,6 +67,9 @@ mod observe;
 mod pem;
 mod policy;
 mod provider;
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+pub mod quic;
 #[cfg(feature = "net-io")]
 mod seam;
 mod server;
@@ -184,6 +187,33 @@ pub mod fuzz {
     /// address, in the scope's own group.
     pub fn host_value(data: &[u8]) -> bool {
         std::str::from_utf8(data).is_ok_and(crate::sni::fuzz_host)
+    }
+
+    /// The ClientHello parser on arbitrary bytes as QUIC CRYPTO data. Never
+    /// panics; a complete view is marked as QUIC, spans exactly the message,
+    /// and has a JA4 that starts with `q`. `true` for a complete hello.
+    #[cfg(feature = "quic")]
+    pub fn quic_hello(data: &[u8]) -> bool {
+        let limits = crate::HelloLimits::new();
+        match crate::hello::parse_quic_client_hello(data, &limits) {
+            Ok(crate::HelloParse::Complete { view, length }) => {
+                assert!(length <= data.len());
+                assert!(view.is_quic() && view.record_version() == 0);
+                assert_eq!(view.raw().map(<[u8]>::len), Some(length));
+                let _ = view.cipher_suites().count();
+                let _ = view.extension_types().count();
+                let _ = view.alpn().count();
+                let _ = (view.server_name(), view.normalized_server_name());
+                let ja4 = crate::Ja4::compute(&view);
+                assert!(ja4.as_str().starts_with('q'));
+                true
+            }
+            Ok(crate::HelloParse::Incomplete { needed }) => {
+                assert!(needed > data.len());
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     /// PEM and DER intake on arbitrary bytes.

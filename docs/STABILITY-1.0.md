@@ -42,7 +42,7 @@ DIRECTIVES section 3, checked at 0.9.1.
 | 3 | `cargo audit` and `cargo deny check` | met | CI `Security (audit + deny)` |
 | 4 | No `unwrap`, `expect`, `todo!`, `dbg!`, or printing in shipping code | met | clippy with `unwrap_used`, `expect_used`, `todo`, `unimplemented`, `dbg_macro`, `print_stdout`, `print_stderr`, and `panic` on the library, all features: clean at 0.9.1 |
 | 5 | A Tier-1 API headlines the docs | met | `README.md`, `docs/API.md` "Tier 1" |
-| 6 | Standards cases whole and split at every byte; a property test per invariant; a fuzz target per parser or decoder; an attack test per threat | met | T-1 to T-31 each have an attack test (`docs/SECURITY.md`); `tests/properties.rs`; eight fuzz targets, each run without an open finding (`import_sealed` 24 hours, `host_value` 4) |
+| 6 | Standards cases whole and split at every byte; a property test per invariant; a fuzz target per parser or decoder; an attack test per threat | met | T-1 to T-32 each have an attack test (`docs/SECURITY.md`); `tests/properties.rs`; eight fuzz targets, each run without an open finding (`import_sealed` 24 hours, `host_value` 4) |
 | 7 | Hot-path changes carry benchmarks; no regression over 5% | open | the re-tune against the 0.6 baselines is a 0.9.x item; it needs a quiet machine |
 | 8 | `README.md`, `docs/API.md`, `CHANGELOG.md`, release notes | met | updated each release; `docs/release/` |
 | 9 | Decision log for every design decision | met | `dev/PLAN.md` D-001 to D-142 |
@@ -81,7 +81,7 @@ All numbers were measured on Windows and on WSL2. There are no bare-metal Linux 
 
 ## Security
 
-- **Threats:** T-1 to T-31 each have a defence, an attack test, and a stated cost (`docs/SECURITY.md`).
+- **Threats:** T-1 to T-32 each have a defence, an attack test, and a stated cost (`docs/SECURITY.md`).
 - **Fuzzing:** six targets ran 24 hours each at 0.7 with one finding, fixed (D-111). `import_sealed` (0.9.1) ran 24 hours and `host_value` (0.10) 4 hours, with none.
 - **Conformance:** testssl.sh and tlsfuzzer run weekly in CI. One finding was fixed (D-110).
 - **Miri and loom:** both run in CI.

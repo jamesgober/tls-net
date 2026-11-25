@@ -32,7 +32,8 @@ impl Ja4 {
     #[must_use]
     pub fn compute(view: &ClientHelloView<'_>) -> Ja4 {
         let mut out = [b'0'; 36];
-        out[0] = b't';
+        // JA4's first character is the transport: t for TCP, q for QUIC.
+        out[0] = if view.is_quic() { b'q' } else { b't' };
         out[1..3].copy_from_slice(version_code(view));
         out[3] = if view.has_server_name() { b'd' } else { b'i' };
 
